@@ -1,0 +1,34 @@
+# zerohour (TUI) — the terminal app. Builds the `zerohour` command.
+#
+# Install it on your machine from the project folder with:
+#     cargo install --path tui
+
+[package]
+# If this name were taken on crates.io we would publish as "zerohour-tui"; the binary
+# name below stays "zerohour" either way.
+name = "zerohour"
+description = "A terminal to-do list and countdown timer."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+# The command you type in the terminal.
+name = "zerohour"
+path = "src/main.rs"
+
+[dependencies]
+# All the app logic (model, dates, database, stats, themes, icons).
+zerohour-core.workspace = true
+# Drawing the UI. We use its re-exported `ratatui::crossterm` for keyboard/terminal control,
+# which guarantees the crossterm version matches the one ratatui was built against.
+ratatui.workspace = true
+# Today's local date, date formatting.
+chrono.workspace = true
+# Command-line flags (--db, --demo).
+clap.workspace = true
+# Friendly error messages with context in the binary.
+anyhow.workspace = true
+# Truncating titles to fit columns, measured in terminal cells instead of bytes.
+unicode-width.workspace = true

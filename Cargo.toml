@@ -1,0 +1,50 @@
+# zerohour — workspace root.
+#
+# A Cargo "workspace" groups several crates (Rust packages) that are built together
+# and share one `Cargo.lock` and one `target/` folder. We split the app in two:
+#
+#   core/  -> pure logic (data model, dates, database, stats, themes, icons).
+#             No terminal code, so the future Android app can reuse it unchanged.
+#   tui/   -> the terminal user interface; produces the `zerohour` command.
+#
+# Build everything:   cargo build
+# Run the app:        cargo run -p zerohour
+# Run all tests:      cargo test
+
+[workspace]
+# Resolver "3" is the current dependency resolver (default for edition 2024).
+resolver = "3"
+members = ["core", "tui"]
+
+# Settings every member crate inherits with `version.workspace = true` etc.
+# The app's name lives here (package names) and in `core::APP_NAME`; change both to rename.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Shane Custer"]
+repository = "https://github.com/shanecuster/zerohour"
+
+# One central list of dependency versions; member crates opt in with `foo.workspace = true`.
+[workspace.dependencies]
+# Our own core crate, so `tui` can depend on it by path.
+zerohour-core = { path = "core" }
+# Terminal UI toolkit: layouts, tables, bar charts, borders. Re-exports crossterm for us.
+ratatui = "0.30"
+# SQLite database; "bundled" compiles SQLite into the binary so users need nothing installed.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Calendar dates and timestamps (NaiveDate = a date with no time zone, perfect for due dates).
+chrono = { version = "0.4", features = ["serde"] }
+# Random unique IDs for every row, so items from different devices never collide when syncing.
+uuid = { version = "1", features = ["v4"] }
+# Turns our structs into JSON and back (needed for sync in phase 2 and export in phase 4).
+serde = { version = "1", features = ["derive"] }
+# Finds the right per-OS data folder (e.g. ~/.local/share/zerohour on Linux).
+directories = "6"
+# Parses command-line flags like --db and --demo.
+clap = { version = "4", features = ["derive"] }
+# Easy error handling in the app binary: any error type, plus `.context("what we were doing")`.
+anyhow = "1"
+# Lets the core library define its own clear error types with little boilerplate.
+thiserror = "2"
+# Measures how many terminal columns a string takes (some characters are 2 wide), for truncation.
+unicode-width = "0.2"

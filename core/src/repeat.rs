@@ -1,0 +1,592 @@
+//! Date math: repeating dates, countdowns, and parsing dates the user types.
+//!
+//! This is the most error-prone part of the app, so it is written plainly and tested hard
+//! (see the `tests` module at the bottom). Two ground rules:
+//!
+//! 1. **`today` is always a parameter.** Nothing in here reads the clock. The caller (the UI)
+//!    decides what "today" is. That makes every function deterministic: the same inputs always
+//!    give the same answer, so tests can pretend it's any day we like (leap days, New Year's Eve).
+//! 2. **Every occurrence is computed from the original anchor date.** A monthly repeat that
+//!    started on Jan 31 is "anchor + 1 month", "anchor + 2 months", ... — never "previous
+//!    occurrence + 1 month". That way Jan 31 -> Feb 28 -> Mar 31: the short month clamps the
+//!    day, but the next month goes back to the 31st instead of drifting to the 28th forever.
+
+use chrono::{Datelike, Months, NaiveDate, TimeDelta, Weekday};
+
+use crate::model::{Item, Kind, RepeatRule, Unit};
+
+/// The size of one repeat step, normalized to either "some days" or "some months".
+///
+/// Weeks are just 7 days and years are just 12 months, so every rule reduces to one of these
+/// two shapes. Days and months need different math because months have different lengths.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    Days(i64),
+    Months(u32),
+}
+
+/// Turns a repeat rule into its step size, or `None` if the rule doesn't repeat.
+fn step_of(rule: RepeatRule) -> Option<Step> {
+    match rule {
+        RepeatRule::None => None,
+        RepeatRule::Daily => Some(Step::Days(1)),
+        RepeatRule::Weekly => Some(Step::Days(7)),
+        RepeatRule::Monthly => Some(Step::Months(1)),
+        RepeatRule::Yearly => Some(Step::Months(12)),
+        RepeatRule::EveryN { n, unit } => {
+            // "Every 0 days" would never move forward (an infinite loop waiting to happen),
+            // so we quietly treat 0 as 1. The add form also refuses 0.
+            let n = n.max(1);
+            Some(match unit {
+                Unit::Days => Step::Days(i64::from(n)),
+                Unit::Weeks => Step::Days(i64::from(n) * 7),
+                Unit::Months => Step::Months(n),
+            })
+        }
+    }
+}
+
+/// Adds whole months to a date, clamping the day to the end of shorter months.
+///
+/// Examples: Jan 31 + 1 month = Feb 28 (or Feb 29 in a leap year); Feb 29 + 12 months =
+/// Feb 28 in a non-leap year. chrono's `checked_add_months` does exactly this clamping.
+fn add_months(date: NaiveDate, months: u32) -> NaiveDate {
+    // `checked_add_months` returns `None` only if the result is past the year 262,143.
+    // Rather than crash in that absurd case, we use the latest date chrono can represent.
+    date.checked_add_months(Months::new(months))
+        .unwrap_or(NaiveDate::MAX)
+}
+
+/// Adds a number of days to a date (saturating at chrono's max date instead of panicking).
+fn add_days(date: NaiveDate, days: i64) -> NaiveDate {
+    date.checked_add_signed(TimeDelta::days(days))
+        .unwrap_or(NaiveDate::MAX)
+}
+
+/// The first occurrence of `rule`, starting from `anchor`, that falls on or after `target`.
+///
+/// Occurrences are `anchor`, `anchor + 1 step`, `anchor + 2 steps`, ... If the anchor itself is
+/// already on or after the target, the anchor is the answer. For a non-repeating rule the only
+/// occurrence is the anchor, so it is returned as-is (even if it's in the past).
+fn first_on_or_after(rule: RepeatRule, anchor: NaiveDate, target: NaiveDate) -> NaiveDate {
+    if anchor >= target {
+        return anchor;
+    }
+    // `let ... else` : bind the value if the pattern matches, otherwise run the `else` block
+    // (which must leave the function). Here: no step means "doesn't repeat".
+    let Some(step) = step_of(rule) else {
+        return anchor;
+    };
+
+    match step {
+        Step::Days(d) => {
+            // Days are easy: jump straight there with division instead of looping.
+            // We need the smallest k with anchor + k*d >= target, i.e. k = ceil(diff / d).
+            let diff = (target - anchor).num_days();
+            let k = (diff + d - 1) / d; // integer "round up" division
+            add_days(anchor, k * d)
+        }
+        Step::Months(m) => {
+            // Months vary in length, so we estimate how many steps to skip, then walk
+            // forward. The estimate lands at or before the target's month, so the loop runs
+            // at most about twice.
+            let months_diff = (target.year() - anchor.year()) * 12 + target.month() as i32
+                - anchor.month() as i32;
+            // `as u32` converts number types. months_diff is never negative here because
+            // anchor < target, but `.max(0)` makes that obvious to the reader.
+            let mut k = (months_diff.max(0) as u32) / m;
+            loop {
+                // Always compute from the ORIGINAL anchor (see the module docs).
+                let candidate = add_months(anchor, k * m);
+                if candidate >= target {
+                    return candidate;
+                }
+                k += 1;
+            }
+        }
+    }
+}
+
+/// The first occurrence of a repeating date on or after `today`.
+///
+/// `from_date` is the item's stored date (the anchor). Used to show repeating events: Christmas
+/// stored as 2025-12-25 shows as 2026-12-25 once 2025's has passed. For `RepeatRule::None` this
+/// returns `from_date` unchanged.
+pub fn next_occurrence(rule: RepeatRule, from_date: NaiveDate, today: NaiveDate) -> NaiveDate {
+    first_on_or_after(rule, from_date, today)
+}
+
+/// The due date for the *next instance* of a repeating task that was just completed.
+///
+/// Returns the first occurrence that is strictly after BOTH the old due date and today:
+/// - Completed on time or late: you've done today's (or an earlier) occurrence, so the next
+///   one is the first occurrence after today. (A daily task done today is next due tomorrow.)
+/// - Completed early: a weekly task due next Monday, done on Thursday, is next due the Monday
+///   after that — not the same Monday again.
+///
+/// A repeating task with no due date uses today as its anchor. Returns `None` for non-repeating
+/// rules, because those don't create a new instance.
+pub fn next_task_date(
+    rule: RepeatRule,
+    old_date: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Option<NaiveDate> {
+    if !rule.is_repeating() {
+        return None;
+    }
+    let anchor = old_date.unwrap_or(today);
+    // "Strictly after X" is the same as "on or after the day after X".
+    let after = anchor.max(today);
+    Some(first_on_or_after(rule, anchor, add_days(after, 1)))
+}
+
+/// How many days from `today` until `date`. Positive = future, 0 = today, negative = past.
+pub fn days_until(date: NaiveDate, today: NaiveDate) -> i64 {
+    // Subtracting two dates gives a `TimeDelta`; `.num_days()` turns it into a whole number.
+    (date - today).num_days()
+}
+
+/// The date an event should currently count down to, or `None` if it has no date.
+///
+/// Repeating events roll forward to their next occurrence on or after today automatically —
+/// nothing is stored or clicked. One-off events just show their stored date.
+pub fn event_target(item: &Item, today: NaiveDate) -> Option<NaiveDate> {
+    // `.map(|d| ...)` transforms the value inside an Option if there is one.
+    // `|d| expr` is a closure: a small unnamed function taking `d`.
+    item.date.map(|d| next_occurrence(item.repeat, d, today))
+}
+
+/// Should this event be shown on the main screen today?
+///
+/// Repeating events always show (they've rolled forward). A one-off event shows until its day
+/// is over; after that, only if the user ticked "keep after pass".
+pub fn event_is_visible(item: &Item, today: NaiveDate) -> bool {
+    match event_target(item, today) {
+        Some(date) => date >= today || item.keep_after_pass,
+        None => true, // An event without a date is a data problem; show it so it can be fixed.
+    }
+}
+
+/// True if `item` is an open task whose due date is before today.
+pub fn is_overdue(item: &Item, today: NaiveDate) -> bool {
+    item.kind == Kind::Task && !item.is_completed() && item.date.is_some_and(|due| due < today)
+}
+
+/// Parses a date the user typed into the add form.
+///
+/// Accepted forms (case doesn't matter, surrounding spaces are ignored):
+/// - empty            -> no date (`Ok(None)`)
+/// - `2026-12-25`     -> that exact date
+/// - `12/25/2026`     -> US-style month/day/year
+/// - `12-25`, `12/25` -> the next Dec 25 on or after today
+/// - `today`, `tomorrow`
+/// - `+3`, `+3d`, `+2w`, `+1m`, `+1y` -> that many days/weeks/months/years from today
+/// - `mon` ... `sun` (or full names) -> the next such weekday after today
+///
+/// `Result<T, E>` is Rust's "this can fail" type: `Ok(value)` or `Err(error)`. Here the error
+/// is a friendly message the UI can show directly.
+pub fn parse_date_input(input: &str, today: NaiveDate) -> Result<Option<NaiveDate>, String> {
+    let s = input.trim().to_lowercase();
+    if s.is_empty() {
+        return Ok(None);
+    }
+
+    // Words first.
+    match s.as_str() {
+        "today" | "tod" => return Ok(Some(today)),
+        "tomorrow" | "tom" | "tmr" => return Ok(Some(add_days(today, 1))),
+        _ => {}
+    }
+
+    // Relative offsets: "+3", "+3d", "+2w", "+1m", "+1y".
+    if let Some(rest) = s.strip_prefix('+') {
+        // Split "12w" into the digits "12" and the unit "w".
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let (num, unit) = rest.split_at(digits_end);
+        let n: u32 = num.parse().map_err(|_| bad_date_message())?;
+        let date = match unit {
+            "" | "d" => add_days(today, i64::from(n)),
+            "w" => add_days(today, i64::from(n) * 7),
+            "m" => add_months(today, n),
+            "y" => add_months(today, n.saturating_mul(12)),
+            _ => return Err(bad_date_message()),
+        };
+        return Ok(Some(date));
+    }
+
+    // Weekday names: the next one strictly after today ("fri" on a Friday = next Friday;
+    // type "today" if you mean today).
+    if let Ok(weekday) = s.parse::<Weekday>() {
+        let mut date = add_days(today, 1);
+        while date.weekday() != weekday {
+            date = add_days(date, 1);
+        }
+        return Ok(Some(date));
+    }
+
+    // Full dates: ISO (2026-12-25) or US style (12/25/2026).
+    for format in ["%Y-%m-%d", "%m/%d/%Y"] {
+        if let Ok(date) = NaiveDate::parse_from_str(&s, format) {
+            return Ok(Some(date));
+        }
+    }
+
+    // Month and day only (12-25 or 12/25): the next one on or after today.
+    // `if let A && let B` is a "let chain": every pattern must match for the block to run.
+    let parts: Vec<&str> = s.split(['-', '/']).collect();
+    if let [m, d] = parts.as_slice()
+        && let (Ok(month), Ok(day)) = (m.parse::<u32>(), d.parse::<u32>())
+    {
+        // Try this year, then the following years. Checking several years handles Feb 29,
+        // which only exists in leap years.
+        for year in today.year()..=today.year() + 8 {
+            if let Some(date) = NaiveDate::from_ymd_opt(year, month, day)
+                && date >= today
+            {
+                return Ok(Some(date));
+            }
+        }
+    }
+
+    Err(bad_date_message())
+}
+
+/// The error message shown when a typed date can't be understood.
+fn bad_date_message() -> String {
+    "Couldn't read that date. Try 2026-12-25, 12/25, +3d, +2w, tomorrow, or fri.".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    /// Shorthand to build a date in tests. `unwrap()` is fine in tests: a bad literal should
+    /// fail the test loudly.
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    fn event(date: NaiveDate, repeat: RepeatRule) -> Item {
+        let mut item = Item::new(Kind::Event, "test", Utc::now());
+        item.date = Some(date);
+        item.repeat = repeat;
+        item
+    }
+
+    // ---- next_occurrence ---------------------------------------------------------------
+
+    #[test]
+    fn no_repeat_returns_the_date_unchanged() {
+        assert_eq!(
+            next_occurrence(RepeatRule::None, d(2026, 1, 1), d(2026, 6, 1)),
+            d(2026, 1, 1)
+        );
+    }
+
+    #[test]
+    fn future_anchor_is_its_own_next_occurrence() {
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, d(2026, 12, 25), d(2026, 10, 8)),
+            d(2026, 12, 25)
+        );
+    }
+
+    #[test]
+    fn christmas_rolls_over_after_it_passes() {
+        let christmas = d(2025, 12, 25);
+        // On Christmas day itself: 0 days, still this year's.
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, christmas, d(2026, 12, 25)),
+            d(2026, 12, 25)
+        );
+        // Dec 26 2026 -> Dec 25 2027 (2027 is not a leap year): 364 days.
+        let next = next_occurrence(RepeatRule::Yearly, christmas, d(2026, 12, 26));
+        assert_eq!(next, d(2027, 12, 25));
+        assert_eq!(days_until(next, d(2026, 12, 26)), 364);
+        // Dec 26 2027 -> Dec 25 2028, and Feb 29 2028 is in between: 365 days.
+        let next = next_occurrence(RepeatRule::Yearly, christmas, d(2027, 12, 26));
+        assert_eq!(days_until(next, d(2027, 12, 26)), 365);
+    }
+
+    #[test]
+    fn year_rollover_for_monthly_and_daily() {
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, d(2026, 1, 15), d(2026, 12, 20)),
+            d(2027, 1, 15)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Daily, d(2026, 12, 30), d(2027, 1, 2)),
+            d(2027, 1, 2)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Weekly, d(2026, 12, 28), d(2027, 1, 1)),
+            d(2027, 1, 4)
+        );
+    }
+
+    #[test]
+    fn feb_29_yearly_falls_back_to_feb_28_in_non_leap_years() {
+        let leap_day = d(2024, 2, 29);
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, leap_day, d(2025, 1, 1)),
+            d(2025, 2, 28)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, leap_day, d(2027, 3, 1)),
+            d(2028, 2, 29)
+        );
+        // Back on Feb 29 in the next leap year, not stuck on the 28th.
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, leap_day, d(2028, 1, 1)),
+            d(2028, 2, 29)
+        );
+    }
+
+    #[test]
+    fn leap_year_rules() {
+        // 2000 was a leap year (divisible by 400); 2100 is not (divisible by 100 but not 400).
+        let leap_day = d(2000, 2, 29);
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, leap_day, d(2100, 1, 1)),
+            d(2100, 2, 28)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Yearly, leap_day, d(2096, 1, 1)),
+            d(2096, 2, 29)
+        );
+    }
+
+    #[test]
+    fn month_end_anchoring_does_not_drift() {
+        let jan31 = d(2026, 1, 31);
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, jan31, d(2026, 2, 1)),
+            d(2026, 2, 28)
+        );
+        // After Feb, back to the 31st (not the 28th).
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, jan31, d(2026, 3, 1)),
+            d(2026, 3, 31)
+        );
+        // April has 30 days.
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, jan31, d(2026, 4, 1)),
+            d(2026, 4, 30)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, jan31, d(2026, 5, 1)),
+            d(2026, 5, 31)
+        );
+        // Leap year February.
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, d(2028, 1, 31), d(2028, 2, 1)),
+            d(2028, 2, 29)
+        );
+    }
+
+    #[test]
+    fn every_n_intervals() {
+        let start = d(2026, 1, 1);
+        let every3days = RepeatRule::EveryN {
+            n: 3,
+            unit: Unit::Days,
+        };
+        assert_eq!(
+            next_occurrence(every3days, start, d(2026, 1, 2)),
+            d(2026, 1, 4)
+        );
+        assert_eq!(
+            next_occurrence(every3days, start, d(2026, 1, 4)),
+            d(2026, 1, 4)
+        );
+
+        let every2weeks = RepeatRule::EveryN {
+            n: 2,
+            unit: Unit::Weeks,
+        };
+        assert_eq!(
+            next_occurrence(every2weeks, start, d(2026, 1, 2)),
+            d(2026, 1, 15)
+        );
+        assert_eq!(
+            next_occurrence(every2weeks, start, d(2026, 1, 16)),
+            d(2026, 1, 29)
+        );
+
+        let every3months = RepeatRule::EveryN {
+            n: 3,
+            unit: Unit::Months,
+        };
+        assert_eq!(
+            next_occurrence(every3months, d(2026, 1, 31), d(2026, 2, 1)),
+            d(2026, 4, 30)
+        );
+        assert_eq!(
+            next_occurrence(every3months, d(2026, 1, 31), d(2026, 5, 1)),
+            d(2026, 7, 31)
+        );
+        assert_eq!(
+            next_occurrence(every3months, d(2026, 11, 15), d(2026, 12, 1)),
+            d(2027, 2, 15)
+        );
+    }
+
+    #[test]
+    fn every_zero_is_treated_as_every_one() {
+        let rule = RepeatRule::EveryN {
+            n: 0,
+            unit: Unit::Days,
+        };
+        assert_eq!(
+            next_occurrence(rule, d(2026, 1, 1), d(2026, 1, 5)),
+            d(2026, 1, 5)
+        );
+    }
+
+    #[test]
+    fn far_past_anchor_is_fast_and_correct() {
+        // A daily repeat anchored 100 years ago must not loop 36,500 times (and must be right).
+        assert_eq!(
+            next_occurrence(RepeatRule::Daily, d(1926, 1, 1), d(2026, 10, 8)),
+            d(2026, 10, 8)
+        );
+        assert_eq!(
+            next_occurrence(RepeatRule::Monthly, d(1926, 1, 31), d(2026, 10, 8)),
+            d(2026, 10, 31)
+        );
+    }
+
+    // ---- days_until and events ---------------------------------------------------------
+
+    #[test]
+    fn countdown_today_tomorrow_and_yesterday() {
+        let today = d(2026, 10, 8);
+        assert_eq!(days_until(today, today), 0);
+        assert_eq!(days_until(d(2026, 10, 9), today), 1);
+        assert_eq!(days_until(d(2026, 10, 7), today), -1);
+        assert_eq!(days_until(d(2026, 12, 25), today), 78);
+    }
+
+    #[test]
+    fn event_exactly_today_shows_zero_days() {
+        let today = d(2026, 10, 8);
+        let e = event(today, RepeatRule::Yearly);
+        assert_eq!(event_target(&e, today), Some(today));
+        assert!(event_is_visible(&e, today));
+    }
+
+    #[test]
+    fn repeating_event_yesterday_rolls_to_next_year() {
+        let today = d(2026, 10, 8);
+        let e = event(d(2026, 10, 7), RepeatRule::Yearly);
+        let target = event_target(&e, today).unwrap();
+        assert_eq!(target, d(2027, 10, 7));
+        assert_eq!(days_until(target, today), 364);
+    }
+
+    #[test]
+    fn one_off_event_yesterday_hides_unless_kept() {
+        let today = d(2026, 10, 8);
+        let mut e = event(d(2026, 10, 7), RepeatRule::None);
+        assert!(!event_is_visible(&e, today));
+        assert_eq!(days_until(event_target(&e, today).unwrap(), today), -1);
+        e.keep_after_pass = true;
+        assert!(event_is_visible(&e, today));
+    }
+
+    // ---- tasks -------------------------------------------------------------------------
+
+    #[test]
+    fn overdue_tasks() {
+        let today = d(2026, 10, 8);
+        let mut t = Item::new(Kind::Task, "t", Utc::now());
+        assert!(!is_overdue(&t, today), "no due date is never overdue");
+        t.date = Some(today);
+        assert!(!is_overdue(&t, today), "due today is not overdue yet");
+        t.date = Some(d(2026, 10, 7));
+        assert!(is_overdue(&t, today));
+        t.completed_at = Some(Utc::now());
+        assert!(!is_overdue(&t, today), "completed tasks are never overdue");
+    }
+
+    #[test]
+    fn next_task_date_for_on_time_late_and_early_completion() {
+        let today = d(2026, 10, 8); // a Thursday
+        // Daily task due today, done today -> due tomorrow.
+        assert_eq!(
+            next_task_date(RepeatRule::Daily, Some(today), today),
+            Some(d(2026, 10, 9))
+        );
+        // Daily task 5 days overdue, done today -> due tomorrow (not today again).
+        assert_eq!(
+            next_task_date(RepeatRule::Daily, Some(d(2026, 10, 3)), today),
+            Some(d(2026, 10, 9))
+        );
+        // Weekly task due Monday Oct 5, done late on Thursday -> next Monday Oct 12.
+        assert_eq!(
+            next_task_date(RepeatRule::Weekly, Some(d(2026, 10, 5)), today),
+            Some(d(2026, 10, 12))
+        );
+        // Weekly task due Monday Oct 12, done early on Thursday -> Monday Oct 19.
+        assert_eq!(
+            next_task_date(RepeatRule::Weekly, Some(d(2026, 10, 12)), today),
+            Some(d(2026, 10, 19))
+        );
+        // Monthly on the 31st keeps its anchor.
+        assert_eq!(
+            next_task_date(RepeatRule::Monthly, Some(d(2026, 1, 31)), d(2026, 1, 31)),
+            Some(d(2026, 2, 28))
+        );
+        // No due date: anchored on today.
+        assert_eq!(
+            next_task_date(RepeatRule::Weekly, None, today),
+            Some(d(2026, 10, 15))
+        );
+        // Not repeating: no new instance.
+        assert_eq!(next_task_date(RepeatRule::None, Some(today), today), None);
+    }
+
+    // ---- parse_date_input --------------------------------------------------------------
+
+    #[test]
+    fn parses_typed_dates() {
+        let today = d(2026, 10, 8); // Thursday
+        let p = |s: &str| parse_date_input(s, today);
+        assert_eq!(p(""), Ok(None));
+        assert_eq!(p("  "), Ok(None));
+        assert_eq!(p("today"), Ok(Some(today)));
+        assert_eq!(p("Tomorrow"), Ok(Some(d(2026, 10, 9))));
+        assert_eq!(p("2026-12-25"), Ok(Some(d(2026, 12, 25))));
+        assert_eq!(p("12/25/2026"), Ok(Some(d(2026, 12, 25))));
+        assert_eq!(p("12-25"), Ok(Some(d(2026, 12, 25))));
+        assert_eq!(
+            p("1/5"),
+            Ok(Some(d(2027, 1, 5))),
+            "already passed this year -> next year"
+        );
+        assert_eq!(p("10/8"), Ok(Some(today)), "today counts as on-or-after");
+        assert_eq!(
+            p("2/29"),
+            Ok(Some(d(2028, 2, 29))),
+            "next Feb 29 is in 2028"
+        );
+        assert_eq!(p("+3"), Ok(Some(d(2026, 10, 11))));
+        assert_eq!(p("+3d"), Ok(Some(d(2026, 10, 11))));
+        assert_eq!(p("+2w"), Ok(Some(d(2026, 10, 22))));
+        assert_eq!(p("+1m"), Ok(Some(d(2026, 11, 8))));
+        assert_eq!(p("+1y"), Ok(Some(d(2027, 10, 8))));
+        assert_eq!(p("fri"), Ok(Some(d(2026, 10, 9))));
+        assert_eq!(
+            p("thursday"),
+            Ok(Some(d(2026, 10, 15))),
+            "same weekday means next week"
+        );
+        assert!(p("someday").is_err());
+        assert!(p("13/45").is_err());
+        assert!(p("+3x").is_err());
+        assert!(p("2026-02-30").is_err());
+    }
+}

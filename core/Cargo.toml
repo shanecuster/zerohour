@@ -1,0 +1,30 @@
+# zerohour-core — the shared brain of the app.
+#
+# RULE: nothing in this crate may depend on ratatui, crossterm, or any other UI code.
+# That is what lets the Android app (phase 3) reuse all of this logic as-is.
+
+[package]
+name = "zerohour-core"
+description = "Core logic for zerohour: tasks, countdowns, repeats, storage, stats, themes."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+# How other Rust code refers to us: `use zerohour_core::...` (dashes become underscores).
+name = "zerohour_core"
+
+[dependencies]
+# Dates and timestamps.
+chrono.workspace = true
+# Unique IDs for items and completions.
+uuid.workspace = true
+# Local storage.
+rusqlite.workspace = true
+# Serialize the model for future sync/export.
+serde.workspace = true
+# Platform data directory lookup for the default database location.
+directories.workspace = true
+# Our error enum (`DbError`).
+thiserror.workspace = true
