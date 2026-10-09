@@ -6,6 +6,12 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Title banner**: a big "zerohour" at the top of the main screen, in a gradient from the theme's
+  accent color to its event color, with a tagline counting down to the next event ("7 days to
+  Your Birthday", "Launch day is today!", or the date when there's none). Half-block letters, or
+  plain ASCII in ASCII icon mode. Shows on terminals at least 30 rows tall, not in narrow mode;
+  `b` switches it off and on (saved as `banner`, on by default).
+
 - **Due times** on tasks (optional, local wall-clock time): "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
   "! overdue 2h". Overdue the minute the time passes. 12-hour by default; `T` switches to 24-hour.
   Database schema version 3 adds the column; existing data is unchanged.

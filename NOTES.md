@@ -286,6 +286,42 @@ Branch `feature/schedule`, built on top of `feature/sync`.
   a row is written only after a successful send, reminders older than a grace window are skipped,
   and moving a task's time creates a new reminder.
 
+---
+
+## Title banner (done 2026-10-09)
+
+Branch `feature/banner`. A big "zerohour" above the Tasks box, modeled on tuxwire's banner (art
+hard-coded as text lines, no figlet library), plus a tagline.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/banner.rs` | The letters, in two fonts: a 3-row half-block design (`▀ ▄ █`, 31 columns) for Nerd/Unicode icon modes, and figlet's `smslant` (4 rows, 37 columns, plain ASCII) for ASCII mode. |
+| `core/src/theme.rs` | `Rgb::lerp`: mixes two theme colors, for gradients. |
+| `tui/src/ui/banner.rs` | When to show it (`fits`), the accent→event gradient, and the tagline. |
+| `tui/src/ui/list.rs` | Puts the banner above the Tasks box; the 50/50 split shares what's left. |
+
+### Rules worth knowing
+
+- **Shows only when** the terminal is at least 30 rows tall, not in narrow mode (60+ columns),
+  and `b` hasn't switched it off. Then it costs 4 rows (5 in ASCII mode), tagline included.
+- **Colors** are a left-to-right gradient from the theme's `accent` slot to its `event` slot,
+  so every theme has its own, and nothing is hard-coded.
+- **Tagline:** the soonest visible upcoming event: "X is today!", "1 day to X", "N days to X";
+  today's date if there's none. Hidden events and passed ones (`p`) are skipped.
+- The `zerohour` title in the top border stays.
+
+### Keys
+
+`b` banner on/off (saved as `banner` = on|off, default on)
+
+### Save to your personal notes
+
+- **Title:** Regenerate figlet text for a banner
+  **Command:** `figlet -f smslant zerohour` (list fonts: `ls /usr/share/figlet/fonts`)
+  **When:** making ASCII art for a project's title; paste the output into the source as a constant.
+
 ### Next: Phase 3 (Android)
 
 The Android app can reuse `zerohour_core::sync` as-is (enable the `sync` feature, not
