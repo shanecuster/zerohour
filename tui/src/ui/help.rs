@@ -27,9 +27,21 @@ const KEYS: &[(&str, &str)] = &[
     ("q / Ctrl+C", "quit"),
 ];
 
+/// Keys that only exist in builds with the `sync` feature.
+#[cfg(feature = "sync")]
+const SYNC_KEYS: &[(&str, &str)] = &[
+    ("r", "sync now"),
+    ("c", "sync settings (server, login, on/off)"),
+];
+/// Local-only builds have no sync keys.
+#[cfg(not(feature = "sync"))]
+const SYNC_KEYS: &[(&str, &str)] = &[];
+
 /// Draws the help popup.
 pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
-    let area = centered(frame.area(), 72, 27);
+    // Sync builds list extra keys, so the popup is a bit taller there.
+    let height = if cfg!(feature = "sync") { 29 } else { 27 };
+    let area = centered(frame.area(), 72, height);
     let block = popup_block(" Help ", theme, color(theme.accent));
     let key_style = Style::new()
         .fg(color(theme.accent))
@@ -40,7 +52,8 @@ pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
     let muted = Style::new().fg(color(theme.muted));
 
     let mut lines = vec![Line::from(Span::styled("Keys", heading))];
-    for (keys, what) in KEYS {
+    // `.chain(...)` continues one list with another; sync builds add their keys at the end.
+    for (keys, what) in KEYS.iter().chain(SYNC_KEYS) {
         lines.push(Line::from(vec![
             Span::styled(format!("  {keys:<12}"), key_style),
             Span::raw(*what),

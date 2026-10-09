@@ -10,6 +10,7 @@
 //! - [`stats`]  — statistics (streaks, per-week counts, overdue) computed from the completion log.
 //! - [`theme`]  — named color slots and the built-in palettes (Everforest, Dracula, ...).
 //! - [`icons`]  — every icon in one table with Nerd Font / Unicode / ASCII versions.
+//! - `sync`     — optional CouchDB sync (only with the `sync` cargo feature; see `sync/mod.rs`).
 //!
 //! A Rust "crate" is a package; a "module" is one file (or folder) inside it. `pub mod x;`
 //! below tells the compiler "there is a file `x.rs`, and other crates may use what's public in it".
@@ -19,6 +20,10 @@ pub mod icons;
 pub mod model;
 pub mod repeat;
 pub mod stats;
+// `#[cfg(feature = "sync")]` = "only compile this module when the `sync` feature is on".
+// Without it, none of the network code is even built.
+#[cfg(feature = "sync")]
+pub mod sync;
 pub mod theme;
 
 /// The app's name, used for the data folder, window titles, and the header.

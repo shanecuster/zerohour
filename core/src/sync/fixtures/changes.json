@@ -1,0 +1,6 @@
+{"results":[
+{"seq":"1-g1AAAABteJzLYWBgYMpgTmHgz8tPSTV0MDQy1zMwMDTXMwRKMeUAAAF0gYa","id":"_design/app","changes":[{"rev":"1-967a00dff5e02add41819138abb3284d"}],"doc":{"_id":"_design/app","_rev":"1-967a00dff5e02add41819138abb3284d","views":{}}},
+{"seq":"2-g1AAAABteJzLYWBgYMpgTmHgz8tPSTV0MDQy1zMwMDTXMwRKMeUAAAF0gYb","id":"item:0f8e2c1a-5b7d-4c3e-9a10-2b4c6d8e0f12","changes":[{"rev":"2-7051cbe5c8faecd085a3fa619e6e6337"}],"doc":{"_id":"item:0f8e2c1a-5b7d-4c3e-9a10-2b4c6d8e0f12","_rev":"2-7051cbe5c8faecd085a3fa619e6e6337","type":"item","v":1,"kind":"event","title":"Christmas","notes":null,"priority":"medium","date":"2026-12-25","repeat":"yearly","keep_after_pass":false,"completed_at":null,"created_at":"2026-10-01T09:00:00.000Z","updated_at":"2026-10-02T10:30:00.000Z","deleted":false}},
+{"seq":"3-g1AAAABteJzLYWBgYMpgTmHgz8tPSTV0MDQy1zMwMDTXMwRKMeUAAAF0gYc","id":"item:7a1c9e3b-2d4f-4a6b-8c0d-1e2f3a4b5c6d","changes":[{"rev":"4-5d2b1f0e9c8a7b6d5e4f3a2b1c0d9e8f"}],"deleted":true,"doc":{"_id":"item:7a1c9e3b-2d4f-4a6b-8c0d-1e2f3a4b5c6d","_rev":"4-5d2b1f0e9c8a7b6d5e4f3a2b1c0d9e8f","_deleted":true}}
+],
+"last_seq":"3-g1AAAABteJzLYWBgYMpgTmHgz8tPSTV0MDQy1zMwMDTXMwRKMeUAAAF0gYc","pending":0}

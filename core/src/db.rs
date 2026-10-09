@@ -8,6 +8,10 @@
 //! schema later (e.g. adding tags), append a new entry to [`MIGRATIONS`] — never edit an old
 //! one, because existing databases have already run it.
 //!
+//! **Sync.** The sync bookkeeping SQL (the `sync_docs` table) lives in `sync/store.rs`, behind
+//! the `sync` feature, so local-only builds don't even compile it. It reuses the helpers below,
+//! which is why a few of them are `pub(crate)` (visible inside this crate only).
+//!
 //! **Formats.** Calendar dates are stored as `YYYY-MM-DD` text. Timestamps are stored as UTC in
 //! RFC 3339 text (`2026-10-08T14:03:00Z`). Text sorts correctly and is easy to read with the
 //! `sqlite3` command-line tool when debugging.
@@ -17,7 +21,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{Completion, Item, Kind, Priority, RepeatRule, new_id};
+use crate::model::{
+    Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
+};
 use crate::repeat::{is_overdue, next_task_date};
 
 /// Everything that can go wrong in the storage layer.
@@ -45,10 +51,12 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
-/// Version 1 is the initial schema. NEVER edit an entry once released; add a new one instead.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    "
+/// Version 1 is the initial schema; version 2 adds the sync bookkeeping table.
+/// NEVER edit an entry once released; add a new one instead.
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        "
     -- One row per task or event. Tasks and events share the table (see model::Item).
     CREATE TABLE items (
         id              TEXT PRIMARY KEY,      -- UUID, unique across devices
@@ -82,11 +90,26 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         value TEXT NOT NULL
     );
     ",
-)];
+    ),
+    (
+        2,
+        "
+    -- Sync bookkeeping (phase 2). One row per document this device has seen on, or pushed
+    -- to, the CouchDB server. Purely additive: no existing table or column changes, and a
+    -- database that never syncs simply leaves this table empty. Created in every build (with
+    -- or without the `sync` feature) so one database file works with both kinds of build.
+    CREATE TABLE sync_docs (
+        doc_id            TEXT PRIMARY KEY,  -- 'item:<uuid>' or 'completion:<uuid>'
+        rev               TEXT NOT NULL,     -- CouchDB _rev we last saw or wrote
+        synced_updated_at TEXT               -- updated_at of the version that rev holds
+    );
+    ",
+    ),
+];
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
-const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
+pub(crate) const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
                             completed_at, created_at, updated_at, deleted";
 
 /// Well-known keys for the settings table, so typos become compile errors instead of bugs.
@@ -102,7 +125,8 @@ pub mod settings_keys {
 /// It owns the SQLite `Connection`; when the `Db` is dropped (goes out of scope), Rust closes
 /// the connection automatically. No manual cleanup needed — that's ownership at work.
 pub struct Db {
-    conn: Connection,
+    /// `pub(crate)` so the sync bookkeeping in `sync/store.rs` can run its own SQL.
+    pub(crate) conn: Connection,
 }
 
 impl Db {
@@ -199,12 +223,18 @@ impl Db {
         insert_item_on(&self.conn, item)
     }
 
-    /// Saves changes to an existing item, stamping `updated_at = now`.
+    /// Saves changes to an existing item, stamping a fresh `updated_at` (normally `now`; see
+    /// [`next_updated_at`] for the clock-skew rule).
     ///
     /// `item: &mut Item` is a *mutable borrow*: we may change the caller's item (to set
     /// `updated_at`), but we don't take ownership of it.
     pub fn update_item(&self, item: &mut Item, now: DateTime<Utc>) -> Result<()> {
-        item.updated_at = now;
+        // Base the new timestamp on what's stored, not on the caller's copy: a sync may have
+        // updated the row since the caller loaded it.
+        let stored = self
+            .stored_updated_at(&item.id)?
+            .ok_or_else(|| DbError::NotFound(item.id.clone()))?;
+        item.updated_at = next_updated_at(stored, now);
         let changed = self.conn.execute(
             "UPDATE items SET kind = ?2, title = ?3, notes = ?4, priority = ?5, date = ?6,
                               repeat = ?7, keep_after_pass = ?8, completed_at = ?9,
@@ -234,9 +264,12 @@ impl Db {
     /// Soft-deletes an item: marks it deleted (and bumps `updated_at`) but keeps the row,
     /// so the deletion can be synced to other devices later.
     pub fn delete_item(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        let stored = self
+            .stored_updated_at(id)?
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
         let changed = self.conn.execute(
             "UPDATE items SET deleted = 1, updated_at = ?2 WHERE id = ?1 AND deleted = 0",
-            params![id, ts_to_db(now)],
+            params![id, ts_to_db(next_updated_at(stored, now))],
         )?;
         if changed == 0 {
             return Err(DbError::NotFound(id.to_string()));
@@ -244,17 +277,20 @@ impl Db {
         Ok(())
     }
 
+    /// The stored `updated_at` of an item, or `None` if there's no such id.
+    fn stored_updated_at(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
+        let text: Option<String> = self
+            .conn
+            .query_row("SELECT updated_at FROM items WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        text.as_deref().map(ts_from_db).transpose()
+    }
+
     /// Loads one item by id (including deleted ones), or `None` if there's no such id.
     pub fn get_item(&self, id: &str) -> Result<Option<Item>> {
-        let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
-        // `.optional()` turns "no rows" into `Ok(None)` instead of an error.
-        let raw = self
-            .conn
-            .query_row(&sql, [id], RawItem::from_row)
-            .optional()?;
-        // `.map(...)` converts the inner RawItem if present; `.transpose()` flips
-        // `Option<Result<Item>>` into `Result<Option<Item>>` so `?` can be used on it.
-        raw.map(RawItem::into_item).transpose()
+        get_item_on(&self.conn, id)
     }
 
     /// Every item that isn't deleted, open and completed, tasks and events.
@@ -294,8 +330,11 @@ impl Db {
             return Ok(None); // Already done; completing twice would double-count stats.
         }
 
+        // The completion and the next instance get ids *derived* from this task's id (see
+        // `model::derived_id`), so completing the same task on two offline devices produces
+        // the same rows, which sync then merges into one.
         let completion = Completion {
-            id: new_id(),
+            id: derived_id(DerivedId::Completion, &task.id),
             item_id: task.id.clone(),
             completed_at: now,
             title_snapshot: task.title.clone(),
@@ -307,7 +346,7 @@ impl Db {
         let next = next_task_date(task.repeat, task.date, today).map(|date| {
             // `..task.clone()` = "every other field copied from the old task".
             Item {
-                id: new_id(),
+                id: derived_id(DerivedId::NextInstance, &task.id),
                 date: Some(date),
                 completed_at: None,
                 created_at: now,
@@ -317,17 +356,26 @@ impl Db {
         });
 
         task.completed_at = Some(now);
-        task.updated_at = now;
+        task.updated_at = next_updated_at(task.updated_at, now);
 
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE items SET completed_at = ?2, updated_at = ?3 WHERE id = ?1",
-            params![task.id, ts_to_db(now), ts_to_db(now)],
+            params![task.id, ts_to_db(now), ts_to_db(task.updated_at)],
         )?;
-        insert_completion_on(&tx, &completion)?;
-        if let Some(next) = &next {
-            insert_item_on(&tx, next)?;
+        // With sync, the other device's copy of these rows may already have arrived (same
+        // derived ids). Then we keep what's there instead of failing on a duplicate id.
+        if !row_exists_on(&tx, "completions", &completion.id)? {
+            insert_completion_on(&tx, &completion)?;
         }
+        let next = match next {
+            Some(next) if row_exists_on(&tx, "items", &next.id)? => get_item_on(&tx, &next.id)?,
+            Some(next) => {
+                insert_item_on(&tx, &next)?;
+                Some(next)
+            }
+            None => None,
+        };
         tx.commit()?;
         Ok(next)
     }
@@ -340,34 +388,7 @@ impl Db {
 
     /// The whole completion log, oldest first. This is the input for `stats::compute`.
     pub fn list_completions(&self) -> Result<Vec<Completion>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue
-             FROM completions ORDER BY completed_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, bool>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, item_id, completed_at, title, priority, was_overdue) = row?;
-            out.push(Completion {
-                id,
-                item_id,
-                completed_at: ts_from_db(&completed_at)?,
-                title_snapshot: title,
-                priority_snapshot: Priority::parse(&priority)
-                    .ok_or_else(|| DbError::BadData(format!("unknown priority '{priority}'")))?,
-                was_overdue,
-            });
-        }
-        Ok(out)
+        completions_where(&self.conn, "1 = 1")
     }
 
     // ---- settings ----------------------------------------------------------------------
@@ -409,11 +430,69 @@ pub fn default_db_path() -> Option<PathBuf> {
 // transaction: a rusqlite `Transaction` "derefs" to a `Connection`, meaning `&tx` can be
 // passed wherever `&Connection` is expected.
 
+/// Loads completions matching an SQL condition (`filter`), oldest first.
+///
+/// `filter` is always a constant written in this crate (e.g. `"1 = 1"` for "all rows"), never
+/// user input, so pasting it into the SQL is safe.
+pub(crate) fn completions_where(conn: &Connection, filter: &str) -> Result<Vec<Completion>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue
+         FROM completions WHERE {filter} ORDER BY completed_at"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, bool>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, item_id, completed_at, title, priority, was_overdue) = row?;
+        out.push(Completion {
+            id,
+            item_id,
+            completed_at: ts_from_db(&completed_at)?,
+            title_snapshot: title,
+            priority_snapshot: Priority::parse(&priority)
+                .ok_or_else(|| DbError::BadData(format!("unknown priority '{priority}'")))?,
+            was_overdue,
+        });
+    }
+    Ok(out)
+}
+
+/// Loads one item by id using the given connection or transaction.
+pub(crate) fn get_item_on(conn: &Connection, id: &str) -> Result<Option<Item>> {
+    let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
+    // `.optional()` turns "no rows" into `Ok(None)` instead of an error.
+    let raw = conn.query_row(&sql, [id], RawItem::from_row).optional()?;
+    // `.map(...)` converts the inner RawItem if present; `.transpose()` flips
+    // `Option<Result<Item>>` into `Result<Option<Item>>` so `?` can be used on it.
+    raw.map(RawItem::into_item).transpose()
+}
+
 /// Inserts an item row using the given connection or transaction.
-fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
+pub(crate) fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
+    write_item_on(conn, item, "INSERT")
+}
+
+/// Inserts an item row, or overwrites the row with the same id. Used when sync brings in a
+/// newer version of an item.
+#[cfg(feature = "sync")]
+pub(crate) fn replace_item_on(conn: &Connection, item: &Item) -> Result<()> {
+    write_item_on(conn, item, "INSERT OR REPLACE")
+}
+
+/// Shared body of [`insert_item_on`] and `replace_item_on`: `verb` is the SQL that starts the
+/// statement (a constant, never user input).
+fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
     conn.execute(
         &format!(
-            "INSERT INTO items ({ITEM_COLUMNS})
+            "{verb} INTO items ({ITEM_COLUMNS})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
         ),
         params![
@@ -434,8 +513,21 @@ fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
     Ok(())
 }
 
+/// True if `table` has a row with this `id`. `table` is always one of our own constant names,
+/// never user input, so building the SQL with `format!` is safe here.
+pub(crate) fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            [id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 /// Inserts a completion row using the given connection or transaction.
-fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
+pub(crate) fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
     conn.execute(
         "INSERT INTO completions
              (id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue)
@@ -456,7 +548,7 @@ fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
 ///
 /// Reading happens in two steps because rusqlite's row callback can only return rusqlite
 /// errors; parsing our own formats (dates, enums) happens afterwards with our own errors.
-struct RawItem {
+pub(crate) struct RawItem {
     id: String,
     kind: String,
     title: String,
@@ -476,7 +568,7 @@ impl RawItem {
     ///
     /// `Row<'_>` has a *lifetime* parameter: the row borrows from the running query and is only
     /// valid while it runs. `'_` tells Rust "work out that lifetime yourself".
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<RawItem> {
+    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<RawItem> {
         Ok(RawItem {
             id: row.get(0)?,
             kind: row.get(1)?,
@@ -494,7 +586,7 @@ impl RawItem {
     }
 
     /// Parses the text columns into proper types, failing with a clear message on bad data.
-    fn into_item(self) -> Result<Item> {
+    pub(crate) fn into_item(self) -> Result<Item> {
         let bad = |what: &str, value: &str| DbError::BadData(format!("unknown {what} '{value}'"));
         Ok(Item {
             kind: Kind::parse(&self.kind).ok_or_else(|| bad("kind", &self.kind))?,
@@ -515,24 +607,24 @@ impl RawItem {
 }
 
 /// Date -> `"2026-12-25"`.
-fn date_to_db(date: NaiveDate) -> String {
+pub(crate) fn date_to_db(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
 /// `"2026-12-25"` -> Date.
-fn date_from_db(s: &str) -> Result<NaiveDate> {
+pub(crate) fn date_from_db(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| DbError::BadData(format!("bad date '{s}'")))
 }
 
 /// Timestamp -> `"2026-10-08T14:03:00.123Z"` (RFC 3339, always UTC, always the same width
 /// so that text sorting equals time sorting).
-fn ts_to_db(ts: DateTime<Utc>) -> String {
+pub(crate) fn ts_to_db(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// RFC 3339 text -> UTC timestamp.
-fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|ts| ts.with_timezone(&Utc))
         .map_err(|_| DbError::BadData(format!("bad timestamp '{s}'")))
@@ -541,7 +633,7 @@ fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Unit;
+    use crate::model::{Unit, new_id};
     use chrono::TimeZone;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -555,10 +647,59 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn version_1_database_upgrades_without_touching_existing_rows() {
+        // Build a database exactly as a phase 1 build left it: only migration 1 applied.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[0].1).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            [ts_to_db(now())],
+        )
+        .unwrap();
+        let old = Db { conn };
+        let mut task = Item::new(Kind::Task, "old task", now());
+        task.date = Some(d(2026, 10, 1));
+        old.insert_item(&task).unwrap();
+        // The completion and the next instance get ids *derived* from this task's id (see
+        // `model::derived_id`), so completing the same task on two offline devices produces
+        // the same rows, which sync then merges into one.
+        let completion = Completion {
+            id: derived_id(DerivedId::Completion, &task.id),
+            item_id: task.id.clone(),
+            completed_at: now(),
+            title_snapshot: "old task".into(),
+            priority_snapshot: Priority::Medium,
+            was_overdue: true,
+        };
+        old.insert_completion(&completion).unwrap();
+        old.set_setting(settings_keys::THEME, "Nord").unwrap();
+
+        // Re-run initialization the way `Db::open` does on the next start.
+        let db = Db::init(old.conn).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.list_items().unwrap(), vec![task]);
+        assert_eq!(db.list_completions().unwrap(), vec![completion]);
+        assert_eq!(
+            db.get_setting(settings_keys::THEME).unwrap().as_deref(),
+            Some("Nord")
+        );
+        // The new table exists and starts empty.
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
@@ -664,6 +805,96 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items.iter().filter(|i| i.is_completed()).count(), 1);
         assert!(!db.list_completions().unwrap()[0].was_overdue);
+    }
+
+    #[test]
+    fn edits_stamp_past_a_stored_time_from_the_future() {
+        // A version synced from a device whose clock runs 10 minutes fast.
+        let db = Db::open_in_memory().unwrap();
+        let ahead = now() + chrono::TimeDelta::minutes(10);
+        let mut item = Item::new(Kind::Task, "from fast clock", ahead);
+        db.insert_item(&item).unwrap();
+
+        // Editing it "now" must still produce a newer timestamp than the stored one.
+        db.update_item(&mut item, now()).unwrap();
+        let one_ms = chrono::TimeDelta::milliseconds(1);
+        assert_eq!(item.updated_at, ahead + one_ms);
+        db.delete_item(&item.id, now()).unwrap();
+        let deleted = db.get_item(&item.id).unwrap().unwrap();
+        assert_eq!(deleted.updated_at, ahead + one_ms + one_ms);
+    }
+
+    #[test]
+    fn local_completion_flow_is_unchanged_with_derived_ids() {
+        // Existing phase 1 data: a repeating task with a random (v4) id, plus another item and
+        // an old completion that must not be touched.
+        let mut db = Db::open_in_memory().unwrap();
+        let mut task = Item::new(Kind::Task, "water plants", now());
+        task.date = Some(d(2026, 10, 8));
+        task.repeat = RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        let bystander = Item::new(Kind::Event, "untouched", now());
+        db.insert_item(&bystander).unwrap();
+        let old_completion = Completion {
+            id: new_id(),
+            item_id: new_id(),
+            completed_at: now() - chrono::TimeDelta::days(3),
+            title_snapshot: "older".into(),
+            priority_snapshot: Priority::Low,
+            was_overdue: false,
+        };
+        db.insert_completion(&old_completion).unwrap();
+
+        // Complete it, then complete the next instance too: a chain of three.
+        let second = db
+            .complete_task(&task.id, d(2026, 10, 8), now())
+            .unwrap()
+            .unwrap();
+        let later = now() + chrono::TimeDelta::days(7);
+        let third = db
+            .complete_task(&second.id, d(2026, 10, 15), later)
+            .unwrap()
+            .unwrap();
+
+        // Same visible results as before: dates, titles, history rows, one log entry each.
+        assert_eq!(second.date, Some(d(2026, 10, 15)));
+        assert_eq!(third.date, Some(d(2026, 10, 22)));
+        assert_eq!(db.list_items().unwrap().len(), 4);
+        assert_eq!(db.get_item(&bystander.id).unwrap().unwrap(), bystander);
+        let log = db.list_completions().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0], old_completion, "old rows are never rewritten");
+
+        // The new ids are the derived ones, all distinct.
+        assert_eq!(second.id, derived_id(DerivedId::NextInstance, &task.id));
+        assert_eq!(third.id, derived_id(DerivedId::NextInstance, &second.id));
+        assert_eq!(log[1].id, derived_id(DerivedId::Completion, &task.id));
+        assert_eq!(log[2].id, derived_id(DerivedId::Completion, &second.id));
+        assert_ne!(log[1].id, log[2].id);
+    }
+
+    #[test]
+    fn completing_when_synced_copies_already_exist_keeps_them() {
+        // Another device completed this task first and its rows already synced here, but the
+        // task itself still looks open locally (its update hasn't arrived yet).
+        let mut db = Db::open_in_memory().unwrap();
+        let mut task = Item::new(Kind::Task, "weekly review", now());
+        task.date = Some(d(2026, 10, 8));
+        task.repeat = RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        let mut theirs = Item::new(Kind::Task, "weekly review (theirs)", now());
+        theirs.id = derived_id(DerivedId::NextInstance, &task.id);
+        db.insert_item(&theirs).unwrap();
+
+        let next = db
+            .complete_task(&task.id, d(2026, 10, 8), now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next, theirs,
+            "the existing copy wins, no duplicate-id error"
+        );
+        assert_eq!(db.list_items().unwrap().len(), 2);
     }
 
     #[test]

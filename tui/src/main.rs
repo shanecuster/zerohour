@@ -14,12 +14,13 @@
 mod app;
 mod demo;
 mod input;
+#[cfg(feature = "sync")]
+mod sync;
 mod ui;
 
 use std::io::{Stdout, stdout};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -71,8 +72,8 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<()> {
     // Everything that can fail in a "normal" way happens BEFORE we take over the terminal,
     // so error messages print cleanly in your shell.
-    let db = open_database(&args)?;
-    let mut app = App::new(db, args.demo)?;
+    let (db, db_path) = open_database(&args)?;
+    let mut app = App::new(db, args.demo, db_path)?;
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("couldn't set up the terminal")?;
@@ -83,12 +84,15 @@ fn run(args: Args) -> Result<()> {
 }
 
 /// Decides which database to open based on the flags.
-fn open_database(args: &Args) -> Result<Db> {
+///
+/// Also returns the file's path for sync, or `None` in demo mode: sample data must never be
+/// synced to a real server, even when `--demo` is combined with `--db`.
+fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
     // `--demo` without `--db`: a throwaway in-memory database filled with samples.
     if args.demo && args.db.is_none() {
         let db = Db::open_in_memory()?;
         demo::seed(&db, local_today()).context("couldn't load the demo data")?;
-        return Ok(db);
+        return Ok((db, None));
     }
 
     let path = match &args.db {
@@ -101,8 +105,9 @@ fn open_database(args: &Args) -> Result<Db> {
     let db = Db::open(&path)?;
     if args.demo {
         demo::seed(&db, local_today()).context("couldn't load the demo data")?;
+        return Ok((db, None));
     }
-    Ok(db)
+    Ok((db, Some(path)))
 }
 
 /// The main loop: draw, wait up to a second for input, handle it, repeat until quit.
@@ -114,7 +119,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
         // `draw` gives us a `Frame` to paint on; the closure paints the whole UI.
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if event::poll(Duration::from_secs(1))? {
+        if event::poll(app.poll_interval())? {
             match event::read()? {
                 // Only react to key *presses*. Some terminals (notably on Windows) also send
                 // key *release* events, which would otherwise trigger every action twice.
