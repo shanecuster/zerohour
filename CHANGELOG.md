@@ -6,6 +6,12 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Better `--demo` data** for screenshots, all fictional and relative to today: 8 tasks (one due
+  later today, one overdue, a Mon–Thu 2:00 PM "Submit weekly report", one with notes), 5 upcoming
+  events (Christmas, a product launch, a monthly book club, a concert, a trip), and 12 weeks of
+  completion history with a 9-day streak, a few late completions, and a mixed priority breakdown.
+  Still in-memory unless combined with `--db`, and never synced.
+
 - **Title banner**: a big "zerohour" at the top of the main screen, in a gradient from the theme's
   accent color to its event color, with a tagline counting down to the next event ("7 days to
   Your Birthday", "Launch day is today!", or the date when there's none). Half-block letters, or

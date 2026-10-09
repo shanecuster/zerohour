@@ -322,6 +322,49 @@ hard-coded as text lines, no figlet library), plus a tagline.
   **Command:** `figlet -f smslant zerohour` (list fonts: `ls /usr/share/figlet/fonts`)
   **When:** making ASCII art for a project's title; paste the output into the source as a constant.
 
+## Demo data for screenshots (done 2026-10-09)
+
+`zerohour --demo` now shows a fuller, entirely fictional sample set (no real names, places,
+employers or servers), built so the main screen and the stats screen both look populated.
+
+### What was built
+
+| File | What it does |
+|---|---|
+| `tui/src/demo.rs` | The sample data. `seed(db, now)` takes the local date and time as a parameter, so tests can seed the demo as of any moment. |
+| `tui/src/main.rs` | Passes `local_now()` to `seed`; new tests check that `--demo` never returns a sync path. |
+
+- **Tasks (8):** High, Medium and Low; one due later today at a set time ("in 2h"), one
+  overdue (due yesterday), "Submit weekly report" repeating Mon–Thu at 2:00 PM, one with notes,
+  one with no date.
+- **Events (5):** Christmas (yearly), a product launch, a monthly book club, a concert and a
+  trip. Every event is stored at its *next* occurrence, so none is ever in the past.
+- **History:** completions from the Monday that starts the oldest bar on the stats chart up to
+  yesterday (12 weeks), shaped by a per-week load × per-weekday shape (Sundays are off). Gives
+  ~90 completions, a current streak of exactly 9 days (also the best), ~7% late, and a priority
+  mix of about 40% Medium, 35% High, 25% Low.
+
+### Rules worth knowing
+
+- **Never in the past:** the due-today task falls back to 11:59 PM late in the evening; the
+  weekly report moves to the next Mon–Thu once 2:00 PM has passed, so the overdue task stays
+  the only one.
+- **Nothing is completed "today"**, since a completion later than now would be in the future.
+  The streak counts back from yesterday, which is how the stats screen treats an unfinished day.
+- **Safety is unchanged:** `--demo` alone uses an in-memory database; with `--db` it seeds that
+  file. Either way demo mode never syncs, and the keyring/password file are only looked at from
+  the sync screen, which demo mode blocks.
+- Tests seed at fixed moments (a Monday morning, a Thursday afternoon, a late Sunday, Dec 26,
+  Jan 1) and check: no past events, exactly one overdue task, history spanning the 12 charted
+  weeks, streak 9, and the priority mix. One more test builds the real `App` and checks the
+  stats it would draw.
+
+### Save to your personal notes
+
+- **Title:** Take zerohour screenshots with sample data
+  **Command:** `cargo run -p zerohour -- --demo` (then `Tab` for the stats screen)
+  **When:** for README images or to check a theme; the data is fictional and always current.
+
 ### Next: Phase 3 (Android)
 
 The Android app can reuse `zerohour_core::sync` as-is (enable the `sync` feature, not

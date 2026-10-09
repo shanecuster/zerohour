@@ -47,7 +47,7 @@ cargo install --path tui --features sync
 
 Without `--features sync`, the app contains no network code at all.
 
-Try it with sample data (nothing is saved):
+Try it with sample data (fictional, always dated relative to today; nothing is saved or synced):
 
 ```sh
 zerohour --demo
@@ -109,7 +109,7 @@ A mouse click on a day picks it, and the scroll wheel changes the month.
 Options:
 
 - `--db <path>`: use a different database file
-- `--demo`: load sample data without saving anything
+- `--demo`: load sample tasks, events and 12 weeks of stats history without saving or syncing anything
 
 Your data is stored in `~/.local/share/zerohour/zerohour.db`.
 

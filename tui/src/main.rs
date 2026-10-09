@@ -36,7 +36,7 @@ use ratatui::crossterm::{cursor, execute};
 use zerohour_core::APP_NAME;
 use zerohour_core::db::{Db, default_db_path};
 
-use crate::app::{App, local_today};
+use crate::app::{App, local_now};
 
 /// Command-line flags. `clap` reads the doc comments below and turns them into `--help` text.
 #[derive(Parser, Debug)]
@@ -93,7 +93,7 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
     // `--demo` without `--db`: a throwaway in-memory database filled with samples.
     if args.demo && args.db.is_none() {
         let db = Db::open_in_memory()?;
-        demo::seed(&db, local_today()).context("couldn't load the demo data")?;
+        demo::seed(&db, local_now()).context("couldn't load the demo data")?;
         return Ok((db, None));
     }
 
@@ -106,7 +106,7 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
     // The DbError message already names the file and the problem.
     let db = Db::open(&path)?;
     if args.demo {
-        demo::seed(&db, local_today()).context("couldn't load the demo data")?;
+        demo::seed(&db, local_now()).context("couldn't load the demo data")?;
         return Ok((db, None));
     }
     Ok((db, Some(path)))
@@ -186,4 +186,44 @@ fn install_panic_hook() {
         restore_terminal();
         default_hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--demo` on its own seeds a throwaway in-memory database (it never opens the default
+    /// file) and returns no path, so sync can't start.
+    #[test]
+    fn demo_alone_stays_in_memory_and_never_syncs() {
+        let args = Args {
+            db: None,
+            demo: true,
+        };
+        let (db, path) = open_database(&args).unwrap();
+        assert!(path.is_none());
+        assert!(!db.list_items().unwrap().is_empty());
+    }
+
+    /// `--demo --db <file>` seeds that file, but still returns no path: demo data never syncs.
+    #[test]
+    fn demo_with_a_file_never_syncs() {
+        let file = std::env::temp_dir().join(format!("zerohour-demo-test-{}.db", uuid_like()));
+        let args = Args {
+            db: Some(file.clone()),
+            demo: true,
+        };
+        let (_db, path) = open_database(&args).unwrap();
+        assert!(path.is_none());
+        let _ = std::fs::remove_file(&file);
+    }
+
+    /// A unique-enough suffix for a temp file name (process id + nanoseconds).
+    fn uuid_like() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{}-{nanos}", std::process::id())
+    }
 }
