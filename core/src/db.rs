@@ -45,10 +45,12 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
-/// Version 1 is the initial schema. NEVER edit an entry once released; add a new one instead.
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    "
+/// Version 1 is the initial schema; version 2 adds the sync bookkeeping table.
+/// NEVER edit an entry once released; add a new one instead.
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        "
     -- One row per task or event. Tasks and events share the table (see model::Item).
     CREATE TABLE items (
         id              TEXT PRIMARY KEY,      -- UUID, unique across devices
@@ -82,7 +84,22 @@ const MIGRATIONS: &[(i64, &str)] = &[(
         value TEXT NOT NULL
     );
     ",
-)];
+    ),
+    (
+        2,
+        "
+    -- Sync bookkeeping (phase 2). One row per document this device has seen on, or pushed
+    -- to, the CouchDB server. Purely additive: no existing table or column changes, and a
+    -- database that never syncs simply leaves this table empty. Created in every build (with
+    -- or without the `sync` feature) so one database file works with both kinds of build.
+    CREATE TABLE sync_docs (
+        doc_id            TEXT PRIMARY KEY,  -- 'item:<uuid>' or 'completion:<uuid>'
+        rev               TEXT NOT NULL,     -- CouchDB _rev we last saw or wrote
+        synced_updated_at TEXT               -- updated_at of the version that rev holds
+    );
+    ",
+    ),
+];
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
@@ -555,10 +572,56 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 1);
+        assert_eq!(db.schema_version().unwrap(), 2);
+    }
+
+    #[test]
+    fn version_1_database_upgrades_without_touching_existing_rows() {
+        // Build a database exactly as a phase 1 build left it: only migration 1 applied.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute_batch(MIGRATIONS[0].1).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?1)",
+            [ts_to_db(now())],
+        )
+        .unwrap();
+        let old = Db { conn };
+        let mut task = Item::new(Kind::Task, "old task", now());
+        task.date = Some(d(2026, 10, 1));
+        old.insert_item(&task).unwrap();
+        let completion = Completion {
+            id: new_id(),
+            item_id: task.id.clone(),
+            completed_at: now(),
+            title_snapshot: "old task".into(),
+            priority_snapshot: Priority::Medium,
+            was_overdue: true,
+        };
+        old.insert_completion(&completion).unwrap();
+        old.set_setting(settings_keys::THEME, "Nord").unwrap();
+
+        // Re-run initialization the way `Db::open` does on the next start.
+        let db = Db::init(old.conn).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.list_items().unwrap(), vec![task]);
+        assert_eq!(db.list_completions().unwrap(), vec![completion]);
+        assert_eq!(
+            db.get_setting(settings_keys::THEME).unwrap().as_deref(),
+            Some("Nord")
+        );
+        // The new table exists and starts empty.
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

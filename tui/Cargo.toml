@@ -32,3 +32,9 @@ clap.workspace = true
 anyhow.workspace = true
 # Truncating titles to fit columns, measured in terminal cells instead of bytes.
 unicode-width.workspace = true
+
+# Optional parts of the app, switched on with `--features ...`. Nothing is on by default, so
+# `cargo install --path tui` builds a local-only app with no network code.
+[features]
+# CouchDB sync: install with `cargo install --path tui --features sync`.
+sync = ["zerohour-core/sync"]
