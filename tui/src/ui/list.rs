@@ -15,6 +15,9 @@
 //! Tasks and events each get their own color (theme `task` / `event` slots) AND their own
 //! marker icon, so color is never the only way to tell them apart.
 //!
+//! **Banner**: on tall screens (30+ rows, not narrow), a big "zerohour" title and a
+//! next-event tagline sit above the Tasks box (see `banner.rs`); the boxes share what's left.
+//!
 //! **Layout** (`v` toggles, saved in settings): *split* gives Tasks and Events equal halves of
 //! the height (the default); *fit* sizes the Events box to its rows and gives Tasks the rest.
 //!
@@ -33,7 +36,7 @@ use zerohour_core::model::{Item, Priority};
 use zerohour_core::repeat::{days_until, is_overdue};
 use zerohour_core::theme::{Rgb, Theme};
 
-use super::{NARROW_WIDTH, color, screen_block, truncate, width_u16};
+use super::{NARROW_WIDTH, banner, color, screen_block, truncate, width_u16};
 use crate::app::{App, EventRow, LayoutMode};
 
 /// From this width up, an extra column shows the actual date ("Fri Dec 25").
@@ -60,7 +63,15 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|item| item.notes.clone())
         .filter(|n| !n.is_empty());
     let notes_height = u16::from(notes.is_some());
-    let sections_height = inner.height.saturating_sub(notes_height + 1);
+    // The banner takes its rows first, when the screen is big enough for it.
+    let banner_height = if banner::fits(area.width, area.height, app.icon_mode) {
+        banner::height(app.icon_mode)
+    } else {
+        0
+    };
+    let sections_height = inner
+        .height
+        .saturating_sub(banner_height + notes_height + 1);
     let events_height = match app.layout {
         LayoutMode::Split => split_heights(sections_height).1,
         // Fit: the Events box is sized to its rows (+2 for borders), but never more than half
@@ -73,7 +84,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // `Layout::vertical(...).areas(rect)` splits a rectangle into rows. `Fill(1)` takes
     // whatever space is left after the fixed `Length`s.
-    let [tasks_area, events_area, notes_area, footer_area] = Layout::vertical([
+    let [
+        banner_area,
+        tasks_area,
+        events_area,
+        notes_area,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(banner_height),
         Constraint::Fill(1),
         Constraint::Length(events_height),
         Constraint::Length(notes_height),
@@ -81,6 +99,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
     ])
     .areas(inner);
 
+    if banner_height > 0 {
+        banner::draw(frame, banner_area, app);
+    }
     draw_tasks(frame, tasks_area, app, narrow, show_dates);
     draw_events(frame, events_area, app, narrow, show_dates);
     if let Some(notes) = notes {
