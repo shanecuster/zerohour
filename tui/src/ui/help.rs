@@ -20,6 +20,8 @@ const KEYS: &[(&str, &str)] = &[
     ("d", "delete the selected item"),
     ("j k / ↑ ↓", "move · g G jump to top/bottom"),
     ("p", "show/hide one-off events that have passed"),
+    ("v", "layout: split 50/50 ↔ events fit their content"),
+    ("T", "times: 12-hour ↔ 24-hour"),
     ("Tab / s", "switch to stats and back"),
     ("t", "theme picker (live preview)"),
     ("i", "icons: Nerd Font → Unicode → ASCII"),
@@ -40,7 +42,7 @@ const SYNC_KEYS: &[(&str, &str)] = &[];
 /// Draws the help popup.
 pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
     // Sync builds list extra keys, so the popup is a bit taller there.
-    let height = if cfg!(feature = "sync") { 29 } else { 27 };
+    let height = if cfg!(feature = "sync") { 32 } else { 30 };
     let area = centered(frame.area(), 72, height);
     let block = popup_block(" Help ", theme, color(theme.accent));
     let key_style = Style::new()
@@ -63,6 +65,10 @@ pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
     lines.push(Line::from(Span::styled("Dates you can type", heading)));
     lines.push(Line::from(Span::styled(
         "  2026-12-25 · 12/25 · today · tomorrow · +3d · +2w · +1m · fri",
+        muted,
+    )));
+    lines.push(Line::from(Span::styled(
+        "  or press Ctrl+D / F2 in the date field for a calendar",
         muted,
     )));
     lines.push(Line::default());

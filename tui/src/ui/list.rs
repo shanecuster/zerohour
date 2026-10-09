@@ -15,22 +15,26 @@
 //! Tasks and events each get their own color (theme `task` / `event` slots) AND their own
 //! marker icon, so color is never the only way to tell them apart.
 //!
+//! **Layout** (`v` toggles, saved in settings): *split* gives Tasks and Events equal halves of
+//! the height (the default); *fit* sizes the Events box to its rows and gives Tasks the rest.
+//!
 //! **Narrow mode** (under [`NARROW_WIDTH`] columns): the priority text, repeat label and date
 //! columns are dropped, countdowns get shorter ("3d"), and long titles end in `…`.
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table};
+use zerohour_core::clock::{TimeFormat, format_time, format_time_short, relative_text};
 use zerohour_core::icons::{Icon, IconMode, priority_icon};
 use zerohour_core::model::{Item, Priority};
 use zerohour_core::repeat::{days_until, is_overdue};
 use zerohour_core::theme::{Rgb, Theme};
 
 use super::{NARROW_WIDTH, color, screen_block, truncate, width_u16};
-use crate::app::{App, EventRow};
+use crate::app::{App, EventRow, LayoutMode};
 
 /// From this width up, an extra column shows the actual date ("Fri Dec 25").
 const DATE_COLUMN_WIDTH: u16 = 90;
@@ -49,16 +53,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
     let narrow = area.width < NARROW_WIDTH;
     let show_dates = area.width >= DATE_COLUMN_WIDTH;
 
-    // The Events box is sized to its rows (+2 for borders), but never more than half the
-    // space; Tasks get everything else. One line for notes of the selected item (if any),
-    // one line for the key hints.
-    let event_rows = app.events.len().max(1) as u16;
-    let events_height = (event_rows + 2).clamp(3, (inner.height / 2).max(3));
+    // One line for notes of the selected item (if any), one line for the key hints; the two
+    // section boxes share what's left according to the layout mode.
     let notes = app
         .selected_item()
         .and_then(|item| item.notes.clone())
         .filter(|n| !n.is_empty());
     let notes_height = u16::from(notes.is_some());
+    let sections_height = inner.height.saturating_sub(notes_height + 1);
+    let events_height = match app.layout {
+        LayoutMode::Split => split_heights(sections_height).1,
+        // Fit: the Events box is sized to its rows (+2 for borders), but never more than half
+        // the space; Tasks get everything else. (This is the original phase 1 layout.)
+        LayoutMode::Fit => {
+            let event_rows = app.events.len().max(1) as u16;
+            (event_rows + 2).clamp(3, (inner.height / 2).max(3))
+        }
+    };
 
     // `Layout::vertical(...).areas(rect)` splits a rectangle into rows. `Fill(1)` takes
     // whatever space is left after the fixed `Length`s.
@@ -85,6 +96,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
         );
     }
     draw_footer(frame, footer_area, app.theme, narrow);
+}
+
+/// Split layout: divides `height` lines into (tasks, events) halves. An odd line goes to Tasks.
+///
+/// Equal halves also give each box its minimum height whenever the screen can fit both: with
+/// at least 10 lines, each box gets at least 5 (3 rows plus its borders). On a smaller
+/// terminal the two still share equally, so neither disappears.
+fn split_heights(height: u16) -> (u16, u16) {
+    let events = height / 2;
+    (height - events, events)
 }
 
 /// The bordered box around one section, titled with its marker, name and item count.
@@ -116,6 +137,8 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
     let theme = app.theme;
     let mode = app.icon_mode;
     let today = app.today;
+    let now = app.now;
+    let time_format = app.time_format;
     let block = section_block(
         "Tasks",
         app.tasks.len(),
@@ -141,7 +164,19 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
         .map(|&p| width_u16(priority_icon(p).get(mode)))
         .max()
         .unwrap_or(1);
-    let due_w: u16 = if narrow { 5 } else { 13 };
+    // The due column fits its longest text, but is never narrower than the original 13 (or 5
+    // in narrow mode), so a list without due times looks exactly as before.
+    let due_texts: Vec<(String, Rgb)> = app
+        .tasks
+        .iter()
+        .map(|task| due_label(task, now, narrow, mode, time_format, theme))
+        .collect();
+    let longest = due_texts
+        .iter()
+        .map(|(text, _)| width_u16(text))
+        .max()
+        .unwrap_or(0);
+    let due_w: u16 = longest.max(if narrow { 5 } else { 13 });
     let mut fixed = vec![marker_w, prio_w];
     if show_dates {
         fixed.push(DATE_WIDTH);
@@ -156,8 +191,10 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
     let rows: Vec<Row> = app
         .tasks
         .iter()
-        .map(|task| {
-            let overdue = is_overdue(task, today);
+        // `.zip` walks two lists side by side, pairing each task with its due text.
+        .zip(due_texts)
+        .map(|(task, (due_text, due_slot))| {
+            let overdue = is_overdue(task, now);
             let mut title = task.title.clone();
             if task.repeat.is_repeating() {
                 title.push(' ');
@@ -169,7 +206,6 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
                 Style::new().fg(color(theme.fg))
             };
             let prio_style = Style::new().fg(priority_color(task.priority, theme));
-            let (due_text, due_slot) = due_label(task, today, narrow, mode, theme);
 
             let mut cells = vec![
                 Cell::from(Span::styled(
@@ -336,15 +372,28 @@ fn date_cell<'a>(date: Option<NaiveDate>, today: NaiveDate, theme: &Theme) -> Ce
 /// Returns a tuple `(String, Rgb)`; the caller unpacks it with `let (text, slot) = ...`.
 fn due_label(
     task: &Item,
-    today: NaiveDate,
+    now: NaiveDateTime,
     narrow: bool,
     mode: IconMode,
+    time_format: TimeFormat,
     theme: &Theme,
 ) -> (String, Rgb) {
     let Some(due) = task.date else {
         return (String::new(), theme.muted);
     };
+    let today = now.date();
     let days = days_until(due, today);
+    if let Some(time) = task.due_time {
+        return timed_due_label(
+            due.and_time(time),
+            days,
+            now,
+            narrow,
+            mode,
+            time_format,
+            theme,
+        );
+    }
     let overdue = Icon::Overdue.get(mode);
     // Match on (days, narrow) together; guards (`if d > 0`) refine an arm further.
     let text = match (days, narrow) {
@@ -360,6 +409,39 @@ fn due_label(
     let slot = match days {
         d if d < 0 => theme.danger,
         0 | 1 => theme.warn,
+        _ => theme.muted,
+    };
+    (text, slot)
+}
+
+/// The due text for a task with a due time, e.g. "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
+/// "in 3d · 2:00 PM", or "! overdue 2h". Narrow mode keeps just "3h" (today), "2PM"
+/// (tomorrow), "3d" or "!2h".
+fn timed_due_label(
+    due: NaiveDateTime,
+    days: i64,
+    now: NaiveDateTime,
+    narrow: bool,
+    mode: IconMode,
+    time_format: TimeFormat,
+    theme: &Theme,
+) -> (String, Rgb) {
+    let overdue_icon = Icon::Overdue.get(mode);
+    let (relative, overdue) = relative_text(due, now);
+    let time = format_time(due.time(), time_format);
+    let text = match (overdue, days, narrow) {
+        (true, _, false) => format!("{overdue_icon} overdue {relative}"),
+        (true, _, true) => format!("{overdue_icon}{relative}"),
+        (false, 0, false) => format!("today {time} · in {relative}"),
+        (false, 0, true) => relative,
+        (false, 1, false) => format!("tomorrow {time}"),
+        (false, 1, true) => format_time_short(due.time(), time_format),
+        (false, d, false) => format!("in {d}d · {time}"),
+        (false, d, true) => format!("{d}d"),
+    };
+    let slot = match (overdue, days) {
+        (true, _) => theme.danger,
+        (false, 0 | 1) => theme.warn,
         _ => theme.muted,
     };
     (text, slot)
@@ -425,4 +507,39 @@ fn draw_footer(frame: &mut Frame, area: Rect, theme: &Theme, narrow: bool) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest useful section box: 3 rows plus the top and bottom borders.
+    const MIN_SECTION_HEIGHT: u16 = 5;
+
+    #[test]
+    fn split_gives_equal_halves_with_the_odd_line_to_tasks() {
+        assert_eq!(split_heights(20), (10, 10));
+        assert_eq!(split_heights(21), (11, 10));
+        assert_eq!(split_heights(0), (0, 0));
+    }
+
+    #[test]
+    fn split_meets_the_minimum_whenever_both_fit() {
+        for height in 2 * MIN_SECTION_HEIGHT..200 {
+            let (tasks, events) = split_heights(height);
+            assert!(tasks >= MIN_SECTION_HEIGHT && events >= MIN_SECTION_HEIGHT);
+            assert_eq!(tasks + events, height);
+        }
+    }
+
+    #[test]
+    fn layout_setting_defaults_to_split() {
+        assert_eq!(LayoutMode::parse(None), LayoutMode::Split);
+        assert_eq!(LayoutMode::parse(Some("garbage")), LayoutMode::Split);
+        assert_eq!(LayoutMode::parse(Some("fit")), LayoutMode::Fit);
+        for mode in [LayoutMode::Split, LayoutMode::Fit] {
+            assert_eq!(LayoutMode::parse(Some(mode.as_str())), mode);
+            assert_eq!(mode.toggled().toggled(), mode);
+        }
+    }
 }

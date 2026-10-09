@@ -8,6 +8,7 @@
 //! Submodules:
 //! - [`list`]     — the main screen: Tasks section above, Events section below.
 //! - [`add`]      — the add/edit dialog (also owns that dialog's state and keys).
+//! - [`calendar`] — the month-grid date picker that opens over the add/edit dialog.
 //! - [`stats`]    — the stats screen with the weekly bar chart.
 //! - [`settings`] — the theme picker and the first-run icon check.
 //! - [`help`]     — the `?` help overlay.
@@ -16,6 +17,7 @@
 //! This file has the entry point [`draw`] plus small helpers every screen uses.
 
 pub mod add;
+pub mod calendar;
 pub mod help;
 pub mod list;
 pub mod settings;
@@ -54,12 +56,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Screen::Stats => stats::draw(frame, area, app),
     }
 
+    // Where the date picker's grid ends up (if it's open), for mouse clicks. Set below, then
+    // saved into `app` once the `match` has finished borrowing `app.overlay`.
+    let mut grid = None;
     // Popups go on top of the screen. `match &app.overlay` borrows the overlay so we can look
     // inside it without taking it out of `app`.
     match &app.overlay {
         Overlay::None => {}
         Overlay::Help => help::draw(frame, theme, app.icon_mode),
-        Overlay::Form(form) => add::draw(frame, form, theme, app.icon_mode, app.today),
+        Overlay::Form(form) => {
+            grid = add::draw(frame, form, theme, app.icon_mode, app.today);
+        }
         Overlay::ThemePicker { selected, .. } => {
             settings::draw_theme_picker(frame, theme, *selected, app.icon_mode);
         }
@@ -70,6 +77,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             sync_settings::draw(frame, form, &app.sync, theme, app.icon_mode);
         }
     }
+    app.calendar_grid = grid;
 }
 
 /// Converts a core color into a ratatui color (24-bit "true color").

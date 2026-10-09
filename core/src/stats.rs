@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use chrono::{Datelike, NaiveDate, TimeDelta, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, TimeDelta, TimeZone, Utc};
 
 use crate::model::{Completion, Item, Priority};
 use crate::repeat::is_overdue;
@@ -51,7 +51,7 @@ pub struct Stats {
     pub current_streak: u32,
     /// The longest such run ever.
     pub longest_streak: u32,
-    /// Open tasks whose due date is before today.
+    /// Open tasks that are past due (date, or date and time).
     pub overdue_count: u32,
     /// Completions that happened on or before the due date (or had no due date).
     pub on_time: u32,
@@ -84,7 +84,8 @@ pub fn week_start(date: NaiveDate) -> NaiveDate {
 ///
 /// - `completions`: the whole completion log (`Db::list_completions`).
 /// - `items`: all non-deleted items (`Db::list_items`), used for the overdue count.
-/// - `today`: the user's local date.
+/// - `now`: the user's local date and time (the date drives the weekly/monthly totals and
+///   streaks; the time matters for the overdue count, since tasks can have a due time).
 /// - `tz`: the user's time zone, used to decide which *local* day a completion happened on.
 ///   Completions are stored in UTC; finishing a task at 11pm in Denver is already "tomorrow" in
 ///   UTC, and it should count for today.
@@ -95,9 +96,10 @@ pub fn week_start(date: NaiveDate) -> NaiveDate {
 pub fn compute<Tz: TimeZone>(
     completions: &[Completion],
     items: &[Item],
-    today: NaiveDate,
+    now: NaiveDateTime,
     tz: &Tz,
 ) -> Stats {
+    let today = now.date();
     let mut stats = Stats::default();
 
     // Convert each completion's UTC timestamp to the local calendar day it happened on.
@@ -162,7 +164,7 @@ pub fn compute<Tz: TimeZone>(
     stats.overdue_count = count_u32(
         items
             .iter()
-            .filter(|i| !i.deleted && is_overdue(i, today))
+            .filter(|i| !i.deleted && is_overdue(i, now))
             .count(),
     );
 
@@ -221,6 +223,11 @@ fn count_u32(n: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Midday today, as the local date-time `compute` takes.
+    fn noon() -> NaiveDateTime {
+        today().and_hms_opt(12, 0, 0).unwrap()
+    }
     use crate::model::{Kind, new_id};
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -251,7 +258,7 @@ mod tests {
 
     #[test]
     fn empty_log_gives_zeroes() {
-        let s = compute(&[], &[], today(), &Utc);
+        let s = compute(&[], &[], noon(), &Utc);
         assert_eq!(s.total_all, 0);
         assert_eq!(s.current_streak, 0);
         assert_eq!(s.longest_streak, 0);
@@ -276,7 +283,7 @@ mod tests {
             simple(d(2026, 10, 4)), // Sunday last week, but this month
             simple(d(2026, 9, 30)), // last month
         ];
-        let s = compute(&log, &[], today(), &Utc);
+        let s = compute(&log, &[], noon(), &Utc);
         assert_eq!(s.total_all, 4);
         assert_eq!(s.total_week, 2);
         assert_eq!(s.total_month, 3);
@@ -291,7 +298,7 @@ mod tests {
             simple(d(2026, 7, 20)), // exactly 11 weeks before this Monday -> first bucket
             simple(d(2026, 7, 19)), // 12 weeks ago -> outside the chart
         ];
-        let s = compute(&log, &[], today(), &Utc);
+        let s = compute(&log, &[], noon(), &Utc);
         assert_eq!(s.per_week.len(), 12);
         assert_eq!(s.per_week[11].week_start, d(2026, 10, 5));
         assert_eq!(s.per_week[11].count, 2);
@@ -316,7 +323,7 @@ mod tests {
             simple(d(2026, 10, 7)),
             simple(d(2026, 10, 8)),
         ];
-        let s = compute(&log, &[], today(), &Utc);
+        let s = compute(&log, &[], noon(), &Utc);
         assert_eq!(s.longest_streak, 4);
         assert_eq!(s.current_streak, 3);
     }
@@ -325,10 +332,10 @@ mod tests {
     fn streak_survives_until_today_ends() {
         // Nothing done today yet, but yesterday and the day before: streak is still 2.
         let log = [simple(d(2026, 10, 6)), simple(d(2026, 10, 7))];
-        assert_eq!(compute(&log, &[], today(), &Utc).current_streak, 2);
+        assert_eq!(compute(&log, &[], noon(), &Utc).current_streak, 2);
         // Last completion two days ago: streak broken.
         let log = [simple(d(2026, 10, 6))];
-        assert_eq!(compute(&log, &[], today(), &Utc).current_streak, 0);
+        assert_eq!(compute(&log, &[], noon(), &Utc).current_streak, 0);
     }
 
     #[test]
@@ -338,8 +345,8 @@ mod tests {
         let mut c = simple(d(2026, 10, 5));
         c.completed_at = d(2026, 10, 5).and_hms_opt(3, 0, 0).unwrap().and_utc();
         let denver = chrono::FixedOffset::west_opt(6 * 3600).unwrap();
-        assert_eq!(compute(&[c.clone()], &[], today(), &Utc).total_week, 1);
-        assert_eq!(compute(&[c], &[], today(), &denver).total_week, 0);
+        assert_eq!(compute(&[c.clone()], &[], noon(), &Utc).total_week, 1);
+        assert_eq!(compute(&[c], &[], noon(), &denver).total_week, 0);
     }
 
     #[test]
@@ -350,7 +357,7 @@ mod tests {
             done_on(d(2026, 10, 3), Priority::Low, false),
             done_on(d(2026, 10, 4), Priority::Medium, false),
         ];
-        let s = compute(&log, &[], today(), &Utc);
+        let s = compute(&log, &[], noon(), &Utc);
         assert_eq!(s.on_time, 3);
         assert_eq!(s.late, 1);
         assert_eq!(s.on_time_rate(), Some(0.75));
@@ -380,6 +387,6 @@ mod tests {
         deleted.deleted = true;
 
         let items = [overdue, due_today, done, past_event, deleted];
-        assert_eq!(compute(&[], &items, today(), &Utc).overdue_count, 1);
+        assert_eq!(compute(&[], &items, noon(), &Utc).overdue_count, 1);
     }
 }

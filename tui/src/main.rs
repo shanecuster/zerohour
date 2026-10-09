@@ -26,7 +26,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -115,7 +117,19 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
 /// Waiting with a timeout (instead of blocking forever) lets `app.tick()` notice when the date
 /// changes at midnight, so countdowns roll over even if you leave the app open.
 fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+    // Whether the terminal currently sends us mouse events (see `App::wants_mouse`).
+    let mut mouse_captured = false;
     while !app.should_quit {
+        // Capture the mouse only while the date picker is open, so text selection with the
+        // mouse works normally everywhere else.
+        if app.wants_mouse() != mouse_captured {
+            mouse_captured = !mouse_captured;
+            if mouse_captured {
+                execute!(stdout(), EnableMouseCapture)?;
+            } else {
+                execute!(stdout(), DisableMouseCapture)?;
+            }
+        }
         // `draw` gives us a `Frame` to paint on; the closure paints the whole UI.
         terminal.draw(|frame| ui::draw(frame, app))?;
 
@@ -124,6 +138,7 @@ fn main_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -
                 // Only react to key *presses*. Some terminals (notably on Windows) also send
                 // key *release* events, which would otherwise trigger every action twice.
                 Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                Event::Mouse(mouse) => app.handle_mouse(mouse),
                 // A resize just needs a redraw, which the next loop iteration does.
                 _ => {}
             }
@@ -150,7 +165,13 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// nothing useful to do if restoring fails — we just try every step.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), LeaveAlternateScreen, cursor::Show);
+    // Turning mouse capture off when it's already off is harmless, so always do it.
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        cursor::Show
+    );
 }
 
 /// Makes sure a panic (a crash from a bug) restores the terminal before printing its message.

@@ -5,7 +5,7 @@
 //! ten weeks of completion history for the stats screen.
 
 use anyhow::Result;
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, TimeDelta, Timelike, Utc};
 use zerohour_core::db::Db;
 use zerohour_core::model::{Completion, Item, Kind, Priority, RepeatRule, Unit, new_id};
 
@@ -121,6 +121,21 @@ pub fn seed(db: &Db, today: NaiveDate) -> Result<()> {
             None,
         ),
     ];
+    // One task with a due time, a few hours from now (on the hour), to show "in 3h".
+    // `with_minute(0)` etc. return an Option; zero always exists, so the fallback never runs.
+    let in_three_hours = Local::now().naive_local() + TimeDelta::hours(3);
+    let soon = in_three_hours
+        .with_minute(0)
+        .and_then(|t| t.with_second(0))
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(in_three_hours);
+    let mut standup = Item::new(Kind::Task, "Team standup", now);
+    standup.priority = Priority::Medium;
+    standup.date = Some(soon.date());
+    standup.due_time = Some(soon.time());
+    standup.repeat = RepeatRule::Daily;
+    db.insert_item(&standup)?;
+
     for (title, date, repeat, keep, notes) in events {
         let mut item = Item::new(Kind::Event, title, now);
         item.date = Some(date);
@@ -204,8 +219,9 @@ mod tests {
         seed(&db, today).unwrap();
         let items = db.list_items().unwrap();
         assert!(items.iter().any(|i| i.kind == Kind::Event));
+        let noon = today.and_hms_opt(12, 0, 0).unwrap();
         let stats =
-            zerohour_core::stats::compute(&db.list_completions().unwrap(), &items, today, &Local);
+            zerohour_core::stats::compute(&db.list_completions().unwrap(), &items, noon, &Local);
         assert!(stats.current_streak >= 5);
         assert_eq!(stats.overdue_count, 1);
     }

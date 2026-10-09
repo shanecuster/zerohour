@@ -35,6 +35,10 @@ pub enum Action {
     CycleIcons,
     /// Show/hide one-off events whose date has passed.
     TogglePassed,
+    /// Switch the main screen between split 50/50 and fit-to-content.
+    ToggleLayout,
+    /// Switch between 12-hour and 24-hour times.
+    ToggleTimeFormat,
     /// Show the help overlay.
     Help,
     /// Open the sync settings (only in builds with the `sync` feature).
@@ -69,6 +73,8 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('t') => Action::Theme,
         KeyCode::Char('i') => Action::CycleIcons,
         KeyCode::Char('p') => Action::TogglePassed,
+        KeyCode::Char('v') => Action::ToggleLayout,
+        KeyCode::Char('T') => Action::ToggleTimeFormat,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
         // `#[cfg]` on a match arm: in local-only builds this key simply does nothing, exactly
         // as before sync existed.

@@ -12,9 +12,13 @@
 //! Database errors never crash the app: they are shown as a red status message instead.
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate, Utc};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use chrono::{Local, NaiveDate, NaiveDateTime, Timelike, Utc};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::widgets::TableState;
+use zerohour_core::calendar::WeekStart;
+use zerohour_core::clock::TimeFormat;
 use zerohour_core::db::{Db, settings_keys};
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
@@ -25,7 +29,8 @@ use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
 use crate::input::{Action, main_action};
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
-use crate::ui::add::{Form, FormData, FormOutcome};
+use crate::ui::add::{Form, FormData, FormOutcome, FormPrefs};
+use crate::ui::calendar::GridArea;
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
 
@@ -36,6 +41,41 @@ pub enum Screen {
     Main,
     /// Statistics and charts.
     Stats,
+}
+
+/// How the main screen divides its height between the Tasks and Events boxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Equal halves (the default), so neither section gets squeezed.
+    Split,
+    /// The Events box is sized to its rows (up to half the screen); Tasks get the rest.
+    Fit,
+}
+
+impl LayoutMode {
+    /// The text saved in the settings table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutMode::Split => "split",
+            LayoutMode::Fit => "fit",
+        }
+    }
+
+    /// Reads the saved text; anything unknown (or nothing saved) means the default, `Split`.
+    pub fn parse(s: Option<&str>) -> LayoutMode {
+        match s {
+            Some("fit") => LayoutMode::Fit,
+            _ => LayoutMode::Split,
+        }
+    }
+
+    /// The other mode (what `v` switches to).
+    pub fn toggled(self) -> LayoutMode {
+        match self {
+            LayoutMode::Split => LayoutMode::Fit,
+            LayoutMode::Fit => LayoutMode::Split,
+        }
+    }
 }
 
 /// Which popup (if any) is open on top of the screen. Only one at a time.
@@ -89,6 +129,11 @@ pub struct App {
     db: Db,
     /// Today's local date. Refreshed each tick so the countdowns roll over at midnight.
     pub today: NaiveDate,
+    /// The local date and time, refreshed every tick. Tasks with a due time turn overdue the
+    /// minute it passes, without waiting for a key press.
+    pub now: NaiveDateTime,
+    /// 12-hour ("2:00 PM", the default) or 24-hour ("14:00") times; `T` switches.
+    pub time_format: TimeFormat,
     /// Open tasks, sorted: highest priority first, then soonest due date.
     pub tasks: Vec<Item>,
     /// Visible events, sorted by days remaining.
@@ -109,6 +154,13 @@ pub struct App {
     pub status: Option<Status>,
     /// Also show one-off events whose date has passed (toggled with `p`).
     pub show_passed: bool,
+    /// Split 50/50 or fit-to-content (toggled with `v`, saved in settings).
+    pub layout: LayoutMode,
+    /// First day of the week in the date picker (switched with `w` in the picker).
+    pub week_start: WeekStart,
+    /// Where the date picker's day grid was last drawn, while it's open (for mouse clicks).
+    /// Written by the drawing code, read by [`App::handle_mouse`].
+    pub calendar_grid: Option<GridArea>,
     /// Set to true to leave the main loop.
     pub should_quit: bool,
     /// Running with `--demo` (in-memory data, nothing is saved).
@@ -146,9 +198,16 @@ impl App {
             Overlay::None
         };
 
+        // Read before `db` moves into the struct below (after a move, `db` can't be used here).
+        let layout = LayoutMode::parse(db.get_setting(settings_keys::LAYOUT)?.as_deref());
+        let week_start = WeekStart::parse(db.get_setting(settings_keys::WEEK_START)?.as_deref());
+        let time_format = TimeFormat::parse(db.get_setting(settings_keys::TIME_FORMAT)?.as_deref());
+
         let mut app = App {
             db,
             today: local_today(),
+            now: local_now(),
+            time_format,
             tasks: Vec::new(),
             events: Vec::new(),
             selected: 0,
@@ -161,6 +220,9 @@ impl App {
             stats: Stats::default(),
             status: None,
             show_passed: false,
+            layout,
+            week_start,
+            calendar_grid: None,
             should_quit: false,
             demo,
             #[cfg(feature = "sync")]
@@ -207,6 +269,13 @@ impl App {
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
                 })
+                // Same day: timed tasks first, earliest first; untimed ones after them.
+                .then_with(|| match (a.due_time, b.due_time) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
                 .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
         });
 
@@ -232,7 +301,7 @@ impl App {
         });
 
         let completions = self.db.list_completions()?;
-        self.stats = stats::compute(&completions, &items, today, &Local);
+        self.stats = stats::compute(&completions, &items, self.now, &Local);
         self.tasks = tasks;
         self.events = events;
 
@@ -248,9 +317,13 @@ impl App {
     /// changed (we passed midnight), reload so countdowns update and repeating events roll
     /// over. With sync, also picks up results from the background worker.
     pub fn tick(&mut self) {
-        let today = local_today();
-        if today != self.today {
-            self.today = today;
+        let now = local_now();
+        // Reload when the minute changes (the overdue count in the stats can change as due
+        // times pass) and, of course, at midnight.
+        let changed = now.date() != self.today || now.minute() != self.now.minute();
+        self.now = now;
+        if changed {
+            self.today = now.date();
             if let Err(e) = self.refresh() {
                 self.set_error(e);
             }
@@ -278,6 +351,33 @@ impl App {
         }
     }
 
+    /// True while the date picker is open: the only time the app wants mouse events.
+    ///
+    /// Capturing the mouse stops the terminal's own text selection, so `main.rs` switches
+    /// capture on only while this is true.
+    pub fn wants_mouse(&self) -> bool {
+        matches!(&self.overlay, Overlay::Form(form) if form.calendar.is_some())
+    }
+
+    /// A mouse event: in the open date picker, a left click picks a day and the scroll wheel
+    /// changes the month. Everything else is ignored.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let grid = self.calendar_grid;
+        let Overlay::Form(form) = &mut self.overlay else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(grid) = grid {
+                    form.click_calendar(grid, mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::ScrollUp => form.scroll_calendar(-1),
+            MouseEventKind::ScrollDown => form.scroll_calendar(1),
+            _ => {}
+        }
+    }
+
     /// Routes the key to the open popup, or to the current screen if no popup is open.
     fn try_handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Ctrl+C quits from anywhere, even inside a popup.
@@ -300,6 +400,11 @@ impl App {
                     FormOutcome::Save(data) => {
                         self.overlay = Overlay::None;
                         self.save_form(data)?;
+                    }
+                    FormOutcome::WeekStartChanged(start) => {
+                        self.week_start = start;
+                        self.db
+                            .set_setting(settings_keys::WEEK_START, start.as_str())?;
                     }
                 }
                 return Ok(());
@@ -414,10 +519,10 @@ impl App {
             }
             Action::Top => self.selected = 0,
             Action::Bottom => self.selected = rows.saturating_sub(1),
-            Action::Add => self.overlay = Overlay::Form(Form::new_add()),
+            Action::Add => self.overlay = Overlay::Form(Form::new_add(self.form_prefs())),
             Action::Edit => {
                 if let Some(item) = self.selected_item() {
-                    self.overlay = Overlay::Form(Form::edit(item));
+                    self.overlay = Overlay::Form(Form::edit(item, self.form_prefs()));
                 }
             }
             Action::Complete => self.complete_selected()?,
@@ -428,6 +533,24 @@ impl App {
                         title: item.title.clone(),
                     };
                 }
+            }
+            Action::ToggleTimeFormat => {
+                self.time_format = self.time_format.toggled();
+                self.db
+                    .set_setting(settings_keys::TIME_FORMAT, self.time_format.as_str())?;
+                self.set_status(match self.time_format {
+                    TimeFormat::Hour12 => "Times: 12-hour (2:00 PM)",
+                    TimeFormat::Hour24 => "Times: 24-hour (14:00)",
+                });
+            }
+            Action::ToggleLayout => {
+                self.layout = self.layout.toggled();
+                self.db
+                    .set_setting(settings_keys::LAYOUT, self.layout.as_str())?;
+                self.set_status(match self.layout {
+                    LayoutMode::Split => "Layout: tasks and events share the screen 50/50",
+                    LayoutMode::Fit => "Layout: events box fits its content",
+                });
             }
             Action::TogglePassed => {
                 self.show_passed = !self.show_passed;
@@ -523,14 +646,18 @@ impl App {
             return Ok(());
         }
         let (id, title) = (item.id.clone(), item.title.clone());
-        let next = self.db.complete_task(&id, self.today, Utc::now())?;
+        let next = self.db.complete_task(&id, local_now(), Utc::now())?;
         self.refresh()?;
         match next {
             Some(next) => {
-                let due = next
+                let mut due = next
                     .date
                     .map(|d| d.format("%a %b %d").to_string())
                     .unwrap_or_default();
+                if let Some(time) = next.due_time {
+                    due.push(' ');
+                    due.push_str(&zerohour_core::clock::format_time(time, self.time_format));
+                }
                 self.select_id(&next.id);
                 self.set_status(format!("Done: \"{title}\". Next one due {due}"));
             }
@@ -709,6 +836,14 @@ impl App {
         Ok(())
     }
 
+    /// The display settings the add/edit form needs.
+    fn form_prefs(&self) -> FormPrefs {
+        FormPrefs {
+            week_start: self.week_start,
+            time_format: self.time_format,
+        }
+    }
+
     /// Total rows on the main screen (tasks + events).
     pub fn row_count(&self) -> usize {
         self.tasks.len() + self.events.len()
@@ -762,9 +897,14 @@ impl App {
 }
 
 /// Today's date in the computer's local time zone.
-///
-/// This is the ONE place the TUI asks the clock for "today"; everything in core receives it
-/// as a parameter.
 pub fn local_today() -> NaiveDate {
-    Local::now().date_naive()
+    local_now().date()
+}
+
+/// The local date and time ("wall-clock" time, no time zone attached).
+///
+/// This is the ONE place the TUI asks the clock for the local time; everything in core
+/// receives it as a parameter.
+pub fn local_now() -> NaiveDateTime {
+    Local::now().naive_local()
 }
