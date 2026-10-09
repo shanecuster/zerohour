@@ -10,13 +10,15 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 ## Features
 
 - **Tasks and events in one view.** Tasks on top, events underneath, each with its own color and icon.
-- **Countdowns that repeat.** Yearly, monthly, weekly, daily, or every N days/weeks/months.
+- **Countdowns that repeat.** Yearly, monthly, weekly, daily, every N days/weeks/months, or on chosen weekdays (weekdays, Mon–Thu, or any days you pick).
 - **Repeating tasks.** Completing one creates the next instance with the next due date.
+- **Due times.** Give a task a time ("2pm") and it shows "today 2:00 PM · in 3h", turning overdue the minute it passes. 12- or 24-hour clock.
+- **Calendar picker** for dates (Ctrl+D or F2), with the keyboard or a mouse click. Typing dates still works.
 - **Priorities and notes** on every item.
 - **Statistics.** Completions per week, streaks, overdue count, and more, with a bar chart.
 - **Themes.** Everforest, Dracula, Gruvbox, Catppuccin, Nord, Solarized, Tokyo Night, with a live-preview picker.
 - **Nerd Font icons** with Unicode and ASCII fallbacks.
-- **Narrow mode** for small terminal windows.
+- **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
 - **Local-first.** Your data lives in a single SQLite file on your machine.
 - **Optional sync** between devices through your own CouchDB server. Off by default, and left out of the build unless you ask for it.
 
@@ -66,6 +68,8 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | `j` / `k` or arrows | Move up and down |
 | `g` / `G` | Jump to top / bottom |
 | `p` | Show or hide passed events |
+| `v` | Layout: split 50/50, or Events fit their content |
+| `T` | Times: 12-hour or 24-hour |
 | `Tab` / `s` | Switch to the stats screen |
 | `t` | Pick a theme |
 | `i` | Cycle icon mode (Nerd Font / Unicode / ASCII) |
@@ -74,12 +78,42 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | `r` | Sync now (sync builds only) |
 | `c` | Sync settings (sync builds only) |
 
+In the add/edit dialog:
+
+| Key | Action |
+|---|---|
+| `Tab` / `↑` `↓` | Move between fields |
+| `←` `→` | Change a choice (priority, repeat); move between days in the day checkboxes |
+| `Space` | Toggle a checkbox or a day |
+| `Ctrl+D` / `F2` | Open the calendar on the date field |
+| `Enter` | Save |
+| `Esc` | Close (or close just the calendar) |
+
+In the calendar: arrows or `h` `j` `k` `l` move by day/week, `PgUp` / `PgDn` by month, `t` jumps to today,
+`w` switches the first day of the week (Sunday or Monday), `Enter` picks, `Esc` closes.
+A mouse click on a day picks it, and the scroll wheel changes the month.
+
+### Due times and weekday repeats
+
+- A **due time** is optional and needs a due date. Type `2pm`, `2:30 pm`, `14:30`, or `noon`.
+  It's stored as local wall-clock time, so 2 PM means 2 PM wherever you are (also on a synced device in another time zone).
+  A task with a time is overdue once that time passes; without one, the whole day counts as on time.
+- **Repeat on weekdays**: choose *weekdays*, *Mon–Thu*, or *pick days* and tick the days you want.
+  A start date that isn't one of those days moves forward to the next one when you save (the dialog tells you), and an empty date is filled in.
+- When you complete a repeating task, the next one is due at the **first scheduled time after both its old due time and now**.
+  A Mon–Thu 2 PM task completed on Thursday is next due Monday at 2 PM.
+  Done late? Missed days are not added; you get the next upcoming one (still today, if today's time hasn't passed yet).
+
 Options:
 
 - `--db <path>`: use a different database file
 - `--demo`: load sample data without saving anything
 
 Your data is stored in `~/.local/share/zerohour/zerohour.db`.
+
+**Upgrading:** new versions update the database automatically and keep your data.
+Going back is limited: once you've used a weekday repeat, an older version of zerohour can't open that database
+(it reports "bad data" instead of guessing). Keep a copy of the file before upgrading if you might go back.
 
 ## Sync (optional)
 
@@ -137,6 +171,10 @@ itself is encrypted (Tailscale, WireGuard, a VPN).
 - A deletion always sticks, even if another device edited the item later.
 - A completed task stays completed, even if another device edited it later.
 - Completing the same repeating task on two offline devices creates one next instance, not two.
+
+Items with a due time or a weekday repeat are stored on the server in a newer format (`v: 2`).
+A device running an older zerohour skips just those items and shows "update zerohour"; everything else keeps syncing.
+Update every device to use these features everywhere.
 
 ### Where the password is kept
 

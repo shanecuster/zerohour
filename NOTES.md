@@ -211,6 +211,81 @@ cargo tree -p zerohour -e normal | grep -E 'ureq|rustls|keyring'   # nothing = l
   **When:** after restoring a backup, or if the server's database was recreated. Your data isn't
   touched; the next sync compares everything again.
 
+---
+
+## Scheduling: layout, calendar, due times, weekday repeats (done 2026-10-09)
+
+Branch `feature/schedule`, built on top of `feature/sync`.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `CLAUDE.md` | The working rules for this project (branch rules, checks with and without sync, testing only on copies of the database...). |
+| `tui/src/ui/list.rs` | Tasks and Events split the height 50/50 (each box gets at least 5 lines when there's room). `v` switches to "fit", the old layout. Saved as `layout`. |
+| `core/src/calendar.rs` | Month-grid math: which date goes in which of the 6×7 cells, Sunday- or Monday-first, moving by days and months. Shared with Android later. |
+| `tui/src/ui/calendar.rs` | The date picker popup (Ctrl+D / F2 on the date field), plus mouse clicks and the scroll wheel while it's open. |
+| `core/src/clock.rs` | Times of day: parsing "2pm"/"14:30", 12/24-hour display (`time_format`), "in 3h" texts. |
+| `core/src/db.rs` | Migration 3: `items.due_time` (local "HH:MM", NULL = no time). |
+| `core/src/repeat.rs` | Time-aware overdue (`is_overdue` now takes the local date-time), `next_instance_date` (the date+time rule), weekday-set occurrences, `scheduled_on_or_after` (moving a start date onto a repeat day). |
+| `core/src/model.rs` | `DaySet` (7 bits, Monday = bit 0) and `RepeatRule::Weekdays`, stored as `days:mon,tue,wed,thu`. |
+| `core/src/sync/doc.rs` | Document `v: 2` for items with a due time or weekday repeat; everything else stays `v: 1`. |
+
+**Tests:** 102 without sync, 159 with (`cargo test --features sync`).
+
+### Decisions made while building (worth knowing)
+
+- **Wall-clock times.** A due time is stored as plain local time ("14:00"), not UTC. On a day the
+  clocks change, an "in 3h" can be off by an hour; nothing else is affected.
+- **The date+time rule** for the next instance: the first occurrence strictly after both the old
+  due date+time and now. Example: a daily 2 PM task due yesterday, done at 10 AM today, is next due
+  today at 2 PM; done at 3 PM, tomorrow. Tasks without a time keep the old date-only rule exactly.
+- **Weekday repeats never back-fill.** Missing Tuesday and Wednesday doesn't create two tasks; you
+  get one overdue task, and completing it moves to the next scheduled day after now.
+- **Completing early** (e.g. Sunday, for Monday's) counts as doing Monday's, so the next one is
+  Tuesday.
+- **All seven days** saves as plain "daily", which every build understands.
+- **Older builds and weekday repeats.** An older zerohour can't read `days:...` from the database,
+  so it refuses to open a file that contains one ("bad data"), rather than guessing. Over sync,
+  older builds just skip those items (document `v: 2`).
+- **Mouse capture** is only on while the calendar is open, so selecting text with the mouse works
+  everywhere else in the app.
+- **`complete_task` and `stats::compute`** now take the local date-time instead of just today's
+  date, because overdue depends on the time.
+
+### Keys
+
+`v` layout (split / fit) · `T` 12/24-hour times · in the add dialog: `Ctrl+D` / `F2` calendar,
+`Space` toggles a day · in the calendar: arrows/`hjkl`, `PgUp`/`PgDn`, `t` today, `w` week start,
+`Enter` pick, `Esc` close, mouse click / scroll wheel
+
+### Save to your personal notes
+
+- **Title:** Back up the zerohour database before trying a new build
+  **Command:** `mkdir -p ~/zerohour-backups && cp -p ~/.local/share/zerohour/zerohour.db ~/zerohour-backups/zerohour-$(date +%Y%m%d-%H%M%S).db`
+  **When:** before running a version with a new database migration (like this one, schema 3).
+
+- **Title:** Try a new build on a copy of your data
+  **Command:** `cp ~/zerohour-backups/<backup>.db /tmp/z-test.db && ./target/debug/zerohour --db /tmp/z-test.db`
+  **When:** to check a new version against your real items without touching the real file.
+
+- **Title:** A task every Mon–Thu at 2 PM
+  **Command:** `a` → Task → title → Due time `2pm` → Repeat `←→` to "Mon–Thu" → `Enter`
+  **When:** recurring work-day tasks. Completing Thursday's makes Monday's.
+
+### Planned later: reminders (design approved, not built)
+
+- `zerohour remind`: a command that sends any due reminders and exits, run every minute by a
+  systemd user timer (`Persistent=true`; `zerohour remind --print-units` prints the unit files).
+- Fires at the due time (`reminders.lead_minutes`, default 0, adds an earlier one), and at
+  `reminders.day_time` (default 09:00) for tasks due today without a time. Overdue digest: off by
+  default.
+- Desktop notifications with `notify-send`; optional ntfy (its own cargo feature, server and topic
+  as settings, token in the `SecretStore`), enabled on one device only to avoid duplicates.
+- De-duplication in a local, never-synced table `reminders_sent (item_id, kind, fire_at, sent_at)`;
+  a row is written only after a successful send, reminders older than a grace window are skipped,
+  and moving a task's time creates a new reminder.
+
 ### Next: Phase 3 (Android)
 
 The Android app can reuse `zerohour_core::sync` as-is (enable the `sync` feature, not

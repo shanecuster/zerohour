@@ -6,6 +6,16 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Due times** on tasks (optional, local wall-clock time): "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
+  "! overdue 2h". Overdue the minute the time passes. 12-hour by default; `T` switches to 24-hour.
+  Database schema version 3 adds the column; existing data is unchanged.
+- **Weekday repeats**: repeat on chosen days, with presets (weekdays, Mon–Thu) and day checkboxes in the
+  add/edit dialog. Unscheduled start dates move forward on save; empty dates are filled in. Works for events too.
+- **Calendar picker** for the date field (Ctrl+D or F2): arrows or h/j/k/l, PgUp/PgDn, `t` for today,
+  `w` for the week start (Sunday by default), Enter to pick. Mouse clicks and the scroll wheel work while it's open.
+- **Layout**: Tasks and Events now share the screen 50/50 by default; `v` switches to fit-to-content (the old layout).
+- `CLAUDE.md` with the project's working rules.
+
 - **Optional CouchDB sync** between devices, in builds made with `--features sync`
   (`cargo install --path tui --features sync`). Off by default; local-only builds contain no network code.
   - Sync settings screen (`c`): server URL, database, username, password, on/off switch,
@@ -26,6 +36,11 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
   merge instead of duplicating it.
 - An edit is always stamped later than the version it replaces, even if this device's clock is
   behind. With a correct clock this is just the current time.
+- Completing a repeating task with a due time uses date *and* time: the next instance is the first
+  occurrence after both the old due time and now (a daily 2 PM task done late in the morning is next due
+  today at 2 PM). Tasks without a time work exactly as before.
+- Sync: items with a due time or a weekday repeat are written as document version 2; older builds skip
+  only those items. Everything else stays version 1.
 
 ## [0.1.0] - 2026-10-08
 
