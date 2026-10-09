@@ -21,17 +21,30 @@
 //! `v` is the *document format version*. A device that sees a newer `v` than it understands
 //! skips that document (and says "update zerohour") instead of misreading it.
 //!
+//! - `v: 1`: the original format.
+//! - `v: 2`: adds what older builds can't represent: a `"due_time": "14:00"` field (local
+//!   wall-clock time). Only items that *use* a v2 feature are written as `v: 2`; everything
+//!   else stays `v: 1`, so devices that haven't updated yet keep syncing all other items. An
+//!   older device also can't overwrite a v2 document: it never recorded that version's
+//!   `_rev`, so CouchDB rejects its write as a conflict.
+//!
 //! Deletions use our own `"deleted": true`, not CouchDB's `_deleted`: a CouchDB deletion
 //! ("tombstone") throws away every field, including the `updated_at` that conflict
 //! resolution needs.
 
 use serde_json::{Value, json};
 
-use crate::db::{date_from_db, date_to_db, ts_from_db, ts_to_db};
+use crate::db::{date_from_db, date_to_db, time_from_db, time_to_db, ts_from_db, ts_to_db};
 use crate::model::{Completion, Item, Kind, Priority, RepeatRule};
 
-/// The document format this build writes and understands.
-pub const DOC_VERSION: u64 = 1;
+/// The newest document format this build understands (and writes, when an item needs it).
+pub const DOC_VERSION: u64 = 2;
+
+/// The format version an item needs: 2 if it uses a feature older builds can't represent
+/// (a due time), otherwise 1.
+pub fn item_doc_version(item: &Item) -> u64 {
+    if item.due_time.is_some() { 2 } else { 1 }
+}
 
 /// `_id` prefix for item documents.
 const ITEM_PREFIX: &str = "item:";
@@ -77,7 +90,7 @@ pub fn item_to_doc(item: &Item, rev: Option<&str>) -> Value {
     let mut doc = json!({
         "_id": item_doc_id(&item.id),
         "type": "item",
-        "v": DOC_VERSION,
+        "v": item_doc_version(item),
         "kind": item.kind.as_str(),
         "title": item.title,
         "notes": item.notes,
@@ -90,6 +103,10 @@ pub fn item_to_doc(item: &Item, rev: Option<&str>) -> Value {
         "updated_at": ts_to_db(item.updated_at),
         "deleted": item.deleted,
     });
+    // v2 fields are only written when used, so v1 documents look exactly as before.
+    if let (Some(time), Some(object)) = (item.due_time, doc.as_object_mut()) {
+        object.insert("due_time".into(), Value::String(time_to_db(time)));
+    }
     add_rev(&mut doc, rev);
     doc
 }
@@ -99,7 +116,8 @@ pub fn completion_to_doc(completion: &Completion, rev: Option<&str>) -> Value {
     let mut doc = json!({
         "_id": completion_doc_id(&completion.id),
         "type": "completion",
-        "v": DOC_VERSION,
+        // Completions haven't changed format, so they stay readable by every build.
+        "v": 1,
         "item_id": completion.item_id,
         "completed_at": ts_to_db(completion.completed_at),
         "title_snapshot": completion.title_snapshot,
@@ -145,6 +163,10 @@ pub fn item_from_doc(doc: &Value) -> Result<Item, DocProblem> {
             .ok_or_else(|| invalid(format!("unknown priority '{priority}'")))?,
         date: optional_text(doc, "date")?
             .map(|d| date_from_db(&d).map_err(|e| invalid(e.to_string())))
+            .transpose()?,
+        // Missing in v1 documents, which simply means "no time".
+        due_time: optional_text(doc, "due_time")?
+            .map(|t| time_from_db(&t).map_err(|e| invalid(e.to_string())))
             .transpose()?,
         repeat: RepeatRule::parse(&repeat)
             .ok_or_else(|| invalid(format!("unknown repeat '{repeat}'")))?,
@@ -252,6 +274,35 @@ mod tests {
     }
 
     #[test]
+    fn only_items_with_a_due_time_are_version_2() {
+        let mut item = sample_item();
+        let plain = item_to_doc(&item, None);
+        assert_eq!(plain["v"], 1);
+        assert!(
+            plain.get("due_time").is_none(),
+            "v1 documents look exactly as before"
+        );
+
+        item.due_time = chrono::NaiveTime::from_hms_opt(14, 0, 0);
+        let timed = item_to_doc(&item, None);
+        assert_eq!(timed["v"], 2);
+        assert_eq!(timed["due_time"], "14:00");
+        assert_eq!(item_from_doc(&timed).unwrap(), item);
+    }
+
+    #[test]
+    fn a_build_that_only_knows_v1_skips_v2_documents() {
+        // What an older build's check does with a v2 document: NewerVersion, i.e. skip it and
+        // show "update zerohour". Simulated by asking for a version above ours.
+        let mut doc = item_to_doc(&sample_item(), None);
+        doc["v"] = json!(DOC_VERSION + 1);
+        assert_eq!(
+            item_from_doc(&doc),
+            Err(DocProblem::NewerVersion(DOC_VERSION + 1))
+        );
+    }
+
+    #[test]
     fn new_documents_have_no_rev() {
         let doc = item_to_doc(&sample_item(), None);
         assert!(doc.get("_rev").is_none());
@@ -286,8 +337,8 @@ mod tests {
     #[test]
     fn newer_format_and_bad_fields_are_reported() {
         let mut doc = item_to_doc(&sample_item(), None);
-        doc["v"] = json!(2);
-        assert_eq!(item_from_doc(&doc), Err(DocProblem::NewerVersion(2)));
+        doc["v"] = json!(3);
+        assert_eq!(item_from_doc(&doc), Err(DocProblem::NewerVersion(3)));
 
         let mut doc = item_to_doc(&sample_item(), None);
         doc["priority"] = json!("urgent");

@@ -3,7 +3,7 @@
 //! Adding is two steps:
 //! 1. **Choose Task or Event** (`Tab` flips, default Task), each with a one-line explanation.
 //! 2. **Fill in the fields** for that kind:
-//!    - Task:  title, priority, due date, repeat, notes
+//!    - Task:  title, priority, due date, due time, repeat, notes
 //!    - Event: title, date, repeat, keep-after-pass, notes
 //!
 //! Editing skips step 1 (an item's kind can't change) and starts with the fields pre-filled.
@@ -16,12 +16,14 @@
 //! validated [`FormData`], or `Cancel`.
 
 use chrono::NaiveDate;
+use chrono::NaiveTime;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use zerohour_core::calendar::WeekStart;
+use zerohour_core::clock::{TimeFormat, format_time, parse_time_input};
 use zerohour_core::icons::{Icon, IconMode};
 use zerohour_core::model::{Item, Kind, Priority, RepeatRule, Unit};
 use zerohour_core::repeat::{days_until, parse_date_input};
@@ -49,6 +51,8 @@ pub enum Field {
     Title,
     Priority,
     Date,
+    /// Tasks only: optional due time (needs a date).
+    Time,
     Repeat,
     EveryN,
     EveryUnit,
@@ -64,6 +68,7 @@ impl Field {
             Field::Priority => "Priority",
             Field::Date if kind == Kind::Task => "Due date",
             Field::Date => "Date",
+            Field::Time => "Due time",
             Field::Repeat => "Repeat",
             Field::EveryN => "Every",
             Field::EveryUnit => "Unit",
@@ -76,7 +81,7 @@ impl Field {
     fn is_text(self) -> bool {
         matches!(
             self,
-            Field::Title | Field::Date | Field::EveryN | Field::Notes
+            Field::Title | Field::Date | Field::Time | Field::EveryN | Field::Notes
         )
     }
 }
@@ -91,6 +96,8 @@ pub struct FormData {
     pub notes: Option<String>,
     pub priority: Priority,
     pub date: Option<NaiveDate>,
+    /// Tasks only; always `None` for events.
+    pub due_time: Option<NaiveTime>,
     pub repeat: RepeatRule,
     pub keep_after_pass: bool,
 }
@@ -102,6 +109,7 @@ impl FormData {
         item.notes = self.notes.clone();
         item.priority = self.priority;
         item.date = self.date;
+        item.due_time = self.due_time;
         item.repeat = self.repeat;
         item.keep_after_pass = self.keep_after_pass;
     }
@@ -133,6 +141,8 @@ pub struct Form {
     pub title: String,
     pub priority: Priority,
     pub date_text: String,
+    /// The due time as typed ("2pm", "14:30"); empty = no time.
+    pub time_text: String,
     /// Index into [`REPEAT_CHOICES`].
     pub repeat_choice: usize,
     pub every_n: String,
@@ -145,14 +155,24 @@ pub struct Form {
     pub error: Option<String>,
     /// The date picker, while it's open over the form.
     pub calendar: Option<Calendar>,
-    /// First day of the week for the date picker (from settings).
+    /// Display settings the form needs (week start, 12/24-hour times).
+    pub prefs: FormPrefs,
+}
+
+/// The user's display settings that the form needs, passed in when it opens.
+///
+/// `Default` gives Sunday and 12-hour times, the app's defaults (handy in tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormPrefs {
+    /// First day of the week in the date picker.
     pub week_start: WeekStart,
+    /// How the due time is shown when editing and in the preview.
+    pub time_format: TimeFormat,
 }
 
 impl Form {
     /// A blank form for adding something new (starts at the Task/Event choice).
-    /// `week_start` is the saved first day of the week, for the date picker.
-    pub fn new_add(week_start: WeekStart) -> Form {
+    pub fn new_add(prefs: FormPrefs) -> Form {
         Form {
             step: Step::ChooseKind,
             kind: Kind::Task,
@@ -160,6 +180,7 @@ impl Form {
             title: String::new(),
             priority: Priority::Medium,
             date_text: String::new(),
+            time_text: String::new(),
             repeat_choice: 0,
             every_n: "2".to_string(),
             unit: Unit::Weeks,
@@ -168,13 +189,13 @@ impl Form {
             focus: 0,
             error: None,
             calendar: None,
-            week_start,
+            prefs,
         }
     }
 
     /// A form pre-filled from an existing item, for editing (skips the Task/Event step).
-    pub fn edit(item: &Item, week_start: WeekStart) -> Form {
-        let mut form = Form::new_add(week_start);
+    pub fn edit(item: &Item, prefs: FormPrefs) -> Form {
+        let mut form = Form::new_add(prefs);
         form.step = Step::Fields;
         form.kind = item.kind;
         form.editing = Some(item.id.clone());
@@ -184,6 +205,11 @@ impl Form {
         form.date_text = item
             .date
             .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        // Shown in the user's style; both styles can be typed back in.
+        form.time_text = item
+            .due_time
+            .map(|t| format_time(t, prefs.time_format))
             .unwrap_or_default();
         form.keep_after_pass = item.keep_after_pass;
         form.notes = item.notes.clone().unwrap_or_default();
@@ -210,6 +236,9 @@ impl Form {
             fields.push(Field::Priority);
         }
         fields.push(Field::Date);
+        if self.kind == Kind::Task {
+            fields.push(Field::Time);
+        }
         fields.push(Field::Repeat);
         if self.repeat_choice == CUSTOM {
             fields.push(Field::EveryN);
@@ -245,7 +274,7 @@ impl Form {
                     self.calendar = None;
                 }
                 CalendarOutcome::WeekStartChanged(start) => {
-                    self.week_start = start;
+                    self.prefs.week_start = start;
                     return FormOutcome::WeekStartChanged(start);
                 }
             }
@@ -319,7 +348,7 @@ impl Form {
                 if field == Field::Date && (ctrl || key.code == KeyCode::F(2)) =>
             {
                 let current = parse_date_input(&self.date_text, today).ok().flatten();
-                self.calendar = Some(Calendar::new(current, today, self.week_start));
+                self.calendar = Some(Calendar::new(current, today, self.prefs.week_start));
             }
             // Ctrl+U clears the focused text field (same as in a shell).
             KeyCode::Char('u') if ctrl => {
@@ -354,6 +383,7 @@ impl Form {
         match field {
             Field::Title => Some(&mut self.title),
             Field::Date => Some(&mut self.date_text),
+            Field::Time => Some(&mut self.time_text),
             Field::EveryN => Some(&mut self.every_n),
             Field::Notes => Some(&mut self.notes),
             _ => None,
@@ -420,6 +450,15 @@ impl Form {
         if self.kind == Kind::Event && date.is_none() {
             return Err("Events need a date to count down to.".to_string());
         }
+        // Only tasks have a due time, and it needs a date to belong to.
+        let due_time = if self.kind == Kind::Task {
+            parse_time_input(&self.time_text)?
+        } else {
+            None
+        };
+        if due_time.is_some() && date.is_none() {
+            return Err("A due time needs a due date.".to_string());
+        }
         let repeat = self.repeat_rule()?;
         let notes = self.notes.trim();
         Ok(FormData {
@@ -429,6 +468,7 @@ impl Form {
             notes: (!notes.is_empty()).then(|| notes.to_string()),
             priority: self.priority,
             date,
+            due_time,
             repeat,
             // Only meaningful for one-off events; stored false otherwise to keep data tidy.
             keep_after_pass: self.kind == Kind::Event
@@ -505,8 +545,9 @@ fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMo
 /// Step 2: the fields.
 fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) {
     let fields = form.fields();
-    // Height: one line per field + date preview + blank + error/hint lines + borders.
-    let height = fields.len() as u16 + 6;
+    // Height: one line per field + date preview (+ time preview for tasks) + blank +
+    // error/hint lines + borders.
+    let height = fields.len() as u16 + 6 + u16::from(fields.contains(&Field::Time));
     let area = centered(frame.area(), 64, height);
     let (verb, noun) = match (&form.editing, form.kind) {
         (Some(_), Kind::Task) => ("Edit", "task"),
@@ -548,6 +589,9 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         // Right under the date: show how the typed text was understood.
         if *field == Field::Date {
             lines.push(date_preview(form, theme, today));
+        }
+        if *field == Field::Time {
+            lines.push(time_preview(form, theme));
         }
     }
     lines.push(Line::default());
@@ -593,13 +637,14 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
             let text = match field {
                 Field::Title => &form.title,
                 Field::Date => &form.date_text,
+                Field::Time => &form.time_text,
                 Field::EveryN => &form.every_n,
                 _ => &form.notes,
             };
             debug_assert!(field.is_text());
             if focused {
                 format!("{}▏", tail_fit(text, width.saturating_sub(1)))
-            } else if text.is_empty() && field == Field::Date {
+            } else if text.is_empty() && matches!(field, Field::Date | Field::Time) {
                 "(none)".to_string()
             } else {
                 tail_fit(text, width)
@@ -635,6 +680,23 @@ fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
     Line::from(Span::styled(text, Style::new().fg(color(slot))))
 }
 
+/// The muted line under the time field: the understood time, or how to type one.
+fn time_preview<'a>(form: &Form, theme: &Theme) -> Line<'a> {
+    let indent = " ".repeat(14);
+    let (text, slot) = match parse_time_input(&form.time_text) {
+        Ok(Some(time)) => (
+            format!("{indent}→ {}", format_time(time, form.prefs.time_format)),
+            theme.ok,
+        ),
+        Ok(None) => (
+            format!("{indent}e.g. 2pm, 2:30 pm, 14:30 (empty = any time that day)"),
+            theme.muted,
+        ),
+        Err(_) => (format!("{indent}? not a time yet"), theme.warn),
+    };
+    Line::from(Span::styled(text, Style::new().fg(color(slot))))
+}
+
 /// A dim one-line list of keys at the bottom of a popup.
 fn hint_line<'a>(text: &'a str, theme: &Theme) -> Line<'a> {
     Line::from(Span::styled(
@@ -663,7 +725,7 @@ mod tests {
 
     #[test]
     fn tab_flips_kind_then_enter_shows_event_fields() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         assert_eq!(form.kind, Kind::Task);
         form.handle_key(key(KeyCode::Tab), today());
         assert_eq!(form.kind, Kind::Event);
@@ -676,7 +738,7 @@ mod tests {
 
     #[test]
     fn typing_a_task_and_saving() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         form.handle_key(key(KeyCode::Enter), today()); // Task
         type_text(&mut form, "Renew registration");
         form.handle_key(key(KeyCode::Tab), today()); // -> priority
@@ -696,7 +758,7 @@ mod tests {
 
     #[test]
     fn custom_repeat_reveals_every_n_fields() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
         form.title = "x".into();
         form.repeat_choice = CUSTOM;
@@ -717,7 +779,7 @@ mod tests {
 
     #[test]
     fn validation_errors() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
         assert!(form.validate(today()).is_err(), "empty title");
         form.title = "Party".into();
@@ -731,7 +793,7 @@ mod tests {
 
     #[test]
     fn ctrl_d_opens_the_calendar_and_enter_fills_the_date() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         form.handle_key(key(KeyCode::Enter), today()); // Task
         form.focus = form
             .fields()
@@ -760,12 +822,48 @@ mod tests {
 
     #[test]
     fn plain_d_is_still_typed_and_the_picker_only_opens_on_the_date_field() {
-        let mut form = Form::new_add(WeekStart::Sunday);
+        let mut form = Form::new_add(FormPrefs::default());
         form.handle_key(key(KeyCode::Enter), today());
         type_text(&mut form, "dd"); // title field
         assert_eq!(form.title, "dd");
         form.handle_key(key(KeyCode::F(2)), today());
         assert!(form.calendar.is_none(), "not on the title field");
+    }
+
+    #[test]
+    fn tasks_take_an_optional_due_time_that_needs_a_date() {
+        let mut form = Form::new_add(FormPrefs::default());
+        form.step = Step::Fields;
+        form.title = "standup".into();
+        assert!(form.fields().contains(&Field::Time));
+        form.time_text = "2pm".into();
+        assert!(form.validate(today()).is_err(), "time without a date");
+        form.date_text = "today".into();
+        let data = form.validate(today()).unwrap();
+        assert_eq!(data.due_time, NaiveTime::from_hms_opt(14, 0, 0));
+        form.time_text = "25:00".into();
+        assert!(form.validate(today()).is_err(), "bad time");
+
+        // Events have no time field and never store one.
+        form.kind = Kind::Event;
+        assert!(!form.fields().contains(&Field::Time));
+        form.time_text = "2pm".into();
+        assert_eq!(form.validate(today()).unwrap().due_time, None);
+    }
+
+    #[test]
+    fn editing_shows_the_time_in_the_chosen_style() {
+        let mut item = Item::new(Kind::Task, "standup", chrono::Utc::now());
+        item.date = Some(today());
+        item.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        let twelve = Form::edit(&item, FormPrefs::default());
+        assert_eq!(twelve.time_text, "2:00 PM");
+        let prefs = FormPrefs {
+            time_format: TimeFormat::Hour24,
+            ..FormPrefs::default()
+        };
+        assert_eq!(Form::edit(&item, prefs).time_text, "14:00");
+        assert_eq!(twelve.validate(today()).unwrap().due_time, item.due_time);
     }
 
     #[test]
@@ -776,7 +874,7 @@ mod tests {
             n: 2,
             unit: Unit::Months,
         };
-        let form = Form::edit(&item, WeekStart::Sunday);
+        let form = Form::edit(&item, FormPrefs::default());
         assert_eq!(form.step, Step::Fields);
         let data = form.validate(today()).unwrap();
         assert_eq!(data.repeat, item.repeat);

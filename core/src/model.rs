@@ -8,7 +8,7 @@
 //! newest edit can win a conflict), and a `deleted` flag instead of really deleting rows (so a
 //! deletion can be sent to other devices).
 
-use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -234,6 +234,12 @@ pub struct Item {
     /// Christmas everywhere. That's exactly what a due date is, and it can't drift by a day when
     /// clocks change for daylight saving time.
     pub date: Option<NaiveDate>,
+    /// Tasks only: an optional due *time* on the due date, e.g. 14:00.
+    ///
+    /// Stored as local wall-clock time, not UTC: "2 PM" means 2 PM wherever you are, like an
+    /// alarm clock. Two synced devices in different time zones each show 2 PM local. A time
+    /// is only allowed together with a date.
+    pub due_time: Option<NaiveTime>,
     /// How the item repeats (or `RepeatRule::None`).
     pub repeat: RepeatRule,
     /// Events only: keep showing a one-off event after its date has passed.
@@ -263,6 +269,7 @@ impl Item {
             notes: None,
             priority: Priority::Medium,
             date: None,
+            due_time: None,
             repeat: RepeatRule::None,
             keep_after_pass: false,
             completed_at: None,

@@ -21,12 +21,13 @@
 //! **Narrow mode** (under [`NARROW_WIDTH`] columns): the priority text, repeat label and date
 //! columns are dropped, countdowns get shorter ("3d"), and long titles end in `…`.
 
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table};
+use zerohour_core::clock::{TimeFormat, format_time, format_time_short, relative_text};
 use zerohour_core::icons::{Icon, IconMode, priority_icon};
 use zerohour_core::model::{Item, Priority};
 use zerohour_core::repeat::{days_until, is_overdue};
@@ -136,6 +137,8 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
     let theme = app.theme;
     let mode = app.icon_mode;
     let today = app.today;
+    let now = app.now;
+    let time_format = app.time_format;
     let block = section_block(
         "Tasks",
         app.tasks.len(),
@@ -161,7 +164,19 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
         .map(|&p| width_u16(priority_icon(p).get(mode)))
         .max()
         .unwrap_or(1);
-    let due_w: u16 = if narrow { 5 } else { 13 };
+    // The due column fits its longest text, but is never narrower than the original 13 (or 5
+    // in narrow mode), so a list without due times looks exactly as before.
+    let due_texts: Vec<(String, Rgb)> = app
+        .tasks
+        .iter()
+        .map(|task| due_label(task, now, narrow, mode, time_format, theme))
+        .collect();
+    let longest = due_texts
+        .iter()
+        .map(|(text, _)| width_u16(text))
+        .max()
+        .unwrap_or(0);
+    let due_w: u16 = longest.max(if narrow { 5 } else { 13 });
     let mut fixed = vec![marker_w, prio_w];
     if show_dates {
         fixed.push(DATE_WIDTH);
@@ -176,8 +191,10 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
     let rows: Vec<Row> = app
         .tasks
         .iter()
-        .map(|task| {
-            let overdue = is_overdue(task, today);
+        // `.zip` walks two lists side by side, pairing each task with its due text.
+        .zip(due_texts)
+        .map(|(task, (due_text, due_slot))| {
+            let overdue = is_overdue(task, now);
             let mut title = task.title.clone();
             if task.repeat.is_repeating() {
                 title.push(' ');
@@ -189,7 +206,6 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
                 Style::new().fg(color(theme.fg))
             };
             let prio_style = Style::new().fg(priority_color(task.priority, theme));
-            let (due_text, due_slot) = due_label(task, today, narrow, mode, theme);
 
             let mut cells = vec![
                 Cell::from(Span::styled(
@@ -356,15 +372,28 @@ fn date_cell<'a>(date: Option<NaiveDate>, today: NaiveDate, theme: &Theme) -> Ce
 /// Returns a tuple `(String, Rgb)`; the caller unpacks it with `let (text, slot) = ...`.
 fn due_label(
     task: &Item,
-    today: NaiveDate,
+    now: NaiveDateTime,
     narrow: bool,
     mode: IconMode,
+    time_format: TimeFormat,
     theme: &Theme,
 ) -> (String, Rgb) {
     let Some(due) = task.date else {
         return (String::new(), theme.muted);
     };
+    let today = now.date();
     let days = days_until(due, today);
+    if let Some(time) = task.due_time {
+        return timed_due_label(
+            due.and_time(time),
+            days,
+            now,
+            narrow,
+            mode,
+            time_format,
+            theme,
+        );
+    }
     let overdue = Icon::Overdue.get(mode);
     // Match on (days, narrow) together; guards (`if d > 0`) refine an arm further.
     let text = match (days, narrow) {
@@ -380,6 +409,39 @@ fn due_label(
     let slot = match days {
         d if d < 0 => theme.danger,
         0 | 1 => theme.warn,
+        _ => theme.muted,
+    };
+    (text, slot)
+}
+
+/// The due text for a task with a due time, e.g. "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
+/// "in 3d · 2:00 PM", or "! overdue 2h". Narrow mode keeps just "3h" (today), "2PM"
+/// (tomorrow), "3d" or "!2h".
+fn timed_due_label(
+    due: NaiveDateTime,
+    days: i64,
+    now: NaiveDateTime,
+    narrow: bool,
+    mode: IconMode,
+    time_format: TimeFormat,
+    theme: &Theme,
+) -> (String, Rgb) {
+    let overdue_icon = Icon::Overdue.get(mode);
+    let (relative, overdue) = relative_text(due, now);
+    let time = format_time(due.time(), time_format);
+    let text = match (overdue, days, narrow) {
+        (true, _, false) => format!("{overdue_icon} overdue {relative}"),
+        (true, _, true) => format!("{overdue_icon}{relative}"),
+        (false, 0, false) => format!("today {time} · in {relative}"),
+        (false, 0, true) => relative,
+        (false, 1, false) => format!("tomorrow {time}"),
+        (false, 1, true) => format_time_short(due.time(), time_format),
+        (false, d, false) => format!("in {d}d · {time}"),
+        (false, d, true) => format!("{d}d"),
+    };
+    let slot = match (overdue, days) {
+        (true, _) => theme.danger,
+        (false, 0 | 1) => theme.warn,
         _ => theme.muted,
     };
     (text, slot)

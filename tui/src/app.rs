@@ -12,10 +12,11 @@
 //! Database errors never crash the app: they are shown as a red status message instead.
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate, Utc};
+use chrono::{Local, NaiveDate, NaiveDateTime, Timelike, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
+use zerohour_core::clock::TimeFormat;
 use zerohour_core::db::{Db, settings_keys};
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
@@ -26,7 +27,7 @@ use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
 use crate::input::{Action, main_action};
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
-use crate::ui::add::{Form, FormData, FormOutcome};
+use crate::ui::add::{Form, FormData, FormOutcome, FormPrefs};
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
 
@@ -125,6 +126,11 @@ pub struct App {
     db: Db,
     /// Today's local date. Refreshed each tick so the countdowns roll over at midnight.
     pub today: NaiveDate,
+    /// The local date and time, refreshed every tick. Tasks with a due time turn overdue the
+    /// minute it passes, without waiting for a key press.
+    pub now: NaiveDateTime,
+    /// 12-hour ("2:00 PM", the default) or 24-hour ("14:00") times; `T` switches.
+    pub time_format: TimeFormat,
     /// Open tasks, sorted: highest priority first, then soonest due date.
     pub tasks: Vec<Item>,
     /// Visible events, sorted by days remaining.
@@ -189,10 +195,13 @@ impl App {
         // Read before `db` moves into the struct below (after a move, `db` can't be used here).
         let layout = LayoutMode::parse(db.get_setting(settings_keys::LAYOUT)?.as_deref());
         let week_start = WeekStart::parse(db.get_setting(settings_keys::WEEK_START)?.as_deref());
+        let time_format = TimeFormat::parse(db.get_setting(settings_keys::TIME_FORMAT)?.as_deref());
 
         let mut app = App {
             db,
             today: local_today(),
+            now: local_now(),
+            time_format,
             tasks: Vec::new(),
             events: Vec::new(),
             selected: 0,
@@ -253,6 +262,13 @@ impl App {
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => std::cmp::Ordering::Equal,
                 })
+                // Same day: timed tasks first, earliest first; untimed ones after them.
+                .then_with(|| match (a.due_time, b.due_time) {
+                    (Some(x), Some(y)) => x.cmp(&y),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                })
                 .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
         });
 
@@ -278,7 +294,7 @@ impl App {
         });
 
         let completions = self.db.list_completions()?;
-        self.stats = stats::compute(&completions, &items, today, &Local);
+        self.stats = stats::compute(&completions, &items, self.now, &Local);
         self.tasks = tasks;
         self.events = events;
 
@@ -294,9 +310,13 @@ impl App {
     /// changed (we passed midnight), reload so countdowns update and repeating events roll
     /// over. With sync, also picks up results from the background worker.
     pub fn tick(&mut self) {
-        let today = local_today();
-        if today != self.today {
-            self.today = today;
+        let now = local_now();
+        // Reload when the minute changes (the overdue count in the stats can change as due
+        // times pass) and, of course, at midnight.
+        let changed = now.date() != self.today || now.minute() != self.now.minute();
+        self.now = now;
+        if changed {
+            self.today = now.date();
             if let Err(e) = self.refresh() {
                 self.set_error(e);
             }
@@ -465,10 +485,10 @@ impl App {
             }
             Action::Top => self.selected = 0,
             Action::Bottom => self.selected = rows.saturating_sub(1),
-            Action::Add => self.overlay = Overlay::Form(Form::new_add(self.week_start)),
+            Action::Add => self.overlay = Overlay::Form(Form::new_add(self.form_prefs())),
             Action::Edit => {
                 if let Some(item) = self.selected_item() {
-                    self.overlay = Overlay::Form(Form::edit(item, self.week_start));
+                    self.overlay = Overlay::Form(Form::edit(item, self.form_prefs()));
                 }
             }
             Action::Complete => self.complete_selected()?,
@@ -479,6 +499,15 @@ impl App {
                         title: item.title.clone(),
                     };
                 }
+            }
+            Action::ToggleTimeFormat => {
+                self.time_format = self.time_format.toggled();
+                self.db
+                    .set_setting(settings_keys::TIME_FORMAT, self.time_format.as_str())?;
+                self.set_status(match self.time_format {
+                    TimeFormat::Hour12 => "Times: 12-hour (2:00 PM)",
+                    TimeFormat::Hour24 => "Times: 24-hour (14:00)",
+                });
             }
             Action::ToggleLayout => {
                 self.layout = self.layout.toggled();
@@ -583,14 +612,18 @@ impl App {
             return Ok(());
         }
         let (id, title) = (item.id.clone(), item.title.clone());
-        let next = self.db.complete_task(&id, self.today, Utc::now())?;
+        let next = self.db.complete_task(&id, local_now(), Utc::now())?;
         self.refresh()?;
         match next {
             Some(next) => {
-                let due = next
+                let mut due = next
                     .date
                     .map(|d| d.format("%a %b %d").to_string())
                     .unwrap_or_default();
+                if let Some(time) = next.due_time {
+                    due.push(' ');
+                    due.push_str(&zerohour_core::clock::format_time(time, self.time_format));
+                }
                 self.select_id(&next.id);
                 self.set_status(format!("Done: \"{title}\". Next one due {due}"));
             }
@@ -769,6 +802,14 @@ impl App {
         Ok(())
     }
 
+    /// The display settings the add/edit form needs.
+    fn form_prefs(&self) -> FormPrefs {
+        FormPrefs {
+            week_start: self.week_start,
+            time_format: self.time_format,
+        }
+    }
+
     /// Total rows on the main screen (tasks + events).
     pub fn row_count(&self) -> usize {
         self.tasks.len() + self.events.len()
@@ -822,9 +863,14 @@ impl App {
 }
 
 /// Today's date in the computer's local time zone.
-///
-/// This is the ONE place the TUI asks the clock for "today"; everything in core receives it
-/// as a parameter.
 pub fn local_today() -> NaiveDate {
-    Local::now().date_naive()
+    local_now().date()
+}
+
+/// The local date and time ("wall-clock" time, no time zone attached).
+///
+/// This is the ONE place the TUI asks the clock for the local time; everything in core
+/// receives it as a parameter.
+pub fn local_now() -> NaiveDateTime {
+    Local::now().naive_local()
 }

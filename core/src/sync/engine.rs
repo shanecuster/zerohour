@@ -356,7 +356,8 @@ mod tests {
         let b = task("b", at(9));
         db.insert_item(&a).unwrap();
         db.insert_item(&b).unwrap();
-        db.complete_task(&a.id, day(8), at(10)).unwrap();
+        db.complete_task(&a.id, day(8).and_hms_opt(12, 0, 0).unwrap(), at(10))
+            .unwrap();
 
         let report = sync(&mut db, &server, at(11));
         assert_eq!(report.pushed, 3, "two items and one completion");
@@ -527,6 +528,27 @@ mod tests {
     }
 
     #[test]
+    fn a_due_time_syncs_as_a_version_2_document() {
+        let server = FakeCouch::new("zerohour");
+        let (mut laptop, mut phone) = (device(), device());
+        let mut item = task("standup", at(9));
+        item.date = Some(day(9));
+        item.due_time = chrono::NaiveTime::from_hms_opt(14, 0, 0);
+        laptop.insert_item(&item).unwrap();
+        let plain = task("no time", at(9));
+        laptop.insert_item(&plain).unwrap();
+        sync(&mut laptop, &server, at(9));
+
+        assert_eq!(server.doc(&item_doc_id(&item.id)).unwrap()["v"], 2);
+        assert_eq!(server.doc(&item_doc_id(&plain.id)).unwrap()["v"], 1);
+        sync(&mut phone, &server, at(10));
+        assert_eq!(
+            phone.get_item(&item.id).unwrap().unwrap().due_time,
+            item.due_time
+        );
+    }
+
+    #[test]
     fn newest_edit_wins_on_both_devices() {
         let server = FakeCouch::new("zerohour");
         let (mut laptop, mut phone) = (device(), device());
@@ -586,7 +608,9 @@ mod tests {
         sync(&mut laptop, &server, at(9));
         sync(&mut phone, &server, at(9));
 
-        laptop.complete_task(&item.id, day(8), at(10)).unwrap();
+        laptop
+            .complete_task(&item.id, day(8).and_hms_opt(12, 0, 0).unwrap(), at(10))
+            .unwrap();
         let mut renamed = item.clone();
         renamed.title = "file taxes (state too)".into();
         phone.update_item(&mut renamed, at(11)).unwrap();
@@ -614,11 +638,11 @@ mod tests {
         sync(&mut phone, &server, at(9));
 
         let next_laptop = laptop
-            .complete_task(&item.id, day(8), at(10))
+            .complete_task(&item.id, day(8).and_hms_opt(12, 0, 0).unwrap(), at(10))
             .unwrap()
             .unwrap();
         let next_phone = phone
-            .complete_task(&item.id, day(8), at(11))
+            .complete_task(&item.id, day(8).and_hms_opt(12, 0, 0).unwrap(), at(11))
             .unwrap()
             .unwrap();
         assert_eq!(next_laptop.id, next_phone.id, "same derived id");
@@ -705,7 +729,7 @@ mod tests {
         server.put(json!({ "_id": "_design/app", "views": {} }));
         server.put(json!({ "_id": "notes:1", "text": "someone else's doc" }));
         let mut future = item_to_doc(&task("from the future", at(9)), None);
-        future["v"] = json!(2);
+        future["v"] = json!(crate::sync::doc::DOC_VERSION + 1);
         server.put(future);
         server.put(json!({ "_id": "item:broken", "type": "item", "v": 1 }));
 

@@ -12,19 +12,19 @@
 //! the `sync` feature, so local-only builds don't even compile it. It reuses the helpers below,
 //! which is why a few of them are `pub(crate)` (visible inside this crate only).
 //!
-//! **Formats.** Calendar dates are stored as `YYYY-MM-DD` text. Timestamps are stored as UTC in
+//! **Formats.** Calendar dates are stored as `YYYY-MM-DD` text, due times as local `HH:MM`. Timestamps are stored as UTC in
 //! RFC 3339 text (`2026-10-08T14:03:00Z`). Text sorts correctly and is easy to read with the
 //! `sqlite3` command-line tool when debugging.
 
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::{
     Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
 };
-use crate::repeat::{is_overdue, next_task_date};
+use crate::repeat::{is_overdue, next_instance_date};
 
 /// Everything that can go wrong in the storage layer.
 ///
@@ -51,7 +51,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
-/// Version 1 is the initial schema; version 2 adds the sync bookkeeping table.
+/// Version 1 is the initial schema; version 2 adds the sync bookkeeping table; version 3 adds
+/// the optional due time.
 /// NEVER edit an entry once released; add a new one instead.
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -105,12 +106,21 @@ const MIGRATIONS: &[(i64, &str)] = &[
     );
     ",
     ),
+    (
+        3,
+        "
+    -- Optional due time for tasks, as LOCAL wall-clock time 'HH:MM' (not UTC): '14:00' means
+    -- 2 PM wherever you are. NULL = no time (the whole due day counts). Additive: existing
+    -- rows get NULL, and older builds that don't know the column simply never read it.
+    ALTER TABLE items ADD COLUMN due_time TEXT;
+    ",
+    ),
 ];
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
 pub(crate) const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
-                            completed_at, created_at, updated_at, deleted";
+                            completed_at, created_at, updated_at, deleted, due_time";
 
 /// Well-known keys for the settings table, so typos become compile errors instead of bugs.
 pub mod settings_keys {
@@ -123,6 +133,8 @@ pub mod settings_keys {
     pub const LAYOUT: &str = "layout";
     /// First day of the week in the calendar picker: "sunday" (default) or "monday".
     pub const WEEK_START: &str = "week_start";
+    /// How times are shown: "12h" (default, "2:00 PM") or "24h" ("14:00").
+    pub const TIME_FORMAT: &str = "time_format";
 }
 
 /// A handle to the open database. All storage goes through this.
@@ -243,7 +255,8 @@ impl Db {
         let changed = self.conn.execute(
             "UPDATE items SET kind = ?2, title = ?3, notes = ?4, priority = ?5, date = ?6,
                               repeat = ?7, keep_after_pass = ?8, completed_at = ?9,
-                              created_at = ?10, updated_at = ?11, deleted = ?12
+                              created_at = ?10, updated_at = ?11, deleted = ?12,
+                              due_time = ?13
              WHERE id = ?1",
             params![
                 item.id,
@@ -258,6 +271,7 @@ impl Db {
                 ts_to_db(item.created_at),
                 ts_to_db(item.updated_at),
                 item.deleted,
+                item.due_time.map(time_to_db),
             ],
         )?;
         if changed == 0 {
@@ -319,11 +333,12 @@ impl Db {
     /// All three writes happen in one transaction, so a crash can't leave a completed task
     /// without its log entry or its next instance. Returns the new instance, if one was made.
     ///
-    /// `today` is the user's local date (for overdue/next-date math); `now` is the exact moment.
+    /// `local_now` is the user's local date and time (for overdue and next-date math, which
+    /// work in wall-clock time); `now` is the same moment in UTC, for the stored timestamps.
     pub fn complete_task(
         &mut self,
         id: &str,
-        today: NaiveDate,
+        local_now: NaiveDateTime,
         now: DateTime<Utc>,
     ) -> Result<Option<Item>> {
         let mut task = self
@@ -344,21 +359,23 @@ impl Db {
             completed_at: now,
             title_snapshot: task.title.clone(),
             priority_snapshot: task.priority,
-            was_overdue: is_overdue(&task, today),
+            was_overdue: is_overdue(&task, local_now),
         };
 
         // Build the next instance (if repeating) before we start writing.
-        let next = next_task_date(task.repeat, task.date, today).map(|date| {
-            // `..task.clone()` = "every other field copied from the old task".
-            Item {
-                id: derived_id(DerivedId::NextInstance, &task.id),
-                date: Some(date),
-                completed_at: None,
-                created_at: now,
-                updated_at: now,
-                ..task.clone()
-            }
-        });
+        // The next instance keeps the due time (`..task.clone()` below copies it).
+        let next =
+            next_instance_date(task.repeat, task.date, task.due_time, local_now).map(|date| {
+                // `..task.clone()` = "every other field copied from the old task".
+                Item {
+                    id: derived_id(DerivedId::NextInstance, &task.id),
+                    date: Some(date),
+                    completed_at: None,
+                    created_at: now,
+                    updated_at: now,
+                    ..task.clone()
+                }
+            });
 
         task.completed_at = Some(now);
         task.updated_at = next_updated_at(task.updated_at, now);
@@ -498,7 +515,7 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
     conn.execute(
         &format!(
             "{verb} INTO items ({ITEM_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             item.id,
@@ -513,6 +530,7 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
             ts_to_db(item.created_at),
             ts_to_db(item.updated_at),
             item.deleted,
+            item.due_time.map(time_to_db),
         ],
     )?;
     Ok(())
@@ -566,6 +584,7 @@ pub(crate) struct RawItem {
     created_at: String,
     updated_at: String,
     deleted: bool,
+    due_time: Option<String>,
 }
 
 impl RawItem {
@@ -587,6 +606,7 @@ impl RawItem {
             created_at: row.get(9)?,
             updated_at: row.get(10)?,
             deleted: row.get(11)?,
+            due_time: row.get(12)?,
         })
     }
 
@@ -599,6 +619,7 @@ impl RawItem {
                 .ok_or_else(|| bad("priority", &self.priority))?,
             repeat: RepeatRule::parse(&self.repeat).ok_or_else(|| bad("repeat", &self.repeat))?,
             date: self.date.as_deref().map(date_from_db).transpose()?,
+            due_time: self.due_time.as_deref().map(time_from_db).transpose()?,
             completed_at: self.completed_at.as_deref().map(ts_from_db).transpose()?,
             created_at: ts_from_db(&self.created_at)?,
             updated_at: ts_from_db(&self.updated_at)?,
@@ -620,6 +641,16 @@ pub(crate) fn date_to_db(date: NaiveDate) -> String {
 pub(crate) fn date_from_db(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| DbError::BadData(format!("bad date '{s}'")))
+}
+
+/// Time of day -> `"14:00"` (local wall-clock time, 24-hour).
+pub(crate) fn time_to_db(time: NaiveTime) -> String {
+    time.format("%H:%M").to_string()
+}
+
+/// `"14:00"` -> time of day.
+pub(crate) fn time_from_db(s: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(s, "%H:%M").map_err(|_| DbError::BadData(format!("bad time '{s}'")))
 }
 
 /// Timestamp -> `"2026-10-08T14:03:00.123Z"` (RFC 3339, always UTC, always the same width
@@ -645,6 +676,11 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, day).unwrap()
     }
 
+    /// Midday on a date, as the local date-time `complete_task` takes.
+    fn noon(date: NaiveDate) -> NaiveDateTime {
+        date.and_hms_opt(12, 0, 0).unwrap()
+    }
+
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap()
     }
@@ -652,10 +688,10 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -675,7 +711,16 @@ mod tests {
         let old = Db { conn };
         let mut task = Item::new(Kind::Task, "old task", now());
         task.date = Some(d(2026, 10, 1));
-        old.insert_item(&task).unwrap();
+        // Written with the version-1 column list, as a phase 1 build would have.
+        old.conn
+            .execute(
+                "INSERT INTO items (id, kind, title, notes, priority, date, repeat,
+                                    keep_after_pass, completed_at, created_at, updated_at, deleted)
+                 VALUES (?1, 'task', 'old task', NULL, 'medium', '2026-10-01', 'none', 0, NULL,
+                         ?2, ?2, 0)",
+                params![task.id, ts_to_db(now())],
+            )
+            .unwrap();
         // The completion and the next instance get ids *derived* from this task's id (see
         // `model::derived_id`), so completing the same task on two offline devices produces
         // the same rows, which sync then merges into one.
@@ -692,7 +737,7 @@ mod tests {
 
         // Re-run initialization the way `Db::open` does on the next start.
         let db = Db::init(old.conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 2);
+        assert_eq!(db.schema_version().unwrap(), 3);
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
         assert_eq!(
@@ -705,6 +750,66 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sync_docs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn version_2_database_upgrades_to_3_with_no_due_times() {
+        // A database as the sync build left it: migrations 1 and 2 applied.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in &MIGRATIONS[..2] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, ts_to_db(now())],
+            )
+            .unwrap();
+        }
+        // An event written with the old column list (no due_time column existed).
+        conn.execute(
+            "INSERT INTO items (id, kind, title, notes, priority, date, repeat, keep_after_pass,
+                                completed_at, created_at, updated_at, deleted)
+             VALUES ('e1', 'event', 'Christmas', NULL, 'medium', '2026-12-25', 'yearly', 0,
+                     NULL, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z', 0)",
+            [],
+        )
+        .unwrap();
+
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 3);
+        let christmas = db.get_item("e1").unwrap().unwrap();
+        assert_eq!(christmas.title, "Christmas");
+        assert_eq!(christmas.date, Some(d(2026, 12, 25)));
+        assert_eq!(christmas.repeat, RepeatRule::Yearly);
+        assert_eq!(christmas.due_time, None, "existing rows get no time");
+    }
+
+    #[test]
+    fn due_time_round_trips_and_carries_to_the_next_instance() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut task = Item::new(Kind::Task, "standup", now());
+        task.date = Some(d(2026, 10, 8));
+        task.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        task.repeat = RepeatRule::Daily;
+        db.insert_item(&task).unwrap();
+        assert_eq!(db.get_item(&task.id).unwrap().unwrap(), task);
+
+        // Due yesterday at 2 PM, done today at 10 AM: late (so logged as overdue), and today's
+        // 2 PM is still ahead, so the next one is due today at 2 PM.
+        let ten_am = d(2026, 10, 9).and_hms_opt(10, 0, 0).unwrap();
+        let next = db.complete_task(&task.id, ten_am, now()).unwrap().unwrap();
+        assert_eq!(next.date, Some(d(2026, 10, 9)));
+        assert_eq!(next.due_time, task.due_time);
+        assert!(db.list_completions().unwrap()[0].was_overdue);
+
+        // Editing can remove the time again.
+        let mut edited = db.get_item(&next.id).unwrap().unwrap();
+        edited.due_time = None;
+        db.update_item(&mut edited, now()).unwrap();
+        assert_eq!(db.get_item(&next.id).unwrap().unwrap().due_time, None);
     }
 
     #[test]
@@ -766,7 +871,9 @@ mod tests {
         task.priority = Priority::High;
         db.insert_item(&task).unwrap();
 
-        let next = db.complete_task(&task.id, d(2026, 10, 8), now()).unwrap();
+        let next = db
+            .complete_task(&task.id, noon(d(2026, 10, 8)), now())
+            .unwrap();
         assert!(next.is_none());
         assert!(db.get_item(&task.id).unwrap().unwrap().is_completed());
 
@@ -779,7 +886,7 @@ mod tests {
 
         // Completing again does nothing.
         assert!(
-            db.complete_task(&task.id, d(2026, 10, 8), now())
+            db.complete_task(&task.id, noon(d(2026, 10, 8)), now())
                 .unwrap()
                 .is_none()
         );
@@ -796,7 +903,7 @@ mod tests {
         db.insert_item(&task).unwrap();
 
         let next = db
-            .complete_task(&task.id, d(2026, 10, 8), now())
+            .complete_task(&task.id, noon(d(2026, 10, 8)), now())
             .unwrap()
             .expect("weekly task should create a new instance");
         assert_ne!(next.id, task.id);
@@ -852,12 +959,12 @@ mod tests {
 
         // Complete it, then complete the next instance too: a chain of three.
         let second = db
-            .complete_task(&task.id, d(2026, 10, 8), now())
+            .complete_task(&task.id, noon(d(2026, 10, 8)), now())
             .unwrap()
             .unwrap();
         let later = now() + chrono::TimeDelta::days(7);
         let third = db
-            .complete_task(&second.id, d(2026, 10, 15), later)
+            .complete_task(&second.id, noon(d(2026, 10, 15)), later)
             .unwrap()
             .unwrap();
 
@@ -892,7 +999,7 @@ mod tests {
         db.insert_item(&theirs).unwrap();
 
         let next = db
-            .complete_task(&task.id, d(2026, 10, 8), now())
+            .complete_task(&task.id, noon(d(2026, 10, 8)), now())
             .unwrap()
             .unwrap();
         assert_eq!(

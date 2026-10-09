@@ -11,7 +11,7 @@
 //!    occurrence + 1 month". That way Jan 31 -> Feb 28 -> Mar 31: the short month clamps the
 //!    day, but the next month goes back to the 31st instead of drifting to the 28th forever.
 
-use chrono::{Datelike, Months, NaiveDate, TimeDelta, Weekday};
+use chrono::{Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Weekday};
 
 use crate::model::{Item, Kind, RepeatRule, Unit};
 
@@ -140,6 +140,47 @@ pub fn next_task_date(
     Some(first_on_or_after(rule, anchor, add_days(after, 1)))
 }
 
+/// The due date for the next instance of a repeating task that was just completed, taking
+/// the task's due *time* into account. `now` is the local date and time of completion.
+///
+/// - **No due time:** exactly [`next_task_date`] (date-only rules, unchanged).
+/// - **With a due time:** the first occurrence whose date + time is strictly after BOTH the
+///   old due date + time and `now`. So a daily 2 PM task that was due yesterday and is done
+///   today at 10 AM is next due *today* at 2 PM (that occurrence is still ahead); done at
+///   3 PM, it's next due tomorrow. Done early (before its due time), it moves past the one
+///   you just did, same as the date-only rule.
+pub fn next_instance_date(
+    rule: RepeatRule,
+    old_date: Option<NaiveDate>,
+    old_time: Option<NaiveTime>,
+    now: NaiveDateTime,
+) -> Option<NaiveDate> {
+    let today = now.date();
+    // `let (Some(a), Some(b)) = ... else` : continue only if BOTH are present.
+    let (Some(anchor), Some(time)) = (old_date, old_time) else {
+        return next_task_date(rule, old_date, today);
+    };
+    if !rule.is_repeating() {
+        return None;
+    }
+    // The moment the next occurrence must come after.
+    let after = anchor.and_time(time).max(now);
+    // The first occurrence on or after that day; if its time on that day isn't later than
+    // `after` (e.g. it's today but the time has passed), take the following occurrence.
+    let candidate = first_on_or_after(rule, anchor, after.date());
+    if candidate.and_time(time) > after {
+        Some(candidate)
+    } else {
+        Some(first_on_or_after(rule, anchor, add_days(candidate, 1)))
+    }
+}
+
+/// The local date and time a task is due, if it has both a due date and a due time.
+/// (`?` on an `Option` returns `None` early if that part is missing.)
+pub fn due_datetime(item: &Item) -> Option<NaiveDateTime> {
+    Some(item.date?.and_time(item.due_time?))
+}
+
 /// How many days from `today` until `date`. Positive = future, 0 = today, negative = past.
 pub fn days_until(date: NaiveDate, today: NaiveDate) -> i64 {
     // Subtracting two dates gives a `TimeDelta`; `.num_days()` turns it into a whole number.
@@ -167,9 +208,20 @@ pub fn event_is_visible(item: &Item, today: NaiveDate) -> bool {
     }
 }
 
-/// True if `item` is an open task whose due date is before today.
-pub fn is_overdue(item: &Item, today: NaiveDate) -> bool {
-    item.kind == Kind::Task && !item.is_completed() && item.date.is_some_and(|due| due < today)
+/// True if `item` is an open task that is past due at local time `now`.
+///
+/// - With a due time: overdue once `now` is past the due date + time.
+/// - Without one: overdue from the day after the due date (the whole due day counts as on
+///   time), exactly as before due times existed.
+pub fn is_overdue(item: &Item, now: NaiveDateTime) -> bool {
+    if item.kind != Kind::Task || item.is_completed() {
+        return false;
+    }
+    match (item.date, item.due_time) {
+        (Some(date), Some(time)) => date.and_time(time) < now,
+        (Some(date), None) => date < now.date(),
+        (None, _) => false,
+    }
 }
 
 /// Parses a date the user typed into the add form.
@@ -501,15 +553,68 @@ mod tests {
 
     #[test]
     fn overdue_tasks() {
+        // Late in the evening: a date-only task due today is still on time.
         let today = d(2026, 10, 8);
+        let now = today.and_hms_opt(23, 59, 0).unwrap();
         let mut t = Item::new(Kind::Task, "t", Utc::now());
-        assert!(!is_overdue(&t, today), "no due date is never overdue");
+        assert!(!is_overdue(&t, now), "no due date is never overdue");
         t.date = Some(today);
-        assert!(!is_overdue(&t, today), "due today is not overdue yet");
+        assert!(!is_overdue(&t, now), "due today is not overdue yet");
         t.date = Some(d(2026, 10, 7));
-        assert!(is_overdue(&t, today));
+        assert!(is_overdue(&t, now));
         t.completed_at = Some(Utc::now());
-        assert!(!is_overdue(&t, today), "completed tasks are never overdue");
+        assert!(!is_overdue(&t, now), "completed tasks are never overdue");
+    }
+
+    #[test]
+    fn timed_tasks_are_overdue_after_their_time() {
+        let today = d(2026, 10, 8);
+        let mut t = Item::new(Kind::Task, "standup", Utc::now());
+        t.date = Some(today);
+        t.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        let at = |h, m| today.and_hms_opt(h, m, 0).unwrap();
+        assert!(!is_overdue(&t, at(13, 59)));
+        assert!(!is_overdue(&t, at(14, 0)), "exactly on time is not late");
+        assert!(is_overdue(&t, at(14, 1)));
+        assert_eq!(due_datetime(&t), Some(at(14, 0)));
+    }
+
+    #[test]
+    fn next_instance_with_a_due_time() {
+        let two_pm = NaiveTime::from_hms_opt(14, 0, 0);
+        let at = |day: NaiveDate, h| day.and_hms_opt(h, 0, 0).unwrap();
+        let (wed, thu, fri) = (d(2026, 10, 7), d(2026, 10, 8), d(2026, 10, 9));
+
+        // Daily 2 PM, due yesterday, done this morning: today's 2 PM is still ahead.
+        assert_eq!(
+            next_instance_date(RepeatRule::Daily, Some(wed), two_pm, at(thu, 10)),
+            Some(thu)
+        );
+        // Same, but done after 2 PM: tomorrow.
+        assert_eq!(
+            next_instance_date(RepeatRule::Daily, Some(wed), two_pm, at(thu, 15)),
+            Some(fri)
+        );
+        // Due today at 2 PM, done early at 9 AM: you did today's, so tomorrow.
+        assert_eq!(
+            next_instance_date(RepeatRule::Daily, Some(thu), two_pm, at(thu, 9)),
+            Some(fri)
+        );
+        // Weekly, done days early: the week after the one you did.
+        assert_eq!(
+            next_instance_date(RepeatRule::Weekly, Some(fri), two_pm, at(wed, 9)),
+            Some(d(2026, 10, 16))
+        );
+        // No time: the date-only rule, unchanged.
+        assert_eq!(
+            next_instance_date(RepeatRule::Daily, Some(wed), None, at(thu, 10)),
+            next_task_date(RepeatRule::Daily, Some(wed), thu)
+        );
+        // Not repeating: no next instance.
+        assert_eq!(
+            next_instance_date(RepeatRule::None, Some(wed), two_pm, at(thu, 10)),
+            None
+        );
     }
 
     #[test]
