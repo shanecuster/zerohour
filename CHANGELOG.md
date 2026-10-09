@@ -56,9 +56,14 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Fixed
 
+HEAD
 - Hints and messages in dialogs no longer get cut off on narrower terminals: the add/edit dialog's
   date and time hints, the help overlay, the icon check, the delete confirmation (long titles),
   and the sync settings now wrap their text and grow to fit.
+- In the task list, a long timed due label ("today 12:00 PM · in 11h") no longer runs into the
+  priority after it: the due column keeps one blank column after its widest label.
+  
+  feature/due-column-width
 
 ## [0.1.0] - 2026-10-08
 

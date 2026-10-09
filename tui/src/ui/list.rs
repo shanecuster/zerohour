@@ -186,8 +186,8 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
         .map(|&p| width_u16(priority_icon(p).get(mode)))
         .max()
         .unwrap_or(1);
-    // The due column fits its longest text, but is never narrower than the original 13 (or 5
-    // in narrow mode), so a list without due times looks exactly as before.
+    // The due column is sized from the longest due text actually shown (see
+    // `due_column_width`).
     let due_texts: Vec<(String, Rgb)> = app
         .tasks
         .iter()
@@ -198,7 +198,7 @@ fn draw_tasks(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_d
         .map(|(text, _)| width_u16(text))
         .max()
         .unwrap_or(0);
-    let due_w: u16 = longest.max(if narrow { 5 } else { 13 });
+    let due_w = due_column_width(longest, narrow);
     let mut fixed = vec![marker_w, prio_w];
     if show_dates {
         fixed.push(DATE_WIDTH);
@@ -346,6 +346,21 @@ fn constraints(fixed: &[u16], title_index: usize) -> Vec<Constraint> {
     let mut out: Vec<Constraint> = fixed.iter().map(|&w| Constraint::Length(w)).collect();
     out.insert(title_index, Constraint::Fill(1));
     out
+}
+
+/// Width of the Tasks section's due column, given the widest due text being shown.
+///
+/// - **Wide mode:** the widest text plus one blank column, and never less than the original
+///   13. The extra blank keeps a long timed label ("today 12:00 PM · in 11h") from running
+///   straight into the priority after it ("Medium"), which made that row look shifted.
+///   A list without due times stays exactly as before: its texts are at most 12 wide.
+/// - **Narrow mode:** unchanged: the widest text, at least 5.
+fn due_column_width(longest: u16, narrow: bool) -> u16 {
+    if narrow {
+        longest.max(5)
+    } else {
+        (longest + 1).max(13)
+    }
 }
 
 /// How many columns the title gets: the box's inner width minus the fixed columns and the
@@ -563,5 +578,203 @@ mod tests {
             assert_eq!(LayoutMode::parse(Some(mode.as_str())), mode);
             assert_eq!(mode.toggled().toggled(), mode);
         }
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use chrono::{NaiveTime, TimeDelta};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use zerohour_core::db::{Db, settings_keys};
+    use zerohour_core::model::Kind;
+
+    /// "Now" for these tests: Fri Oct 9 2026, 00:30 local, so the labels are predictable.
+    fn now() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 10, 9)
+            .unwrap()
+            .and_hms_opt(0, 30, 0)
+            .unwrap()
+    }
+
+    /// One test task: (title, due in N days, due time as (hour, minute), priority).
+    type SampleTask = (&'static str, Option<i64>, Option<(u32, u32)>, Priority);
+
+    /// An app with timed and untimed tasks covering the longest due texts:
+    /// "today 12:00 PM · in 11h", "tomorrow 12:00 PM", "! overdue 23h", "in 3d · 12:00 PM",
+    /// plus untimed ones ("due in 3d", "! 2d overdue") and one without a date.
+    fn app_with_tasks(format: TimeFormat) -> App {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        db.set_setting(settings_keys::TIME_FORMAT, format.as_str())
+            .unwrap();
+        let today = now().date();
+        let tasks: [SampleTask; 7] = [
+            ("noon today", Some(0), Some((12, 0)), Priority::Medium),
+            ("noon tomorrow", Some(1), Some((12, 0)), Priority::Low),
+            ("late last night", Some(-1), Some((1, 30)), Priority::High),
+            ("later this week", Some(3), Some((12, 0)), Priority::Medium),
+            ("untimed", Some(3), None, Priority::High),
+            ("untimed overdue", Some(-2), None, Priority::Low),
+            ("no date", None, None, Priority::Low),
+        ];
+        for (title, days, time, priority) in tasks {
+            let mut item = Item::new(Kind::Task, title, chrono::Utc::now());
+            item.date = days.map(|d| today + TimeDelta::days(d));
+            item.due_time = time.map(|(h, m)| NaiveTime::from_hms_opt(h, m, 0).unwrap());
+            item.priority = priority;
+            db.insert_item(&item).unwrap();
+        }
+        let mut app = App::new(db, false, None).unwrap();
+        app.show_banner = false;
+        app.now = now();
+        app.today = now().date();
+        app.refresh().unwrap();
+        app
+    }
+
+    /// Renders the main screen and returns each task row as a list of cell symbols, so an
+    /// index into it is a screen column.
+    fn task_rows(app: &mut App, width: u16) -> Vec<Vec<String>> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area, app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // Row 0 is the screen border, row 1 the Tasks box title; tasks start on row 2.
+        (2..2 + app.tasks.len() as u16)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The screen column where `text` starts in `row`, if it's there in full.
+    fn column_of(row: &[String], text: &str) -> Option<usize> {
+        let line: String = row.concat();
+        let byte = line.find(text)?;
+        // All characters in these rows are 1 column wide, so a character count is a column.
+        Some(line[..byte].chars().count())
+    }
+
+    #[test]
+    fn due_and_priority_columns_line_up_at_every_width_and_format() {
+        for format in [TimeFormat::Hour12, TimeFormat::Hour24] {
+            let mut app = app_with_tasks(format);
+            for width in [60, 80, 120] {
+                let rows = task_rows(&mut app, width);
+                let mut due_starts = Vec::new();
+                let mut priority_starts = Vec::new();
+                for (task, row) in app.tasks.iter().zip(&rows) {
+                    let (label, _) =
+                        due_label(task, now(), false, IconMode::Unicode, format, app.theme);
+                    let priority = column_of(row, task.priority.label()).unwrap();
+                    priority_starts.push(priority);
+                    if label.is_empty() {
+                        continue; // no date, no due text
+                    }
+                    let due = column_of(row, &label).unwrap_or_else(|| {
+                        panic!(
+                            "{format:?} at {width}: {label:?} is cut off: {}",
+                            row.concat()
+                        )
+                    });
+                    // At least one blank column between the due text and the priority, on
+                    // top of the table's own one-column gap.
+                    assert!(
+                        due + label.chars().count() + 2 <= priority,
+                        "{format:?} at {width}: {label:?} runs into the priority: {}",
+                        row.concat()
+                    );
+                    due_starts.push(due);
+                }
+                let same = |starts: &[usize]| starts.windows(2).all(|w| w[0] == w[1]);
+                assert!(
+                    same(&due_starts),
+                    "{format:?} at {width}: due {due_starts:?}"
+                );
+                assert!(
+                    same(&priority_starts),
+                    "{format:?} at {width}: priority {priority_starts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_longest_forms_are_the_ones_tested() {
+        // Guards the test above: these exact texts must be among the labels it checks.
+        let app = app_with_tasks(TimeFormat::Hour12);
+        let labels: Vec<String> = app
+            .tasks
+            .iter()
+            .map(|t| {
+                due_label(
+                    t,
+                    now(),
+                    false,
+                    IconMode::Unicode,
+                    TimeFormat::Hour12,
+                    app.theme,
+                )
+                .0
+            })
+            .collect();
+        for expected in [
+            "today 12:00 PM · in 11h",
+            "tomorrow 12:00 PM",
+            "! overdue 23h",
+            "in 3d · 12:00 PM",
+            "due in 3d",
+            "! 2d overdue",
+        ] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "{expected:?} in {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untimed_lists_and_narrow_mode_keep_their_old_widths() {
+        // Wide mode: untimed texts are at most 12 wide, so the column stays 13 as before.
+        for longest in 0..=12 {
+            assert_eq!(due_column_width(longest, false), 13);
+        }
+        assert_eq!(due_column_width(23, false), 24, "longest + one blank");
+        // Narrow mode: exactly the old rule.
+        for longest in 0..30 {
+            assert_eq!(due_column_width(longest, true), longest.max(5));
+        }
+    }
+
+    #[test]
+    fn narrow_mode_rows_still_line_up() {
+        let mut app = app_with_tasks(TimeFormat::Hour12);
+        let rows = task_rows(&mut app, 50);
+        // Narrow mode has no priority text; the due column must still start in one place.
+        let starts: Vec<usize> = app
+            .tasks
+            .iter()
+            .zip(&rows)
+            .filter_map(|(task, row)| {
+                let (label, _) = due_label(
+                    task,
+                    now(),
+                    true,
+                    IconMode::Unicode,
+                    TimeFormat::Hour12,
+                    app.theme,
+                );
+                (!label.is_empty()).then(|| column_of(row, &label).unwrap())
+            })
+            .collect();
+        assert!(starts.windows(2).all(|w| w[0] == w[1]), "{starts:?}");
     }
 }
