@@ -263,7 +263,8 @@ pub fn tail_fit(text: &str, max: usize) -> String {
 /// Word-wraps `text` into lines no wider than `width` terminal columns, so hints and
 /// messages in popups never get cut off at the right edge.
 ///
-/// - Lines break at spaces. A `·` separator always stays at the end of the line before it
+/// - Lines break at spaces, and runs of spaces between words become single spaces (so only
+///   pass it text whose spacing doesn't matter, like hints and messages). A `·` separator always stays at the end of the line before it
 ///   (so a wrapped hint reads "Tab move · ←→ change ·" / "Enter save"), never starts a line.
 /// - Any spaces at the start of `text` are kept on the first line; later lines start with
 ///   `indent` spaces instead, so wrapped text lines up under the first line's text.

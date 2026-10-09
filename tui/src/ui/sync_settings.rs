@@ -14,12 +14,16 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 use zerohour_core::icons::{Icon, IconMode};
 use zerohour_core::sync::SyncSettings;
 use zerohour_core::theme::Theme;
 
-use super::{centered, color, popup_block, tail_fit};
+use super::{
+    centered, color, popup_block, popup_height, popup_text_width, tail_fit, wrap_text,
+    wrapped_lines,
+};
 use crate::sync::{SyncState, SyncUi};
 
 /// One row of the form, top to bottom.
@@ -227,14 +231,15 @@ impl SyncForm {
 }
 
 /// Draws the popup. `sync` supplies the live status (storage, test result, last sync).
+///
+/// Everything long (the storage path, status, warnings, messages) wraps to the popup's width,
+/// and the popup is as tall as its lines, so nothing is cut off on a narrow terminal.
 pub fn draw(frame: &mut Frame, form: &SyncForm, sync: &SyncUi, theme: &Theme, icons: IconMode) {
-    let area = centered(frame.area(), 74, 24);
-    let title = format!(" {} Sync settings ", Icon::Sync.get(icons));
-    let block = popup_block(&title, theme, color(theme.accent));
-    let inner = block.inner(area);
+    let width = 74.min(frame.area().width);
+    let text_width = popup_text_width(width);
 
     const LABEL_WIDTH: usize = 11;
-    let value_width = (inner.width as usize).saturating_sub(LABEL_WIDTH + 3);
+    let value_width = text_width.saturating_sub(LABEL_WIDTH + 3);
     let accent = Style::new()
         .fg(color(theme.accent))
         .add_modifier(Modifier::BOLD);
@@ -263,45 +268,71 @@ pub fn draw(frame: &mut Frame, form: &SyncForm, sync: &SyncUi, theme: &Theme, ic
         }
         let label_style = if focused { accent } else { muted };
         let value = input_value(form, sync, *row, focused, value_width);
+        // A value that's too wide (e.g. the on/off explanation on a narrow screen) wraps
+        // under the value column; typed text is already cut to fit by `input_value`.
+        let value_style = Style::new().fg(color(theme.fg));
+        // Only wrap when needed: wrapping joins words with single spaces, which mustn't
+        // change what you typed.
+        let parts = if value.width() > value_width {
+            wrap_text(&value, value_width, 0)
+        } else {
+            vec![value]
+        };
+        let mut parts = parts.into_iter();
         lines.push(Line::from(vec![
             marker,
             Span::styled(format!("{:<LABEL_WIDTH$} ", row.label()), label_style),
-            Span::styled(value, Style::new().fg(color(theme.fg))),
+            Span::styled(parts.next().unwrap_or_default(), value_style),
         ]));
+        for part in parts {
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(LABEL_WIDTH + 3)),
+                Span::styled(part, value_style),
+            ]));
+        }
     }
 
     lines.push(Line::default());
     // Where the password lives, and the sync status.
     let storage = sync.storage.as_deref().unwrap_or("checking…");
-    lines.push(Line::from(Span::styled(
-        format!("  Password storage: {storage}"),
+    // Continuation lines are indented 4 so they line up after "  ⚠ " / under the text.
+    lines.extend(wrapped_lines(
+        &format!("  Password storage: {storage}"),
+        text_width,
+        4,
         muted,
-    )));
-    lines.push(Line::from(Span::styled(
-        format!(
+    ));
+    lines.extend(wrapped_lines(
+        &format!(
             "  Status: {} · {} documents synced",
             state_text(&sync.state),
             sync.synced_docs
         ),
+        text_width,
+        4,
         muted,
-    )));
+    ));
     if form.settings().is_plain_http() {
-        lines.push(Line::from(Span::styled(
+        lines.extend(wrapped_lines(
             "  ⚠ http:// sends your password and data unencrypted, unless the network itself \
              is encrypted (Tailscale, VPN). Prefer https://.",
+            text_width,
+            4,
             warn,
-        )));
+        ));
     }
     if let Some(seconds) = sync.clock_skew_secs {
         let direction = if seconds > 0 { "ahead of" } else { "behind" };
-        lines.push(Line::from(Span::styled(
-            format!(
+        lines.extend(wrapped_lines(
+            &format!(
                 "  ⚠ This clock is {} min {direction} the server's. The newest edit wins a \
                  conflict, so fix the clock (enable NTP).",
                 (seconds.abs() + 59) / 60
             ),
+            text_width,
+            4,
             warn,
-        )));
+        ));
     }
 
     // The newest message wins: confirmation question, form message, or test result.
@@ -324,22 +355,24 @@ pub fn draw(frame: &mut Frame, form: &SyncForm, sync: &SyncUi, theme: &Theme, ic
     } else {
         (String::new(), theme.muted)
     };
-    lines.push(Line::from(Span::styled(
-        format!("  {text}"),
+    lines.extend(wrapped_lines(
+        &format!("  {text}"),
+        text_width,
+        2,
         Style::new().fg(color(slot)),
-    )));
-    lines.push(Line::from(Span::styled(
+    ));
+    lines.extend(wrapped_lines(
         "  ↑↓ move · Space on/off · Enter select · Esc close",
+        text_width,
+        2,
         muted,
-    )));
+    ));
 
+    let area = centered(frame.area(), width, popup_height(lines.len()));
+    let title = format!(" {} Sync settings ", Icon::Sync.get(icons));
+    let block = popup_block(&title, theme, color(theme.accent));
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// The text shown for one input row.
@@ -532,6 +565,57 @@ mod tests {
                 assert!(screen.contains("unencrypted"), "http:// warning shown");
                 assert!(screen.contains("Reset sync state"));
             }
+        }
+    }
+
+    #[test]
+    fn nothing_in_the_popup_is_cut_off_at_any_width() {
+        use crate::ui::test_support::{WIDTHS, assert_shows, screen_text};
+        use zerohour_core::db::Db;
+        use zerohour_core::theme::THEMES;
+
+        let db = Db::open_in_memory().unwrap();
+        let mut sync = SyncUi::new(&db, Some("unused.db".into())).unwrap();
+        // Long values on purpose: a deep password-file path, an error status, clock skew.
+        sync.storage =
+            Some("file /home/someone/.config/zerohour/sync-password (only you can read it)".into());
+        sync.state = SyncState::Error(
+            "database not found; create it on the server first (zerohour never creates \
+             databases)"
+                .into(),
+        );
+        sync.clock_skew_secs = Some(300);
+        let mut form = filled();
+        form.url = "http://couchdb.example.ts.net:5984".into();
+        form.confirm_reset = true;
+
+        let expected = [
+            "Sync",
+            "[x] on (off = this device stays local-only)",
+            "Server URL",
+            "Database",
+            "Username",
+            "Password",
+            "[ Save ]",
+            "[ Test connection ]",
+            "[ Reset sync state… ]",
+            "Password storage: file /home/someone/.config/zerohour/sync-password (only you \
+             can read it)",
+            "Status: error: database not found; create it on the server first (zerohour \
+             never creates databases) · 0 documents synced",
+            "⚠ http:// sends your password and data unencrypted, unless the network itself \
+             is encrypted (Tailscale, VPN). Prefer https://.",
+            "⚠ This clock is 5 min ahead of the server's. The newest edit wins a conflict, \
+             so fix the clock (enable NTP).",
+            "Forget which versions the server has? Your tasks stay; the next sync re-checks \
+             everything. y = reset, n = cancel",
+            "↑↓ move · Space on/off · Enter select · Esc close",
+        ];
+        for width in WIDTHS {
+            let screen = screen_text(width, 50, |frame| {
+                draw(frame, &form, &sync, &THEMES[0], IconMode::Unicode);
+            });
+            assert_shows(&screen, width, &expected);
         }
     }
 
