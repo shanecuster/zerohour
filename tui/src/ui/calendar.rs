@@ -15,6 +15,10 @@
 //! its drawing ([`draw`]). The date math (which date is in which cell, moving by months) is in
 //! `zerohour_core::calendar`, so the Android app can reuse it. Typing a date into the field
 //! still works; the picker is just another way to fill it.
+//!
+//! **Mouse:** while the picker is open, a left click on a day picks it and the scroll wheel
+//! changes the month. [`draw`] returns where the grid landed on screen ([`GridArea`]) so a
+//! click position can be turned back into a date ([`GridArea::date_at`]).
 
 use chrono::{Datelike, NaiveDate};
 use ratatui::Frame;
@@ -92,14 +96,42 @@ impl Calendar {
     }
 }
 
-/// Draws the picker centered on the screen.
-pub fn draw(frame: &mut Frame, calendar: &Calendar, theme: &Theme, today: NaiveDate) {
+/// Width of one day cell on screen: two digits plus a space.
+const CELL_WIDTH: u16 = 3;
+
+/// Where the day grid was drawn: the screen cell of its top-left day (row 0, column 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridArea {
+    /// Screen column of the first day cell.
+    pub x: u16,
+    /// Screen row of the first week.
+    pub y: u16,
+}
+
+impl GridArea {
+    /// The date under screen position (`column`, `row`), or `None` if that's not on a day
+    /// (outside the grid, or on the header and hint lines).
+    pub fn date_at(self, calendar: &Calendar, column: u16, row: u16) -> Option<NaiveDate> {
+        // `checked_sub` returns None instead of wrapping around when the click is left of or
+        // above the grid.
+        let col = usize::from(column.checked_sub(self.x)? / CELL_WIDTH);
+        let week = usize::from(row.checked_sub(self.y)?);
+        if col >= 7 || week >= 6 {
+            return None;
+        }
+        Some(month_grid(calendar.cursor, calendar.week_start)[week][col])
+    }
+}
+
+/// Draws the picker centered on the screen and returns where its day grid is.
+pub fn draw(frame: &mut Frame, calendar: &Calendar, theme: &Theme, today: NaiveDate) -> GridArea {
     let area = centered(frame.area(), WIDTH, HEIGHT);
     let block = popup_block(
         &format!(" {} ", month_title(calendar.cursor)),
         theme,
         color(theme.accent),
     );
+    let inner = block.inner(area);
     let muted = Style::new().fg(color(theme.muted));
 
     let mut lines: Vec<Line> = Vec::new();
@@ -138,6 +170,11 @@ pub fn draw(frame: &mut Frame, calendar: &Calendar, theme: &Theme, today: NaiveD
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    GridArea {
+        x: inner.x,
+        // The first week is drawn under the weekday header line.
+        y: inner.y + 1,
+    }
 }
 
 /// How one day cell looks. Several things can apply at once; they're layered in order.
@@ -231,6 +268,45 @@ mod tests {
             CalendarOutcome::WeekStartChanged(WeekStart::Monday)
         );
         assert_eq!(cal.week_start, WeekStart::Monday);
+    }
+
+    #[test]
+    fn clicks_map_to_the_dates_drawn_there() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use zerohour_core::theme::THEMES;
+
+        let cal = Calendar::new(Some(d(2026, 10, 9)), d(2026, 10, 9), WeekStart::Sunday);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut grid = None;
+        terminal
+            .draw(|frame| grid = Some(draw(frame, &cal, &THEMES[0], d(2026, 10, 9))))
+            .unwrap();
+        let grid = grid.unwrap();
+
+        // Read back the digits actually drawn at a cell and compare with the mapped date.
+        let buffer = terminal.backend().buffer();
+        for (week, col) in [(0, 0), (1, 5), (5, 6)] {
+            let x = grid.x + col * CELL_WIDTH;
+            let y = grid.y + week;
+            let drawn: String = (x..x + 2).map(|cx| buffer[(cx, y)].symbol()).collect();
+            let date = grid.date_at(&cal, x + 1, y).unwrap();
+            assert_eq!(drawn.trim(), date.day().to_string(), "cell {week},{col}");
+        }
+        // Oct 9, 2026 (a Friday) is in week 1, column 5 with Sunday first.
+        assert_eq!(
+            grid.date_at(&cal, grid.x + 15, grid.y + 1),
+            Some(d(2026, 10, 9))
+        );
+        // Outside the grid: nothing.
+        assert_eq!(grid.date_at(&cal, grid.x.saturating_sub(1), grid.y), None);
+        assert_eq!(
+            grid.date_at(&cal, grid.x, grid.y.saturating_sub(1)),
+            None,
+            "header"
+        );
+        assert_eq!(grid.date_at(&cal, grid.x + 7 * CELL_WIDTH, grid.y), None);
+        assert_eq!(grid.date_at(&cal, grid.x, grid.y + 6), None, "hint line");
     }
 
     #[test]

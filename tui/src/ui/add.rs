@@ -33,8 +33,9 @@ use zerohour_core::model::{DaySet, Item, Kind, Priority, RepeatRule, Unit};
 use zerohour_core::repeat::{days_until, parse_date_input, scheduled_on_or_after};
 use zerohour_core::theme::Theme;
 
-use super::calendar::{self, Calendar, CalendarOutcome};
+use super::calendar::{self, Calendar, CalendarOutcome, GridArea};
 use super::{centered, color, popup_block, tail_fit};
+use zerohour_core::calendar::add_months;
 
 /// The repeat options shown in the form, in cycling order. "custom" reveals the "every N" and
 /// unit fields; "weekdays", "Mon–Thu" and "pick days" reveal the day checkboxes. ("Every day"
@@ -286,6 +287,25 @@ impl Form {
             }
         };
         form
+    }
+
+    /// A left click while the date picker is open: if it hit a day (per `grid`, where the
+    /// picker was last drawn), put that date in the field and close the picker.
+    pub fn click_calendar(&mut self, grid: GridArea, column: u16, row: u16) {
+        let Some(calendar) = &self.calendar else {
+            return;
+        };
+        if let Some(date) = grid.date_at(calendar, column, row) {
+            self.date_text = date.format("%Y-%m-%d").to_string();
+            self.calendar = None;
+        }
+    }
+
+    /// The scroll wheel over the open date picker: one month back (`-1`) or forward (`1`).
+    pub fn scroll_calendar(&mut self, months: i32) {
+        if let Some(calendar) = &mut self.calendar {
+            calendar.cursor = add_months(calendar.cursor, months);
+        }
     }
 
     /// The inputs shown for the current kind, top to bottom.
@@ -585,16 +605,23 @@ impl Form {
     }
 }
 
-/// Draws the dialog as a centered popup over whatever is behind it.
-pub fn draw(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMode, today: NaiveDate) {
+/// Draws the dialog as a centered popup over whatever is behind it. Returns where the date
+/// picker's day grid is, if the picker is open (for mouse clicks).
+pub fn draw(
+    frame: &mut Frame,
+    form: &Form,
+    theme: &Theme,
+    icons: IconMode,
+    today: NaiveDate,
+) -> Option<GridArea> {
     match form.step {
         Step::ChooseKind => draw_choose_kind(frame, form, theme, icons),
         Step::Fields => draw_fields(frame, form, theme, today),
     }
     // The date picker goes on top of the form.
-    if let Some(calendar) = &form.calendar {
-        calendar::draw(frame, calendar, theme, today);
-    }
+    form.calendar
+        .as_ref()
+        .map(|calendar| calendar::draw(frame, calendar, theme, today))
 }
 
 /// Step 1: "Task or Event?"

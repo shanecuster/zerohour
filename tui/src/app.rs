@@ -13,7 +13,9 @@
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate, NaiveDateTime, Timelike, Utc};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::clock::TimeFormat;
@@ -28,6 +30,7 @@ use crate::input::{Action, main_action};
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
 use crate::ui::add::{Form, FormData, FormOutcome, FormPrefs};
+use crate::ui::calendar::GridArea;
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
 
@@ -155,6 +158,9 @@ pub struct App {
     pub layout: LayoutMode,
     /// First day of the week in the date picker (switched with `w` in the picker).
     pub week_start: WeekStart,
+    /// Where the date picker's day grid was last drawn, while it's open (for mouse clicks).
+    /// Written by the drawing code, read by [`App::handle_mouse`].
+    pub calendar_grid: Option<GridArea>,
     /// Set to true to leave the main loop.
     pub should_quit: bool,
     /// Running with `--demo` (in-memory data, nothing is saved).
@@ -216,6 +222,7 @@ impl App {
             show_passed: false,
             layout,
             week_start,
+            calendar_grid: None,
             should_quit: false,
             demo,
             #[cfg(feature = "sync")]
@@ -341,6 +348,33 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if let Err(e) = self.try_handle_key(key) {
             self.set_error(e);
+        }
+    }
+
+    /// True while the date picker is open: the only time the app wants mouse events.
+    ///
+    /// Capturing the mouse stops the terminal's own text selection, so `main.rs` switches
+    /// capture on only while this is true.
+    pub fn wants_mouse(&self) -> bool {
+        matches!(&self.overlay, Overlay::Form(form) if form.calendar.is_some())
+    }
+
+    /// A mouse event: in the open date picker, a left click picks a day and the scroll wheel
+    /// changes the month. Everything else is ignored.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let grid = self.calendar_grid;
+        let Overlay::Form(form) = &mut self.overlay else {
+            return;
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(grid) = grid {
+                    form.click_calendar(grid, mouse.column, mouse.row);
+                }
+            }
+            MouseEventKind::ScrollUp => form.scroll_calendar(-1),
+            MouseEventKind::ScrollDown => form.scroll_calendar(1),
+            _ => {}
         }
     }
 
