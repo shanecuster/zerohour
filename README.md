@@ -5,9 +5,9 @@ A terminal to-do list with built-in countdowns, written in Rust with [Ratatui](h
 Track **tasks** (things to do) and **events** (dates to count down to) in one clean, themeable TUI.
 Add Christmas once and it counts down every year: after the date passes, it rolls over to the next one automatically.
 
-![The zerohour main screen with demo data: a gradient "ZEROHOUR" title banner with the tagline "5 days to Product launch", a Tasks section with eight tasks, and an Events section with five countdowns](docs/screenshots/full-app-display.png)
+![The zerohour main screen with demo data: a gradient "ZEROHOUR" title banner with a tagline counting down to the next event, a Tasks section, and an Events section with countdowns](docs/screenshots/full-app-display.png)
 
-*The main screen (demo data): the title banner with a countdown to the next event ("5 days to Product launch"), tasks on top with an overdue one in red and one due today at 4:00 PM, and upcoming events with their countdowns below.*
+*The main screen (demo data): the title banner with a tagline counting down to the next event, tasks on top (an overdue one in red, and one due later today with a set time and the hours remaining), and upcoming events with their countdowns below.*
 
 > **Status:** early development.
 
@@ -29,13 +29,13 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 
 ## Screenshots
 
-![The Tasks section: eight tasks with priority markers, due dates, an overdue task in red, a task due today at 4:00 PM, repeating tasks marked with a circular arrow, and a task with no date](docs/screenshots/tasks.png)
+![The Tasks section: tasks with priority markers and due dates, an overdue task in red, a task due later today with a set time and the hours remaining, repeating tasks marked with a circular arrow, and a task with no date](docs/screenshots/tasks.png)
 
-*Tasks, sorted by priority (↑ high, ● medium, ↓ low) and then due date. "Pay electricity bill" is a day overdue (⚠, in red); "Send project update" is due today at 4:00 PM, in 1 hour; "Submit weekly report" repeats (↻) and is due Monday at 2:00 PM. A task without a due date simply has no date.*
+*Tasks, sorted by priority (↑ high, ● medium, ↓ low) and then due date. An overdue task is marked ⚠ and shown in red; a task due later today shows its time and the hours remaining; a task due later in the week shows its time and the days remaining; repeating tasks are marked ↻. A task without a due date simply has no date.*
 
-![The Events section: five events with their dates and day countdowns, two marked as repeating monthly and yearly](docs/screenshots/events.png)
+![The Events section: events with their dates and day countdowns, some marked as repeating monthly or yearly](docs/screenshots/events.png)
 
-*Events count down to their date: "Product launch" in 5 days, "Christmas" in 77. Repeating events show how they repeat (↻ monthly, ↻ yearly) and roll over to the next date on their own.*
+*Events count down to their date in days, soonest first. Repeating events show how they repeat (↻ monthly, ↻ yearly) and roll over to the next date on their own.*
 
 ![The Add dialog with two choices, Task ("Something to do, optionally with a due date.") and Event ("A date to count down to, like a birthday or holiday.")](docs/screenshots/add-task-or-event.png)
 
