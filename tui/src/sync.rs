@@ -54,6 +54,8 @@ pub enum Job {
         password: Option<String>,
         then_sync: bool,
     },
+    /// Run a full sync (the `r` key, and once at startup).
+    Sync,
 }
 
 /// What the background worker reports back.
@@ -135,10 +137,11 @@ impl SyncUi {
         }
         if matches!(
             job,
-            Job::Save {
-                then_sync: true,
-                ..
-            }
+            Job::Sync
+                | Job::Save {
+                    then_sync: true,
+                    ..
+                }
         ) {
             self.state = SyncState::Syncing;
         }
@@ -259,6 +262,7 @@ fn run_job(
                 run_sync(store.as_ref(), settings, db_path, sender);
             }
         }
+        Job::Sync => run_sync(store.as_ref(), settings, db_path, sender),
         Job::Test { password } => {
             let result = match password.filter(|p| !p.is_empty()) {
                 Some(password) => Ok(password),

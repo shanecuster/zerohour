@@ -172,6 +172,13 @@ impl App {
             app.set_status("Demo mode: sample data, nothing is saved. Press ? for help.");
         }
         app.refresh()?;
+        // With sync on, sync once at startup, in the background. The app is usable right
+        // away; the lists update when the sync finishes. Offline? Just a header indicator.
+        #[cfg(feature = "sync")]
+        if app.sync.visible() {
+            let settings = app.sync.settings.clone();
+            app.sync.start(Job::Sync, settings);
+        }
         Ok(app)
     }
 
@@ -385,6 +392,11 @@ impl App {
                 self.open_sync_settings();
                 return Ok(());
             }
+            #[cfg(feature = "sync")]
+            Action::SyncNow => {
+                self.sync_now();
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -433,7 +445,7 @@ impl App {
             | Action::CycleIcons
             | Action::Help => {}
             #[cfg(feature = "sync")]
-            Action::SyncSettings => {}
+            Action::SyncSettings | Action::SyncNow => {}
         }
         Ok(())
     }
@@ -538,6 +550,23 @@ impl App {
         self.sync.test_result = None;
         let settings = self.sync.settings.clone();
         self.sync.start(Job::Probe, settings);
+    }
+
+    /// The `r` key: start a sync now (in the background), or say why not.
+    #[cfg(feature = "sync")]
+    fn sync_now(&mut self) {
+        if self.sync.db_path.is_none() {
+            self.set_status("Sync is off in demo mode, so sample data never reaches your server.");
+        } else if !self.sync.settings.enabled {
+            self.set_status("Sync is switched off. Press c to set it up.");
+        } else if self.sync.busy() {
+            self.set_status("Already syncing…");
+        } else {
+            let settings = self.sync.settings.clone();
+            self.sync.start(Job::Sync, settings);
+            self.announce_sync = true;
+            self.set_status("Syncing…");
+        }
     }
 
     /// Acts on what the user did in the sync settings popup.

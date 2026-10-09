@@ -29,7 +29,10 @@ const KEYS: &[(&str, &str)] = &[
 
 /// Keys that only exist in builds with the `sync` feature.
 #[cfg(feature = "sync")]
-const SYNC_KEYS: &[(&str, &str)] = &[("c", "sync settings (server, login, on/off)")];
+const SYNC_KEYS: &[(&str, &str)] = &[
+    ("r", "sync now"),
+    ("c", "sync settings (server, login, on/off)"),
+];
 /// Local-only builds have no sync keys.
 #[cfg(not(feature = "sync"))]
 const SYNC_KEYS: &[(&str, &str)] = &[];
@@ -37,7 +40,7 @@ const SYNC_KEYS: &[(&str, &str)] = &[];
 /// Draws the help popup.
 pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
     // Sync builds list extra keys, so the popup is a bit taller there.
-    let height = if cfg!(feature = "sync") { 28 } else { 27 };
+    let height = if cfg!(feature = "sync") { 29 } else { 27 };
     let area = centered(frame.area(), 72, height);
     let block = popup_block(" Help ", theme, color(theme.accent));
     let key_style = Style::new()

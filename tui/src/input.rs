@@ -40,6 +40,9 @@ pub enum Action {
     /// Open the sync settings (only in builds with the `sync` feature).
     #[cfg(feature = "sync")]
     SyncSettings,
+    /// Sync with the server now (only in builds with the `sync` feature).
+    #[cfg(feature = "sync")]
+    SyncNow,
     /// Leave the app.
     Quit,
 }
@@ -71,6 +74,8 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         // as before sync existed.
         #[cfg(feature = "sync")]
         KeyCode::Char('c') => Action::SyncSettings,
+        #[cfg(feature = "sync")]
+        KeyCode::Char('r') => Action::SyncNow,
         // Esc deliberately does NOT quit: it's the "close this popup" key, and pressing it
         // one time too many shouldn't exit the app.
         KeyCode::Char('q') => Action::Quit,
@@ -100,5 +105,25 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(main_action(ctrl_c), Some(Action::Quit));
         assert_eq!(main_action(press(KeyCode::Char('z'))), None);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_keys_exist_in_sync_builds() {
+        assert_eq!(
+            main_action(press(KeyCode::Char('r'))),
+            Some(Action::SyncNow)
+        );
+        assert_eq!(
+            main_action(press(KeyCode::Char('c'))),
+            Some(Action::SyncSettings)
+        );
+    }
+
+    #[cfg(not(feature = "sync"))]
+    #[test]
+    fn local_only_builds_have_no_sync_keys() {
+        assert_eq!(main_action(press(KeyCode::Char('r'))), None);
+        assert_eq!(main_action(press(KeyCode::Char('c'))), None);
     }
 }
