@@ -8,7 +8,7 @@
 //! newest edit can win a conflict), and a `deleted` flag instead of really deleting rows (so a
 //! deletion can be sent to other devices).
 
-use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -133,6 +133,116 @@ impl Unit {
     }
 }
 
+/// A set of weekdays, e.g. Mon–Thu, for the "repeat on these days" rule.
+///
+/// Stored as 7 bits in one byte: bit 0 = Monday ... bit 6 = Sunday. That makes it `Copy`
+/// (cheap to pass around by value) like the rest of `RepeatRule`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DaySet(u8);
+
+/// Monday-first order, used for storage, labels and the bit numbering.
+const WEEK: [Weekday; 7] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+    Weekday::Sat,
+    Weekday::Sun,
+];
+
+/// Short lowercase names used in the stored text ("days:mon,tue").
+const DB_NAMES: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+/// Names used in labels ("Mon–Thu", "Mon, Wed, Fri").
+const LABEL_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+impl DaySet {
+    /// No days (not a valid rule on its own; the form refuses it).
+    pub const EMPTY: DaySet = DaySet(0);
+    /// Monday to Friday.
+    pub const WEEKDAYS: DaySet = DaySet(0b001_1111);
+    /// Monday to Thursday.
+    pub const MON_THU: DaySet = DaySet(0b000_1111);
+    /// Saturday and Sunday.
+    pub const WEEKENDS: DaySet = DaySet(0b110_0000);
+    /// All seven days.
+    pub const ALL: DaySet = DaySet(0b111_1111);
+
+    /// The bit for a weekday (Monday = bit 0).
+    fn bit(day: Weekday) -> u8 {
+        1 << day.num_days_from_monday()
+    }
+
+    /// True if `day` is in the set.
+    pub fn contains(self, day: Weekday) -> bool {
+        self.0 & DaySet::bit(day) != 0
+    }
+
+    /// The set with `day` switched on or off.
+    pub fn toggled(self, day: Weekday) -> DaySet {
+        // `^` (XOR) flips just that one bit.
+        DaySet(self.0 ^ DaySet::bit(day))
+    }
+
+    /// True if no day is selected.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The first date on or after `from` that falls on one of the days, or `None` if the set
+    /// is empty. Never needs to look more than 7 days ahead.
+    pub fn first_on_or_after(self, from: NaiveDate) -> Option<NaiveDate> {
+        (0..7)
+            .map(|offset| from + TimeDelta::days(offset))
+            .find(|date| self.contains(date.weekday()))
+    }
+
+    /// Encodes as `"days:mon,tue,wed,thu"` (always Monday-first) for the database and sync.
+    pub fn to_db_string(self) -> String {
+        let names: Vec<&str> = WEEK
+            .iter()
+            .zip(DB_NAMES)
+            .filter(|(day, _)| self.contains(**day))
+            .map(|(_, name)| name)
+            .collect();
+        format!("days:{}", names.join(","))
+    }
+
+    /// Decodes the part after `"days:"`. `None` for unknown names or an empty list.
+    fn parse_list(list: &str) -> Option<DaySet> {
+        let mut set = DaySet::EMPTY;
+        for name in list.split(',') {
+            let index = DB_NAMES.iter().position(|n| *n == name)?;
+            set = DaySet(set.0 | DaySet::bit(WEEK[index]));
+        }
+        (!set.is_empty()).then_some(set)
+    }
+
+    /// A short label: "every day", "weekdays", "weekends", a range like "Mon–Thu" (3 or more
+    /// days in a row, Monday-first), or a list like "Mon, Wed, Fri".
+    pub fn label(self) -> String {
+        match self {
+            DaySet::ALL => return "every day".to_string(),
+            DaySet::WEEKDAYS => return "weekdays".to_string(),
+            DaySet::WEEKENDS => return "weekends".to_string(),
+            _ => {}
+        }
+        let indexes: Vec<usize> = (0..7).filter(|&i| self.contains(WEEK[i])).collect();
+        // A run with no gaps: last index - first index + 1 == number of days.
+        if let (Some(&first), Some(&last)) = (indexes.first(), indexes.last())
+            && indexes.len() >= 3
+            && last - first + 1 == indexes.len()
+        {
+            return format!("{}–{}", LABEL_NAMES[first], LABEL_NAMES[last]);
+        }
+        indexes
+            .iter()
+            .map(|&i| LABEL_NAMES[i])
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 /// How (and whether) an item repeats.
 ///
 /// Variants can carry data: `EveryN { n, unit }` holds a number and a unit, e.g.
@@ -144,7 +254,12 @@ pub enum RepeatRule {
     Weekly,
     Monthly,
     Yearly,
-    EveryN { n: u32, unit: Unit },
+    EveryN {
+        n: u32,
+        unit: Unit,
+    },
+    /// On chosen days of the week, e.g. Mon–Thu. Never empty.
+    Weekdays(DaySet),
 }
 
 impl RepeatRule {
@@ -165,6 +280,7 @@ impl RepeatRule {
             RepeatRule::Yearly => "yearly".to_string(),
             // `format!` builds a String, like printf. `{n}` inserts the variable `n`.
             RepeatRule::EveryN { n, unit } => format!("every:{n}:{}", unit.as_str()),
+            RepeatRule::Weekdays(days) => days.to_db_string(),
         }
     }
 
@@ -176,6 +292,11 @@ impl RepeatRule {
             "weekly" => Some(RepeatRule::Weekly),
             "monthly" => Some(RepeatRule::Monthly),
             "yearly" => Some(RepeatRule::Yearly),
+            // `strip_prefix` returns the rest of the text if it starts with "days:".
+            other if other.starts_with("days:") => other
+                .strip_prefix("days:")
+                .and_then(DaySet::parse_list)
+                .map(RepeatRule::Weekdays),
             other => {
                 // Expect exactly three pieces: "every", a number, a unit.
                 let mut parts = other.split(':');
@@ -208,6 +329,7 @@ impl RepeatRule {
                 Unit::Months => "monthly".to_string(),
             },
             RepeatRule::EveryN { n, unit } => format!("every {n} {}", unit.as_str()),
+            RepeatRule::Weekdays(days) => days.label(),
         }
     }
 }
@@ -383,6 +505,59 @@ mod tests {
         for rule in rules {
             assert_eq!(RepeatRule::parse(&rule.to_db_string()), Some(rule));
         }
+    }
+
+    #[test]
+    fn weekday_rules_round_trip_through_db_strings() {
+        let set = DaySet::MON_THU;
+        assert_eq!(
+            RepeatRule::Weekdays(set).to_db_string(),
+            "days:mon,tue,wed,thu"
+        );
+        for set in [
+            DaySet::WEEKDAYS,
+            DaySet::WEEKENDS,
+            DaySet::ALL,
+            DaySet(0b101_0101),
+        ] {
+            let rule = RepeatRule::Weekdays(set);
+            assert_eq!(RepeatRule::parse(&rule.to_db_string()), Some(rule));
+        }
+        assert_eq!(RepeatRule::parse("days:"), None, "empty set");
+        assert_eq!(RepeatRule::parse("days:mon,funday"), None);
+    }
+
+    #[test]
+    fn day_set_labels() {
+        assert_eq!(DaySet::WEEKDAYS.label(), "weekdays");
+        assert_eq!(DaySet::MON_THU.label(), "Mon–Thu");
+        assert_eq!(DaySet::WEEKENDS.label(), "weekends");
+        assert_eq!(DaySet::ALL.label(), "every day");
+        let mwf = DaySet::EMPTY
+            .toggled(Weekday::Mon)
+            .toggled(Weekday::Wed)
+            .toggled(Weekday::Fri);
+        assert_eq!(mwf.label(), "Mon, Wed, Fri");
+        assert_eq!(DaySet::EMPTY.toggled(Weekday::Tue).label(), "Tue");
+        assert_eq!(
+            DaySet::EMPTY
+                .toggled(Weekday::Sat)
+                .toggled(Weekday::Mon)
+                .label(),
+            "Mon, Sat"
+        );
+    }
+
+    #[test]
+    fn day_set_finds_the_next_scheduled_day() {
+        let thu = NaiveDate::from_ymd_opt(2026, 10, 8).unwrap();
+        let mon = NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+        assert_eq!(DaySet::MON_THU.first_on_or_after(thu), Some(thu));
+        assert_eq!(
+            DaySet::MON_THU.first_on_or_after(thu + TimeDelta::days(1)),
+            Some(mon)
+        );
+        assert_eq!(DaySet::EMPTY.first_on_or_after(thu), None);
     }
 
     #[test]

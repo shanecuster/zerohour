@@ -4,6 +4,10 @@
 //! 1. **Choose Task or Event** (`Tab` flips, default Task), each with a one-line explanation.
 //! 2. **Fill in the fields** for that kind:
 //!    - Task:  title, priority, due date, due time, repeat, notes
+//!
+//! Repeat choices include weekday presets ("weekdays", "Mon–Thu") and "pick days"; those
+//! show a row of day checkboxes. A start date that isn't one of the chosen days moves forward
+//! to the next one on save (the date preview says so), and an empty date is filled in.
 //!    - Event: title, date, repeat, keep-after-pass, notes
 //!
 //! Editing skips step 1 (an item's kind can't change) and starts with the fields pre-filled.
@@ -16,7 +20,7 @@
 //! validated [`FormData`], or `Cancel`.
 
 use chrono::NaiveDate;
-use chrono::NaiveTime;
+use chrono::{NaiveTime, Weekday};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
@@ -25,18 +29,60 @@ use ratatui::widgets::{Clear, Paragraph};
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::clock::{TimeFormat, format_time, parse_time_input};
 use zerohour_core::icons::{Icon, IconMode};
-use zerohour_core::model::{Item, Kind, Priority, RepeatRule, Unit};
-use zerohour_core::repeat::{days_until, parse_date_input};
+use zerohour_core::model::{DaySet, Item, Kind, Priority, RepeatRule, Unit};
+use zerohour_core::repeat::{days_until, parse_date_input, scheduled_on_or_after};
 use zerohour_core::theme::Theme;
 
 use super::calendar::{self, Calendar, CalendarOutcome};
 use super::{centered, color, popup_block, tail_fit};
 
-/// The repeat options shown in the form, in cycling order. The last one ("custom") reveals the
-/// "every N" and unit fields.
-const REPEAT_CHOICES: [&str; 6] = ["none", "daily", "weekly", "monthly", "yearly", "custom"];
-/// Index of "custom" in [`REPEAT_CHOICES`].
-const CUSTOM: usize = 5;
+/// The repeat options shown in the form, in cycling order. "custom" reveals the "every N" and
+/// unit fields; "weekdays", "Mon–Thu" and "pick days" reveal the day checkboxes. ("Every day"
+/// is just "daily".)
+const REPEAT_CHOICES: [&str; 9] = [
+    "none",
+    "daily",
+    "weekdays",
+    "Mon–Thu",
+    "weekly",
+    "monthly",
+    "yearly",
+    "custom",
+    "pick days",
+];
+// Indexes into REPEAT_CHOICES, so the code below can say what it means.
+/// "none".
+const NONE: usize = 0;
+/// "daily".
+const DAILY: usize = 1;
+/// "weekdays" (Mon–Fri preset).
+const WEEKDAYS: usize = 2;
+/// "Mon–Thu" preset.
+const MON_THU: usize = 3;
+/// "weekly".
+const WEEKLY: usize = 4;
+/// "monthly".
+const MONTHLY: usize = 5;
+/// "yearly".
+const YEARLY: usize = 6;
+/// "custom" (every N days/weeks/months).
+const CUSTOM: usize = 7;
+/// "pick days" (any set of weekdays).
+const PICK_DAYS: usize = 8;
+
+/// True for the choices that repeat on a set of weekdays (and show the day checkboxes).
+fn is_day_choice(choice: usize) -> bool {
+    matches!(choice, WEEKDAYS | MON_THU | PICK_DAYS)
+}
+
+/// The repeat choice that names a day set: a preset if it matches one, else "pick days".
+fn choice_for_days(days: DaySet) -> usize {
+    match days {
+        DaySet::WEEKDAYS => WEEKDAYS,
+        DaySet::MON_THU => MON_THU,
+        _ => PICK_DAYS,
+    }
+}
 
 /// Which step of the dialog we're on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +100,8 @@ pub enum Field {
     /// Tasks only: optional due time (needs a date).
     Time,
     Repeat,
+    /// The day checkboxes, for weekday-set repeats.
+    Days,
     EveryN,
     EveryUnit,
     KeepAfterPass,
@@ -70,6 +118,7 @@ impl Field {
             Field::Date => "Date",
             Field::Time => "Due time",
             Field::Repeat => "Repeat",
+            Field::Days => "Days",
             Field::EveryN => "Every",
             Field::EveryUnit => "Unit",
             Field::KeepAfterPass => "Keep after",
@@ -147,6 +196,10 @@ pub struct Form {
     pub repeat_choice: usize,
     pub every_n: String,
     pub unit: Unit,
+    /// The chosen weekdays, for weekday-set repeats.
+    pub days: DaySet,
+    /// Which day checkbox ←/→ is on (0..7, in the order shown).
+    pub day_cursor: usize,
     pub keep_after_pass: bool,
     pub notes: String,
     /// Index into `self.fields()` of the focused input.
@@ -184,6 +237,8 @@ impl Form {
             repeat_choice: 0,
             every_n: "2".to_string(),
             unit: Unit::Weeks,
+            days: DaySet::WEEKDAYS,
+            day_cursor: 0,
             keep_after_pass: false,
             notes: String::new(),
             focus: 0,
@@ -215,15 +270,19 @@ impl Form {
         form.notes = item.notes.clone().unwrap_or_default();
         // Map the stored rule back onto the choice list (+ the custom fields).
         form.repeat_choice = match item.repeat {
-            RepeatRule::None => 0,
-            RepeatRule::Daily => 1,
-            RepeatRule::Weekly => 2,
-            RepeatRule::Monthly => 3,
-            RepeatRule::Yearly => 4,
+            RepeatRule::None => NONE,
+            RepeatRule::Daily => DAILY,
+            RepeatRule::Weekly => WEEKLY,
+            RepeatRule::Monthly => MONTHLY,
+            RepeatRule::Yearly => YEARLY,
             RepeatRule::EveryN { n, unit } => {
                 form.every_n = n.to_string();
                 form.unit = unit;
                 CUSTOM
+            }
+            RepeatRule::Weekdays(days) => {
+                form.days = days;
+                choice_for_days(days)
             }
         };
         form
@@ -240,12 +299,15 @@ impl Form {
             fields.push(Field::Time);
         }
         fields.push(Field::Repeat);
+        if is_day_choice(self.repeat_choice) {
+            fields.push(Field::Days);
+        }
         if self.repeat_choice == CUSTOM {
             fields.push(Field::EveryN);
             fields.push(Field::EveryUnit);
         }
         // "Keep after pass" only matters for one-off events (repeating ones roll forward).
-        if self.kind == Kind::Event && self.repeat_choice == 0 {
+        if self.kind == Kind::Event && self.repeat_choice == NONE {
             fields.push(Field::KeepAfterPass);
         }
         fields.push(Field::Notes);
@@ -342,6 +404,7 @@ impl Form {
             KeyCode::Char(' ') if field == Field::KeepAfterPass => {
                 self.keep_after_pass = !self.keep_after_pass;
             }
+            KeyCode::Char(' ') if field == Field::Days => self.toggle_day(),
             // Ctrl+D or F2 on the date field opens the month-grid picker, starting on the date
             // typed so far (or today if it's empty or not a date yet).
             KeyCode::Char('d') | KeyCode::F(2)
@@ -410,7 +473,15 @@ impl Form {
             }
             Field::Repeat => {
                 self.repeat_choice = step(self.repeat_choice, REPEAT_CHOICES.len(), right);
+                // The presets fill in their days; "pick days" keeps whatever was there.
+                match self.repeat_choice {
+                    WEEKDAYS => self.days = DaySet::WEEKDAYS,
+                    MON_THU => self.days = DaySet::MON_THU,
+                    _ => {}
+                }
             }
+            // On the day checkboxes, ←/→ move between days (Space toggles one).
+            Field::Days => self.day_cursor = step(self.day_cursor, 7, right),
             Field::EveryUnit => {
                 let i = Unit::ALL.iter().position(|&u| u == self.unit).unwrap_or(0);
                 self.unit = Unit::ALL[step(i, Unit::ALL.len(), right)];
@@ -420,14 +491,43 @@ impl Form {
         }
     }
 
-    /// The repeat rule currently chosen, or an error message for a bad "every N".
+    /// The days in the order the checkboxes are shown (following the calendar's week start).
+    fn day_order(&self) -> [Weekday; 7] {
+        use Weekday::*;
+        match self.prefs.week_start {
+            WeekStart::Sunday => [Sun, Mon, Tue, Wed, Thu, Fri, Sat],
+            WeekStart::Monday => [Mon, Tue, Wed, Thu, Fri, Sat, Sun],
+        }
+    }
+
+    /// Space on the day checkboxes: flips the day under the cursor, then shows the matching
+    /// preset name if the new set is one ("weekdays", "Mon–Thu"), or "pick days".
+    fn toggle_day(&mut self) {
+        let day = self.day_order()[self.day_cursor];
+        self.days = self.days.toggled(day);
+        self.repeat_choice = choice_for_days(self.days);
+    }
+
+    /// The repeat rule currently chosen, or an error message for a bad "every N" or an empty
+    /// set of days.
     fn repeat_rule(&self) -> Result<RepeatRule, String> {
         Ok(match self.repeat_choice {
-            0 => RepeatRule::None,
-            1 => RepeatRule::Daily,
-            2 => RepeatRule::Weekly,
-            3 => RepeatRule::Monthly,
-            4 => RepeatRule::Yearly,
+            NONE => RepeatRule::None,
+            DAILY => RepeatRule::Daily,
+            WEEKLY => RepeatRule::Weekly,
+            MONTHLY => RepeatRule::Monthly,
+            YEARLY => RepeatRule::Yearly,
+            WEEKDAYS | MON_THU | PICK_DAYS => {
+                if self.days.is_empty() {
+                    return Err("Pick at least one day.".to_string());
+                }
+                // All seven days is just "daily", stored as such (and readable by every build).
+                if self.days == DaySet::ALL {
+                    RepeatRule::Daily
+                } else {
+                    RepeatRule::Weekdays(self.days)
+                }
+            }
             _ => {
                 let n: u32 = self
                     .every_n
@@ -446,7 +546,15 @@ impl Form {
         if title.is_empty() {
             return Err("Please enter a title.".to_string());
         }
-        let date = parse_date_input(&self.date_text, today)?;
+        let typed_date = parse_date_input(&self.date_text, today)?;
+        let repeat = self.repeat_rule()?;
+        // Weekday repeats: an empty date becomes the first scheduled day from today, and a
+        // date on an unscheduled day moves forward to the next scheduled one.
+        let date = match (typed_date, repeat) {
+            (Some(date), RepeatRule::Weekdays(_)) => Some(scheduled_on_or_after(repeat, date)),
+            (None, RepeatRule::Weekdays(_)) => Some(scheduled_on_or_after(repeat, today)),
+            (date, _) => date,
+        };
         if self.kind == Kind::Event && date.is_none() {
             return Err("Events need a date to count down to.".to_string());
         }
@@ -459,7 +567,6 @@ impl Form {
         if due_time.is_some() && date.is_none() {
             return Err("A due time needs a due date.".to_string());
         }
-        let repeat = self.repeat_rule()?;
         let notes = self.notes.trim();
         Ok(FormData {
             editing: self.editing.clone(),
@@ -602,11 +709,11 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         ))),
         None => lines.push(Line::default()),
     }
-    // On the date field, mention the picker instead of the ←→ hint (which does nothing there).
-    let hint = if focused == Field::Date {
-        "Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel"
-    } else {
-        "Tab/↑↓ move · ←→ change · Enter save · Esc cancel"
+    // The hint names the keys that do something on the focused field.
+    let hint = match focused {
+        Field::Date => "Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel",
+        Field::Days => "↑↓ move · ←→ day · Space on/off · Enter save · Esc cancel",
+        _ => "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
     };
     lines.push(hint_line(hint, theme));
 
@@ -627,6 +734,24 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
     match field {
         Field::Priority => choice(form.priority.label()),
         Field::Repeat => choice(REPEAT_CHOICES[form.repeat_choice]),
+        Field::Days => {
+            // "[x]Mo [x]Tu [ ]We ..."; the day under the cursor shows as "‹x›Mo" when focused.
+            form.day_order()
+                .iter()
+                .enumerate()
+                .map(|(i, &day)| {
+                    let mark = if form.days.contains(day) { "x" } else { " " };
+                    // Two-letter name: the first two characters of chrono's "Mon", "Tue"...
+                    let name: String = day.to_string().chars().take(2).collect();
+                    if focused && i == form.day_cursor {
+                        format!("‹{mark}›{name}")
+                    } else {
+                        format!("[{mark}]{name}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
         Field::EveryUnit => choice(form.unit.as_str()),
         Field::KeepAfterPass => {
             let box_ = if form.keep_after_pass { "[x]" } else { "[ ]" };
@@ -656,6 +781,35 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
 /// The muted line under the date field: either the understood date or how to type one.
 fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
     let indent = " ".repeat(14);
+    let line = |text: String, slot| Line::from(Span::styled(text, Style::new().fg(color(slot))));
+    // Weekday repeats: say where an unscheduled or empty date will land when saved.
+    // (`rule @ pattern` matches the pattern and also names the whole value `rule`.)
+    if let Ok(rule @ RepeatRule::Weekdays(_)) = form.repeat_rule() {
+        match parse_date_input(&form.date_text, today) {
+            Ok(Some(date)) if scheduled_on_or_after(rule, date) != date => {
+                let moved = scheduled_on_or_after(rule, date);
+                return line(
+                    format!(
+                        "{indent}→ {} isn't a repeat day: saves as {}",
+                        date.format("%a"),
+                        moved.format("%a %b %d")
+                    ),
+                    theme.warn,
+                );
+            }
+            Ok(None) => {
+                let first = scheduled_on_or_after(rule, today);
+                return line(
+                    format!(
+                        "{indent}→ empty: saves as {} (first repeat day)",
+                        first.format("%a %b %d")
+                    ),
+                    theme.ok,
+                );
+            }
+            _ => {}
+        }
+    }
     let (text, slot) = match parse_date_input(&form.date_text, today) {
         Ok(Some(date)) => {
             let days = days_until(date, today);
@@ -864,6 +1018,96 @@ mod tests {
         };
         assert_eq!(Form::edit(&item, prefs).time_text, "14:00");
         assert_eq!(twelve.validate(today()).unwrap().due_time, item.due_time);
+    }
+
+    /// A task form on the fields step with a title, ready for repeat tests.
+    fn task_form() -> Form {
+        let mut form = Form::new_add(FormPrefs::default());
+        form.step = Step::Fields;
+        form.title = "standup".into();
+        form
+    }
+
+    /// Moves focus to `field`.
+    fn focus_on(form: &mut Form, field: Field) {
+        form.focus = form.fields().iter().position(|f| *f == field).unwrap();
+    }
+
+    #[test]
+    fn weekday_presets_fill_the_days_and_show_the_checkboxes() {
+        let mut form = task_form();
+        assert!(!form.fields().contains(&Field::Days));
+        focus_on(&mut form, Field::Repeat);
+        form.handle_key(key(KeyCode::Right), today()); // daily
+        form.handle_key(key(KeyCode::Right), today()); // weekdays
+        assert_eq!(REPEAT_CHOICES[form.repeat_choice], "weekdays");
+        assert_eq!(form.days, DaySet::WEEKDAYS);
+        assert!(form.fields().contains(&Field::Days));
+        form.handle_key(key(KeyCode::Right), today()); // Mon–Thu
+        assert_eq!(form.days, DaySet::MON_THU);
+        form.date_text = "2026-10-10".into(); // a Saturday, not one of Mon–Thu...
+        let data = form.validate(today()).unwrap();
+        assert_eq!(data.repeat, RepeatRule::Weekdays(DaySet::MON_THU));
+        // ...so the saved date moves forward to Monday.
+        assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 10, 12));
+    }
+
+    #[test]
+    fn toggling_days_switches_between_presets_and_pick_days() {
+        let mut form = task_form();
+        form.repeat_choice = WEEKDAYS;
+        form.days = DaySet::WEEKDAYS;
+        focus_on(&mut form, Field::Days);
+        // Sunday-first order: index 5 is Friday. Turning it off leaves Mon–Thu.
+        form.day_cursor = 0;
+        for _ in 0..5 {
+            form.handle_key(key(KeyCode::Right), today());
+        }
+        form.handle_key(key(KeyCode::Char(' ')), today());
+        assert_eq!(form.days, DaySet::MON_THU);
+        assert_eq!(form.repeat_choice, MON_THU);
+        // Turning Saturday on is no preset: "pick days".
+        form.handle_key(key(KeyCode::Right), today());
+        form.handle_key(key(KeyCode::Char(' ')), today());
+        assert_eq!(form.repeat_choice, PICK_DAYS);
+    }
+
+    #[test]
+    fn day_sets_validate_and_fill_a_missing_date() {
+        let mut form = task_form();
+        form.repeat_choice = PICK_DAYS;
+        form.days = DaySet::EMPTY;
+        assert!(form.validate(today()).is_err(), "no days picked");
+        form.days = DaySet::ALL;
+        assert_eq!(form.validate(today()).unwrap().repeat, RepeatRule::Daily);
+        // Empty date: filled with the first scheduled day from today. Today (Thu Oct 8) is
+        // one of Mon–Thu, so it's today; for Mondays only, it's the next Monday.
+        form.days = DaySet::MON_THU;
+        let data = form.validate(today()).unwrap();
+        assert_eq!(data.date, Some(today()));
+        form.days = DaySet::EMPTY.toggled(Weekday::Mon);
+        let data = form.validate(today()).unwrap();
+        assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 10, 12));
+        // Events may repeat on weekdays too, and get a date filled in the same way.
+        form.kind = Kind::Event;
+        assert_eq!(
+            form.validate(today()).unwrap().date,
+            NaiveDate::from_ymd_opt(2026, 10, 12)
+        );
+    }
+
+    #[test]
+    fn editing_a_weekday_rule_restores_the_preset_or_pick_days() {
+        let mut item = Item::new(Kind::Task, "x", chrono::Utc::now());
+        item.date = NaiveDate::from_ymd_opt(2026, 10, 12);
+        item.repeat = RepeatRule::Weekdays(DaySet::MON_THU);
+        let form = Form::edit(&item, FormPrefs::default());
+        assert_eq!(form.repeat_choice, MON_THU);
+        let odd = DaySet::EMPTY.toggled(Weekday::Mon).toggled(Weekday::Sat);
+        item.repeat = RepeatRule::Weekdays(odd);
+        let form = Form::edit(&item, FormPrefs::default());
+        assert_eq!(form.repeat_choice, PICK_DAYS);
+        assert_eq!(form.validate(today()).unwrap().repeat, item.repeat);
     }
 
     #[test]

@@ -23,7 +23,8 @@
 //!
 //! - `v: 1`: the original format.
 //! - `v: 2`: adds what older builds can't represent: a `"due_time": "14:00"` field (local
-//!   wall-clock time). Only items that *use* a v2 feature are written as `v: 2`; everything
+//!   wall-clock time), and weekday-set repeats (`"repeat": "days:mon,tue,wed,thu"`), which
+//!   an older build would otherwise reject as an unknown repeat. Only items that *use* a v2 feature are written as `v: 2`; everything
 //!   else stays `v: 1`, so devices that haven't updated yet keep syncing all other items. An
 //!   older device also can't overwrite a v2 document: it never recorded that version's
 //!   `_rev`, so CouchDB rejects its write as a conflict.
@@ -41,9 +42,14 @@ use crate::model::{Completion, Item, Kind, Priority, RepeatRule};
 pub const DOC_VERSION: u64 = 2;
 
 /// The format version an item needs: 2 if it uses a feature older builds can't represent
-/// (a due time), otherwise 1.
+/// (a due time or a weekday-set repeat), otherwise 1.
 pub fn item_doc_version(item: &Item) -> u64 {
-    if item.due_time.is_some() { 2 } else { 1 }
+    let weekday_repeat = matches!(item.repeat, RepeatRule::Weekdays(_));
+    if item.due_time.is_some() || weekday_repeat {
+        2
+    } else {
+        1
+    }
 }
 
 /// `_id` prefix for item documents.
@@ -288,6 +294,16 @@ mod tests {
         assert_eq!(timed["v"], 2);
         assert_eq!(timed["due_time"], "14:00");
         assert_eq!(item_from_doc(&timed).unwrap(), item);
+    }
+
+    #[test]
+    fn weekday_repeats_are_version_2() {
+        let mut item = sample_item();
+        item.repeat = RepeatRule::Weekdays(crate::model::DaySet::MON_THU);
+        let doc = item_to_doc(&item, None);
+        assert_eq!(doc["v"], 2);
+        assert_eq!(doc["repeat"], "days:mon,tue,wed,thu");
+        assert_eq!(item_from_doc(&doc).unwrap(), item);
     }
 
     #[test]

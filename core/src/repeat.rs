@@ -10,6 +10,10 @@
 //!    started on Jan 31 is "anchor + 1 month", "anchor + 2 months", ... — never "previous
 //!    occurrence + 1 month". That way Jan 31 -> Feb 28 -> Mar 31: the short month clamps the
 //!    day, but the next month goes back to the 31st instead of drifting to the 28th forever.
+//!
+//! The one rule without a fixed step is **weekday sets** (e.g. Mon–Thu): occurrences are
+//! simply every date on one of those days, so there's no anchor to drift from. The next
+//! occurrence is found by looking at most 7 days ahead.
 
 use chrono::{Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Weekday};
 
@@ -25,10 +29,11 @@ enum Step {
     Months(u32),
 }
 
-/// Turns a repeat rule into its step size, or `None` if the rule doesn't repeat.
+/// Turns a repeat rule into its step size, or `None` if the rule doesn't repeat by a fixed
+/// step (no repeat at all, or a weekday set, which [`first_on_or_after`] handles first).
 fn step_of(rule: RepeatRule) -> Option<Step> {
     match rule {
-        RepeatRule::None => None,
+        RepeatRule::None | RepeatRule::Weekdays(_) => None,
         RepeatRule::Daily => Some(Step::Days(1)),
         RepeatRule::Weekly => Some(Step::Days(7)),
         RepeatRule::Monthly => Some(Step::Months(1)),
@@ -71,6 +76,11 @@ fn add_days(date: NaiveDate, days: i64) -> NaiveDate {
 fn first_on_or_after(rule: RepeatRule, anchor: NaiveDate, target: NaiveDate) -> NaiveDate {
     if anchor >= target {
         return anchor;
+    }
+    // Weekday sets: the first scheduled day on or after the target. (An empty set can't be
+    // saved; if one ever appears, it behaves like "doesn't repeat".)
+    if let RepeatRule::Weekdays(days) = rule {
+        return days.first_on_or_after(target).unwrap_or(anchor);
     }
     // `let ... else` : bind the value if the pattern matches, otherwise run the `else` block
     // (which must leave the function). Here: no step means "doesn't repeat".
@@ -179,6 +189,18 @@ pub fn next_instance_date(
 /// (`?` on an `Option` returns `None` early if that part is missing.)
 pub fn due_datetime(item: &Item) -> Option<NaiveDateTime> {
     Some(item.date?.and_time(item.due_time?))
+}
+
+/// For weekday-set rules: the first scheduled day on or after `date` (a Saturday start for a
+/// Mon–Thu rule becomes the following Monday). Every other rule returns `date` unchanged.
+///
+/// The add/edit form uses this to move an unscheduled start date forward when saving (and to
+/// preview that), and to fill in a missing date.
+pub fn scheduled_on_or_after(rule: RepeatRule, date: NaiveDate) -> NaiveDate {
+    match rule {
+        RepeatRule::Weekdays(days) => days.first_on_or_after(date).unwrap_or(date),
+        _ => date,
+    }
 }
 
 /// How many days from `today` until `date`. Positive = future, 0 = today, negative = past.
@@ -577,6 +599,99 @@ mod tests {
         assert!(!is_overdue(&t, at(14, 0)), "exactly on time is not late");
         assert!(is_overdue(&t, at(14, 1)));
         assert_eq!(due_datetime(&t), Some(at(14, 0)));
+    }
+
+    /// Mon–Thu, the example rule from the design.
+    fn mon_thu() -> RepeatRule {
+        RepeatRule::Weekdays(crate::model::DaySet::MON_THU)
+    }
+
+    #[test]
+    fn weekday_rule_completed_on_thursday_is_next_due_monday() {
+        // Oct 2026: Mon 5, Tue 6, Wed 7, Thu 8, Fri 9, Sat 10, Sun 11, Mon 12.
+        let two_pm = NaiveTime::from_hms_opt(14, 0, 0);
+        let thu = d(2026, 10, 8);
+        // Done Thursday morning (before 2 PM) or afternoon: either way, next is Monday 2 PM.
+        for hour in [9, 16] {
+            let now = thu.and_hms_opt(hour, 0, 0).unwrap();
+            assert_eq!(
+                next_instance_date(mon_thu(), Some(thu), two_pm, now),
+                Some(d(2026, 10, 12)),
+                "done at {hour}:00"
+            );
+        }
+        // The date-only rule agrees.
+        assert_eq!(
+            next_task_date(mon_thu(), Some(thu), thu),
+            Some(d(2026, 10, 12))
+        );
+    }
+
+    #[test]
+    fn weekday_rule_edge_cases() {
+        let two_pm = NaiveTime::from_hms_opt(14, 0, 0);
+        let at = |day: NaiveDate, h| day.and_hms_opt(h, 0, 0).unwrap();
+        let (mon, tue, wed, thu) = (
+            d(2026, 10, 5),
+            d(2026, 10, 6),
+            d(2026, 10, 7),
+            d(2026, 10, 8),
+        );
+        let (sat, sun, next_mon) = (d(2026, 10, 10), d(2026, 10, 11), d(2026, 10, 12));
+
+        // Late: due Mon, done Wed 10 AM -> Wed's 2 PM is still ahead, so Wed (missed Tue is
+        // NOT back-filled). Done Wed 3 PM -> Thu.
+        assert_eq!(
+            next_instance_date(mon_thu(), Some(mon), two_pm, at(wed, 10)),
+            Some(wed)
+        );
+        assert_eq!(
+            next_instance_date(mon_thu(), Some(mon), two_pm, at(wed, 15)),
+            Some(thu)
+        );
+        // Without a time, late completion skips to the first scheduled day after today.
+        assert_eq!(next_task_date(mon_thu(), Some(mon), wed), Some(thu));
+        // Done on a non-scheduled day (late, on Saturday): next Monday.
+        assert_eq!(
+            next_instance_date(mon_thu(), Some(thu), two_pm, at(sat, 10)),
+            Some(next_mon)
+        );
+        // Done early on Sunday for Monday's: Monday's is done, so Tuesday.
+        assert_eq!(
+            next_instance_date(mon_thu(), Some(next_mon), two_pm, at(sun, 10)),
+            Some(d(2026, 10, 13))
+        );
+        // Skipped a whole week: one next instance, after today, never a backlog.
+        assert_eq!(
+            next_task_date(mon_thu(), Some(mon), d(2026, 10, 14)),
+            Some(d(2026, 10, 15))
+        );
+        // A single day behaves like weekly on that day.
+        let tuesdays = RepeatRule::Weekdays(crate::model::DaySet::EMPTY.toggled(Weekday::Tue));
+        assert_eq!(
+            next_task_date(tuesdays, Some(tue), tue),
+            Some(d(2026, 10, 13))
+        );
+        // Events count down to the next scheduled day on or after today.
+        assert_eq!(next_occurrence(mon_thu(), mon, sat), next_mon);
+        assert_eq!(next_occurrence(mon_thu(), mon, wed), wed);
+    }
+
+    #[test]
+    fn unscheduled_start_dates_move_forward() {
+        assert_eq!(
+            scheduled_on_or_after(mon_thu(), d(2026, 10, 10)),
+            d(2026, 10, 12)
+        );
+        assert_eq!(
+            scheduled_on_or_after(mon_thu(), d(2026, 10, 7)),
+            d(2026, 10, 7)
+        );
+        assert_eq!(
+            scheduled_on_or_after(RepeatRule::Weekly, d(2026, 10, 10)),
+            d(2026, 10, 10),
+            "other rules are untouched"
+        );
     }
 
     #[test]
