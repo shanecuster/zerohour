@@ -34,8 +34,9 @@ ratatui = "0.30"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # Calendar dates and timestamps (NaiveDate = a date with no time zone, perfect for due dates).
 chrono = { version = "0.4", features = ["serde"] }
-# Random unique IDs for every row, so items from different devices never collide when syncing.
-uuid = { version = "1", features = ["v4"] }
+# Unique IDs for every row, so items from different devices never collide when syncing.
+# "v4" = random IDs for new items; "v5" = IDs derived from another ID (see model::derived_id).
+uuid = { version = "1", features = ["v4", "v5"] }
 # Turns our structs into JSON and back (needed for sync in phase 2 and export in phase 4).
 serde = { version = "1", features = ["derive"] }
 # Finds the right per-OS data folder (e.g. ~/.local/share/zerohour on Linux).

@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::model::{Completion, Item, Kind, Priority, RepeatRule, new_id};
+use crate::model::{
+    Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
+};
 use crate::repeat::{is_overdue, next_task_date};
 
 /// Everything that can go wrong in the storage layer.
@@ -216,12 +218,18 @@ impl Db {
         insert_item_on(&self.conn, item)
     }
 
-    /// Saves changes to an existing item, stamping `updated_at = now`.
+    /// Saves changes to an existing item, stamping a fresh `updated_at` (normally `now`; see
+    /// [`next_updated_at`] for the clock-skew rule).
     ///
     /// `item: &mut Item` is a *mutable borrow*: we may change the caller's item (to set
     /// `updated_at`), but we don't take ownership of it.
     pub fn update_item(&self, item: &mut Item, now: DateTime<Utc>) -> Result<()> {
-        item.updated_at = now;
+        // Base the new timestamp on what's stored, not on the caller's copy: a sync may have
+        // updated the row since the caller loaded it.
+        let stored = self
+            .stored_updated_at(&item.id)?
+            .ok_or_else(|| DbError::NotFound(item.id.clone()))?;
+        item.updated_at = next_updated_at(stored, now);
         let changed = self.conn.execute(
             "UPDATE items SET kind = ?2, title = ?3, notes = ?4, priority = ?5, date = ?6,
                               repeat = ?7, keep_after_pass = ?8, completed_at = ?9,
@@ -251,14 +259,28 @@ impl Db {
     /// Soft-deletes an item: marks it deleted (and bumps `updated_at`) but keeps the row,
     /// so the deletion can be synced to other devices later.
     pub fn delete_item(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        let stored = self
+            .stored_updated_at(id)?
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
         let changed = self.conn.execute(
             "UPDATE items SET deleted = 1, updated_at = ?2 WHERE id = ?1 AND deleted = 0",
-            params![id, ts_to_db(now)],
+            params![id, ts_to_db(next_updated_at(stored, now))],
         )?;
         if changed == 0 {
             return Err(DbError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// The stored `updated_at` of an item, or `None` if there's no such id.
+    fn stored_updated_at(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
+        let text: Option<String> = self
+            .conn
+            .query_row("SELECT updated_at FROM items WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        text.as_deref().map(ts_from_db).transpose()
     }
 
     /// Loads one item by id (including deleted ones), or `None` if there's no such id.
@@ -311,8 +333,11 @@ impl Db {
             return Ok(None); // Already done; completing twice would double-count stats.
         }
 
+        // The completion and the next instance get ids *derived* from this task's id (see
+        // `model::derived_id`), so completing the same task on two offline devices produces
+        // the same rows, which sync then merges into one.
         let completion = Completion {
-            id: new_id(),
+            id: derived_id(DerivedId::Completion, &task.id),
             item_id: task.id.clone(),
             completed_at: now,
             title_snapshot: task.title.clone(),
@@ -324,7 +349,7 @@ impl Db {
         let next = next_task_date(task.repeat, task.date, today).map(|date| {
             // `..task.clone()` = "every other field copied from the old task".
             Item {
-                id: new_id(),
+                id: derived_id(DerivedId::NextInstance, &task.id),
                 date: Some(date),
                 completed_at: None,
                 created_at: now,
@@ -334,17 +359,32 @@ impl Db {
         });
 
         task.completed_at = Some(now);
-        task.updated_at = now;
+        task.updated_at = next_updated_at(task.updated_at, now);
 
         let tx = self.conn.transaction()?;
         tx.execute(
             "UPDATE items SET completed_at = ?2, updated_at = ?3 WHERE id = ?1",
-            params![task.id, ts_to_db(now), ts_to_db(now)],
+            params![task.id, ts_to_db(now), ts_to_db(task.updated_at)],
         )?;
-        insert_completion_on(&tx, &completion)?;
-        if let Some(next) = &next {
-            insert_item_on(&tx, next)?;
+        // With sync, the other device's copy of these rows may already have arrived (same
+        // derived ids). Then we keep what's there instead of failing on a duplicate id.
+        if !row_exists_on(&tx, "completions", &completion.id)? {
+            insert_completion_on(&tx, &completion)?;
         }
+        let next = match next {
+            Some(next) if row_exists_on(&tx, "items", &next.id)? => {
+                let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
+                Some(
+                    tx.query_row(&sql, [&next.id], RawItem::from_row)?
+                        .into_item()?,
+                )
+            }
+            Some(next) => {
+                insert_item_on(&tx, &next)?;
+                Some(next)
+            }
+            None => None,
+        };
         tx.commit()?;
         Ok(next)
     }
@@ -449,6 +489,19 @@ fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// True if `table` has a row with this `id`. `table` is always one of our own constant names,
+/// never user input, so building the SQL with `format!` is safe here.
+fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            &format!("SELECT 1 FROM {table} WHERE id = ?1"),
+            [id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 
 /// Inserts a completion row using the given connection or transaction.
@@ -558,7 +611,7 @@ fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Unit;
+    use crate::model::{Unit, new_id};
     use chrono::TimeZone;
 
     fn d(y: i32, m: u32, day: u32) -> NaiveDate {
@@ -596,8 +649,11 @@ mod tests {
         let mut task = Item::new(Kind::Task, "old task", now());
         task.date = Some(d(2026, 10, 1));
         old.insert_item(&task).unwrap();
+        // The completion and the next instance get ids *derived* from this task's id (see
+        // `model::derived_id`), so completing the same task on two offline devices produces
+        // the same rows, which sync then merges into one.
         let completion = Completion {
-            id: new_id(),
+            id: derived_id(DerivedId::Completion, &task.id),
             item_id: task.id.clone(),
             completed_at: now(),
             title_snapshot: "old task".into(),
@@ -727,6 +783,96 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items.iter().filter(|i| i.is_completed()).count(), 1);
         assert!(!db.list_completions().unwrap()[0].was_overdue);
+    }
+
+    #[test]
+    fn edits_stamp_past_a_stored_time_from_the_future() {
+        // A version synced from a device whose clock runs 10 minutes fast.
+        let db = Db::open_in_memory().unwrap();
+        let ahead = now() + chrono::TimeDelta::minutes(10);
+        let mut item = Item::new(Kind::Task, "from fast clock", ahead);
+        db.insert_item(&item).unwrap();
+
+        // Editing it "now" must still produce a newer timestamp than the stored one.
+        db.update_item(&mut item, now()).unwrap();
+        let one_ms = chrono::TimeDelta::milliseconds(1);
+        assert_eq!(item.updated_at, ahead + one_ms);
+        db.delete_item(&item.id, now()).unwrap();
+        let deleted = db.get_item(&item.id).unwrap().unwrap();
+        assert_eq!(deleted.updated_at, ahead + one_ms + one_ms);
+    }
+
+    #[test]
+    fn local_completion_flow_is_unchanged_with_derived_ids() {
+        // Existing phase 1 data: a repeating task with a random (v4) id, plus another item and
+        // an old completion that must not be touched.
+        let mut db = Db::open_in_memory().unwrap();
+        let mut task = Item::new(Kind::Task, "water plants", now());
+        task.date = Some(d(2026, 10, 8));
+        task.repeat = RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        let bystander = Item::new(Kind::Event, "untouched", now());
+        db.insert_item(&bystander).unwrap();
+        let old_completion = Completion {
+            id: new_id(),
+            item_id: new_id(),
+            completed_at: now() - chrono::TimeDelta::days(3),
+            title_snapshot: "older".into(),
+            priority_snapshot: Priority::Low,
+            was_overdue: false,
+        };
+        db.insert_completion(&old_completion).unwrap();
+
+        // Complete it, then complete the next instance too: a chain of three.
+        let second = db
+            .complete_task(&task.id, d(2026, 10, 8), now())
+            .unwrap()
+            .unwrap();
+        let later = now() + chrono::TimeDelta::days(7);
+        let third = db
+            .complete_task(&second.id, d(2026, 10, 15), later)
+            .unwrap()
+            .unwrap();
+
+        // Same visible results as before: dates, titles, history rows, one log entry each.
+        assert_eq!(second.date, Some(d(2026, 10, 15)));
+        assert_eq!(third.date, Some(d(2026, 10, 22)));
+        assert_eq!(db.list_items().unwrap().len(), 4);
+        assert_eq!(db.get_item(&bystander.id).unwrap().unwrap(), bystander);
+        let log = db.list_completions().unwrap();
+        assert_eq!(log.len(), 3);
+        assert_eq!(log[0], old_completion, "old rows are never rewritten");
+
+        // The new ids are the derived ones, all distinct.
+        assert_eq!(second.id, derived_id(DerivedId::NextInstance, &task.id));
+        assert_eq!(third.id, derived_id(DerivedId::NextInstance, &second.id));
+        assert_eq!(log[1].id, derived_id(DerivedId::Completion, &task.id));
+        assert_eq!(log[2].id, derived_id(DerivedId::Completion, &second.id));
+        assert_ne!(log[1].id, log[2].id);
+    }
+
+    #[test]
+    fn completing_when_synced_copies_already_exist_keeps_them() {
+        // Another device completed this task first and its rows already synced here, but the
+        // task itself still looks open locally (its update hasn't arrived yet).
+        let mut db = Db::open_in_memory().unwrap();
+        let mut task = Item::new(Kind::Task, "weekly review", now());
+        task.date = Some(d(2026, 10, 8));
+        task.repeat = RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        let mut theirs = Item::new(Kind::Task, "weekly review (theirs)", now());
+        theirs.id = derived_id(DerivedId::NextInstance, &task.id);
+        db.insert_item(&theirs).unwrap();
+
+        let next = db
+            .complete_task(&task.id, d(2026, 10, 8), now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next, theirs,
+            "the existing copy wins, no duplicate-id error"
+        );
+        assert_eq!(db.list_items().unwrap().len(), 2);
     }
 
     #[test]

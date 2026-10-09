@@ -8,7 +8,7 @@
 //! newest edit can win a conflict), and a `deleted` flag instead of really deleting rows (so a
 //! deletion can be sent to other devices).
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -304,6 +304,49 @@ pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// The fixed "namespace" for zerohour's derived IDs. Any constant UUID works; it just has to
+/// never change, or derived IDs made by old and new versions would stop matching.
+const ID_NAMESPACE: Uuid = Uuid::from_u128(0xf430a8ff_6bba_4fe2_9d28_f2da9fe70752);
+
+/// What a [`derived_id`] is derived *for*, so the same source id gives different results for
+/// different purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedId {
+    /// The next instance of a repeating task, derived from the instance that was completed.
+    NextInstance,
+    /// The completion log entry for a task, derived from the task's id.
+    Completion,
+}
+
+/// A UUID (version 5) computed from another id instead of picked at random.
+///
+/// Version 5 UUIDs are a hash of (namespace, name): the same input always gives the same
+/// UUID, on every device. That matters for sync: if you complete the same repeating task on
+/// two devices while both are offline, both create the *same* next instance and the *same*
+/// completion entry, which then merge into one instead of showing up twice.
+///
+/// It's safe locally because a task can only be completed once, so each source id is only
+/// ever used once per purpose.
+pub fn derived_id(purpose: DerivedId, source_id: &str) -> String {
+    let name = match purpose {
+        DerivedId::NextInstance => format!("next-instance:{source_id}"),
+        DerivedId::Completion => format!("completion:{source_id}"),
+    };
+    Uuid::new_v5(&ID_NAMESPACE, name.as_bytes()).to_string()
+}
+
+/// The `updated_at` to stamp on an edit: `now`, unless the stored value is already at or past
+/// `now`, in which case 1 millisecond after the stored value.
+///
+/// Why: sync picks the version with the newer `updated_at`. If this device's clock is behind
+/// another device's, a version synced from there can carry a timestamp "in the future". Without
+/// this rule, your edit made *after* seeing that version would get an older timestamp and lose.
+/// With it, an edit always beats the version it was made on top of. On a single device with a
+/// normal clock, `now` is always later, so local-only behavior is unchanged.
+pub fn next_updated_at(previous: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    now.max(previous + TimeDelta::milliseconds(1))
+}
+
 // `#[cfg(test)]` means "only compile this module when running `cargo test`".
 #[cfg(test)]
 mod tests {
@@ -363,6 +406,34 @@ mod tests {
             "daily"
         );
         assert_eq!(RepeatRule::None.label(), "");
+    }
+
+    #[test]
+    fn derived_ids_are_stable_valid_and_distinct() {
+        let source = "9b2d6f0e-3c1a-4b8e-9f00-123456789abc";
+        let next = derived_id(DerivedId::NextInstance, source);
+        // Same input, same output (this is what lets two devices agree).
+        assert_eq!(next, derived_id(DerivedId::NextInstance, source));
+        // A real UUID, version 5.
+        assert_eq!(Uuid::parse_str(&next).unwrap().get_version_num(), 5);
+        // Different purposes and different sources give different ids.
+        assert_ne!(next, derived_id(DerivedId::Completion, source));
+        assert_ne!(next, derived_id(DerivedId::NextInstance, &new_id()));
+        assert_ne!(next, source);
+    }
+
+    #[test]
+    fn next_updated_at_is_now_unless_the_stored_time_is_ahead() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 10, 8, 12, 0, 0).unwrap();
+        let earlier = now - TimeDelta::hours(1);
+        let ahead = now + TimeDelta::minutes(5);
+        assert_eq!(next_updated_at(earlier, now), now, "normal case: just now");
+        assert_eq!(
+            next_updated_at(ahead, now),
+            ahead + TimeDelta::milliseconds(1)
+        );
+        assert_eq!(next_updated_at(now, now), now + TimeDelta::milliseconds(1));
     }
 
     #[test]
