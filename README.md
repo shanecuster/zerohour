@@ -42,7 +42,7 @@ zerohour --demo
 ```
 
 For the best look, set your terminal to a **Nerd Font Mono** font (for example, "JetBrainsMono Nerd Font Mono").
-Without one, switch the icon mode to Unicode or ASCII in the settings.
+Without one, press `i` in the app to switch to Unicode or ASCII icons.
 
 ## Usage
 
@@ -51,13 +51,17 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | Key | Action |
 |---|---|
 | `a` | Add a task or event |
-| `Space` | Mark a task done |
-| `e` | Edit the selected item |
+| `Space` / `x` | Complete a task |
+| `e` / `Enter` | Edit the selected item |
 | `d` | Delete the selected item |
-| `Tab` | Switch to the stats screen |
-| `t` | Pick a theme |
+| `j` / `k` or arrows | Move up and down |
+| `g` / `G` | Jump to top / bottom |
 | `p` | Show or hide passed events |
+| `Tab` / `s` | Switch to the stats screen |
+| `t` | Pick a theme |
+| `i` | Cycle icon mode (Nerd Font / Unicode / ASCII) |
 | `?` | Help |
+| `q` | Quit |
 
 Options:
 
