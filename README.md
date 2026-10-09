@@ -18,6 +18,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Statistics.** Completions per week, streaks, overdue count, and more, with a bar chart.
 - **Themes.** Everforest, Dracula, Gruvbox, Catppuccin, Nord, Solarized, Tokyo Night, with a live-preview picker.
 - **Nerd Font icons** with Unicode and ASCII fallbacks.
+- **Title banner.** A big "zerohour" in the theme's colors with a countdown to your next event, on terminals 30+ rows tall (`b` hides it).
 - **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
 - **Local-first.** Your data lives in a single SQLite file on your machine.
 - **Optional sync** between devices through your own CouchDB server. Off by default, and left out of the build unless you ask for it.
@@ -70,6 +71,7 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | `p` | Show or hide passed events |
 | `v` | Layout: split 50/50, or Events fit their content |
 | `T` | Times: 12-hour or 24-hour |
+| `b` | Title banner on or off (shows on terminals 30+ rows tall, not in narrow mode) |
 | `Tab` / `s` | Switch to the stats screen |
 | `t` | Pick a theme |
 | `i` | Cycle icon mode (Nerd Font / Unicode / ASCII) |

@@ -8,6 +8,7 @@
 //! Submodules:
 //! - [`list`]     — the main screen: Tasks section above, Events section below.
 //! - [`add`]      — the add/edit dialog (also owns that dialog's state and keys).
+//! - [`banner`]   — the big "zerohour" title and tagline at the top of the main screen.
 //! - [`calendar`] — the month-grid date picker that opens over the add/edit dialog.
 //! - [`stats`]    — the stats screen with the weekly bar chart.
 //! - [`settings`] — the theme picker and the first-run icon check.
@@ -17,6 +18,7 @@
 //! This file has the entry point [`draw`] plus small helpers every screen uses.
 
 pub mod add;
+pub mod banner;
 pub mod calendar;
 pub mod help;
 pub mod list;

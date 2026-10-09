@@ -39,6 +39,8 @@ pub enum Action {
     ToggleLayout,
     /// Switch between 12-hour and 24-hour times.
     ToggleTimeFormat,
+    /// Show or hide the big title banner.
+    ToggleBanner,
     /// Show the help overlay.
     Help,
     /// Open the sync settings (only in builds with the `sync` feature).
@@ -75,6 +77,7 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('p') => Action::TogglePassed,
         KeyCode::Char('v') => Action::ToggleLayout,
         KeyCode::Char('T') => Action::ToggleTimeFormat,
+        KeyCode::Char('b') => Action::ToggleBanner,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
         // `#[cfg]` on a match arm: in local-only builds this key simply does nothing, exactly
         // as before sync existed.
@@ -104,6 +107,14 @@ mod tests {
         assert_eq!(main_action(press(KeyCode::Down)), Some(Action::Down));
         assert_eq!(main_action(press(KeyCode::Char('k'))), Some(Action::Up));
         assert_eq!(main_action(press(KeyCode::Up)), Some(Action::Up));
+    }
+
+    #[test]
+    fn b_toggles_the_banner() {
+        assert_eq!(
+            main_action(press(KeyCode::Char('b'))),
+            Some(Action::ToggleBanner)
+        );
     }
 
     #[test]

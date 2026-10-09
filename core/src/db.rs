@@ -135,6 +135,8 @@ pub mod settings_keys {
     pub const WEEK_START: &str = "week_start";
     /// How times are shown: "12h" (default, "2:00 PM") or "24h" ("14:00").
     pub const TIME_FORMAT: &str = "time_format";
+    /// The big "zerohour" title on the main screen: "on" (default) or "off".
+    pub const BANNER: &str = "banner";
 }
 
 /// A handle to the open database. All storage goes through this.

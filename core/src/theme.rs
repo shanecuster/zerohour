@@ -29,6 +29,23 @@ impl Rgb {
             (value & 0xff) as u8,
         )
     }
+
+    /// The color a fraction `t` of the way from `self` to `other`: `t = 0.0` gives `self`,
+    /// `1.0` gives `other`, `0.5` the midpoint. Values outside 0..=1 are clamped.
+    ///
+    /// Used for gradients (the title banner fades from the `accent` slot to the `event` slot),
+    /// so in-between colors always come from the theme instead of being hard-coded.
+    pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
+        let t = t.clamp(0.0, 1.0);
+        // Mix one channel: start + (end - start) * t, rounded back to a whole 0-255 value.
+        // `f32::from(u8)` widens without loss; the result always fits back in 0..=255.
+        let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+        Rgb(
+            mix(self.0, other.0),
+            mix(self.1, other.1),
+            mix(self.2, other.2),
+        )
+    }
 }
 
 /// One complete theme: a name plus a color for every slot.
@@ -197,6 +214,25 @@ pub fn theme_index(name: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lerp_goes_from_one_color_to_the_other() {
+        let black = Rgb(0, 0, 0);
+        let white = Rgb(255, 255, 255);
+        assert_eq!(black.lerp(white, 0.0), black);
+        assert_eq!(black.lerp(white, 1.0), white);
+        assert_eq!(black.lerp(white, 0.5), Rgb(128, 128, 128));
+        assert_eq!(
+            white.lerp(black, 0.25),
+            Rgb(191, 191, 191),
+            "works downwards too"
+        );
+        assert_eq!(black.lerp(white, 7.0), white, "clamped");
+        assert_eq!(
+            Rgb(10, 200, 30).lerp(Rgb(10, 200, 30), 0.3),
+            Rgb(10, 200, 30)
+        );
+    }
 
     /// A rough "how different are two colors" score: the sum of channel differences.
     fn distance(a: Rgb, b: Rgb) -> u32 {
