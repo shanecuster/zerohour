@@ -260,14 +260,183 @@ pub fn tail_fit(text: &str, max: usize) -> String {
     std::iter::once('…').chain(kept.into_iter().rev()).collect()
 }
 
+/// Word-wraps `text` into lines no wider than `width` terminal columns, so hints and
+/// messages in popups never get cut off at the right edge.
+///
+/// - Lines break at spaces, and runs of spaces between words become single spaces (so only
+///   pass it text whose spacing doesn't matter, like hints and messages). A `·` separator always stays at the end of the line before it
+///   (so a wrapped hint reads "Tab move · ←→ change ·" / "Enter save"), never starts a line.
+/// - Any spaces at the start of `text` are kept on the first line; later lines start with
+///   `indent` spaces instead, so wrapped text lines up under the first line's text.
+/// - A single word wider than a whole line can't be wrapped, so it's shortened with `…`
+///   (the only case where text is cut).
+pub fn wrap_text(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let lead = text.len() - text.trim_start().len();
+    // Keep the indent sensible on very narrow widths.
+    let indent = if indent < width { indent } else { 0 };
+
+    // Split into words, gluing each lone "·" onto the word before it.
+    let mut words: Vec<String> = Vec::new();
+    for word in text.trim_start().split(' ').filter(|w| !w.is_empty()) {
+        match (word, words.last_mut()) {
+            ("·", Some(previous)) => previous.push_str(" ·"),
+            _ => words.push(word.to_string()),
+        }
+    }
+
+    let mut lines = Vec::new();
+    // The line being built, and whether it has a word on it yet.
+    let mut line = " ".repeat(lead.min(width.saturating_sub(1)));
+    let mut has_word = false;
+    for word in words {
+        let candidate = if has_word {
+            format!("{line} {word}")
+        } else {
+            format!("{line}{word}")
+        };
+        if candidate.width() <= width {
+            line = candidate;
+            has_word = true;
+            continue;
+        }
+        if has_word {
+            // The word doesn't fit after the others: finish this line, start the next.
+            lines.push(line);
+            line = " ".repeat(indent);
+        }
+        // The word starts a line; if it's wider than a whole line, shorten it.
+        let room = width.saturating_sub(line.width());
+        line.push_str(&truncate(&word, room));
+        has_word = true;
+    }
+    lines.push(line);
+    lines
+}
+
+/// [`wrap_text`] as styled lines, ready to add to a popup's `Paragraph`.
+pub fn wrapped_lines(text: &str, width: usize, indent: usize, style: Style) -> Vec<Line<'static>> {
+    wrap_text(text, width, indent)
+        .into_iter()
+        .map(|line| Line::from(Span::styled(line, style)))
+        .collect()
+}
+
+/// Inner text width of a popup that is `width` columns wide: minus the two borders and the
+/// one column of padding on each side that [`popup_block`] adds.
+pub fn popup_text_width(width: u16) -> usize {
+    usize::from(width.saturating_sub(4))
+}
+
+/// The height a popup needs for `line_count` lines of text: plus the top and bottom borders.
+pub fn popup_height(line_count: usize) -> u16 {
+    u16::try_from(line_count + 2).unwrap_or(u16::MAX)
+}
+
 /// Display width of a string in terminal columns (as a u16 for layout math).
 pub fn width_u16(text: &str) -> u16 {
     u16::try_from(text.width()).unwrap_or(u16::MAX)
 }
 
+/// Helpers for tests that render popups and check that their text isn't cut off.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ratatui::Frame;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// The terminal widths every popup is checked at.
+    pub const WIDTHS: [u16; 3] = [60, 80, 120];
+
+    /// Renders `draw` on a `width` × `height` terminal and returns the screen as one string:
+    /// rows joined with spaces, border characters removed, and runs of spaces collapsed. That
+    /// way a hint that wrapped onto two lines still reads as one sentence.
+    pub fn screen_text(width: u16, height: u16, draw: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(draw).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut rows = Vec::new();
+        for y in 0..height {
+            let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+            rows.push(row);
+        }
+        normalize(&rows.join(" "))
+    }
+
+    /// Removes box-drawing border characters and collapses whitespace.
+    pub fn normalize(text: &str) -> String {
+        let cleaned: String = text
+            .chars()
+            .map(|c| {
+                if "│╭╮╰╯─".contains(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Fails the test unless every text in `expected` appears complete on the screen.
+    /// A clipped line would be missing its end, so it wouldn't match.
+    pub fn assert_shows(screen: &str, width: u16, expected: &[&str]) {
+        for text in expected {
+            assert!(
+                screen.contains(&normalize(text)),
+                "at {width} columns, {text:?} is cut off or missing.\nScreen: {screen}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrap_keeps_short_text_on_one_line() {
+        assert_eq!(wrap_text("  short hint", 40, 2), vec!["  short hint"]);
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_indents_continuations() {
+        let lines = wrap_text("  Tab/↑↓ move · ←→ change · Enter save · Esc cancel", 30, 2);
+        assert_eq!(
+            lines,
+            vec!["  Tab/↑↓ move · ←→ change ·", "  Enter save · Esc cancel"]
+        );
+        for line in &lines {
+            assert!(line.width() <= 30);
+        }
+    }
+
+    #[test]
+    fn a_separator_never_starts_a_line() {
+        // "a ·" would exactly fill the first line; the "·" must not move to the next one.
+        for width in 3..20 {
+            for line in wrap_text("aaaa · bbbb · cccc", width, 0) {
+                assert!(!line.trim_start().starts_with('·'), "{width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_word_wider_than_the_line_is_shortened() {
+        assert_eq!(
+            wrap_text("ok /a/very/long/path/name", 10, 0),
+            vec!["ok", "/a/very/l…"]
+        );
+    }
+
+    #[test]
+    fn wrapped_text_reads_the_same_when_joined() {
+        let text = "e.g. 12/25, 2026-12-25, +3d, +2w, tomorrow, fri";
+        // From the longest word's width up (narrower would shorten that word, by design).
+        for width in 11..60 {
+            let joined = wrap_text(text, width, 0).join(" ");
+            assert_eq!(joined, text, "width {width}");
+        }
+    }
 
     #[test]
     fn truncate_adds_ellipsis_only_when_needed() {

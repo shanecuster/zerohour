@@ -48,6 +48,12 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 - Sync: items with a due time or a weekday repeat are written as document version 2; older builds skip
   only those items. Everything else stays version 1.
 
+### Fixed
+
+- Hints and messages in dialogs no longer get cut off on narrower terminals: the add/edit dialog's
+  date and time hints, the help overlay, the icon check, the delete confirmation (long titles),
+  and the sync settings now wrap their text and grow to fit.
+
 ## [0.1.0] - 2026-10-08
 
 ### Added

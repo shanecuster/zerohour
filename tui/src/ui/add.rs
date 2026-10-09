@@ -31,10 +31,12 @@ use zerohour_core::clock::{TimeFormat, format_time, parse_time_input};
 use zerohour_core::icons::{Icon, IconMode};
 use zerohour_core::model::{DaySet, Item, Kind, Priority, RepeatRule, Unit};
 use zerohour_core::repeat::{days_until, parse_date_input, scheduled_on_or_after};
-use zerohour_core::theme::Theme;
+use zerohour_core::theme::{Rgb, Theme};
 
 use super::calendar::{self, Calendar, CalendarOutcome, GridArea};
-use super::{centered, color, popup_block, tail_fit};
+use super::{
+    centered, color, popup_block, popup_height, popup_text_width, tail_fit, truncate, wrapped_lines,
+};
 use zerohour_core::calendar::add_months;
 
 /// The repeat options shown in the form, in cycling order. "custom" reveals the "every N" and
@@ -626,8 +628,11 @@ pub fn draw(
 
 /// Step 1: "Task or Event?"
 fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMode) {
-    let area = centered(frame.area(), 62, 9);
-    let block = popup_block(" Add ", theme, color(theme.accent));
+    // The popup is 62 columns, or the whole width on a smaller terminal. Text is wrapped to
+    // fit, and the height follows from the number of lines.
+    let width = 62.min(frame.area().width);
+    let text_width = popup_text_width(width);
+    let muted = Style::new().fg(color(theme.muted));
 
     // One option = a name line plus a hint line; the chosen one gets an arrow and color.
     let option = |kind: Kind, name: &str, icon: Icon, hint: &str, section_color| {
@@ -638,16 +643,12 @@ fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMo
         } else {
             Style::new().fg(color(theme.muted))
         };
-        vec![
-            Line::from(vec![
-                Span::styled(marker, Style::new().fg(color(theme.accent))),
-                Span::styled(format!("{} {name}", icon.get(icons)), name_style),
-            ]),
-            Line::from(Span::styled(
-                format!("    {hint}"),
-                Style::new().fg(color(theme.muted)),
-            )),
-        ]
+        let mut lines = vec![Line::from(vec![
+            Span::styled(marker, Style::new().fg(color(theme.accent))),
+            Span::styled(format!("{} {name}", icon.get(icons)), name_style),
+        ])];
+        lines.extend(wrapped_lines(&format!("    {hint}"), text_width, 4, muted));
+        lines
     };
 
     let mut lines = Vec::new();
@@ -667,11 +668,14 @@ fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMo
         color(theme.event),
     ));
     lines.push(Line::default());
-    lines.push(hint_line(
+    lines.extend(hint_lines(
         "Tab switch · Enter continue · t/e pick · Esc cancel",
+        text_width,
         theme,
     ));
 
+    let area = centered(frame.area(), width, popup_height(lines.len()));
+    let block = popup_block(" Add ", theme, color(theme.accent));
     frame.render_widget(Clear, area); // erase what's behind the popup
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -679,10 +683,10 @@ fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMo
 /// Step 2: the fields.
 fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) {
     let fields = form.fields();
-    // Height: one line per field + date preview (+ time preview for tasks) + blank +
-    // error/hint lines + borders.
-    let height = fields.len() as u16 + 6 + u16::from(fields.contains(&Field::Time));
-    let area = centered(frame.area(), 64, height);
+    // 64 columns, or the whole width on a smaller terminal. Previews, errors and hints wrap
+    // to fit, so the height is worked out from the lines once they're built.
+    let width = 64.min(frame.area().width);
+    let text_width = popup_text_width(width);
     let (verb, noun) = match (&form.editing, form.kind) {
         (Some(_), Kind::Task) => ("Edit", "task"),
         (Some(_), Kind::Event) => ("Edit", "event"),
@@ -693,12 +697,10 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         Kind::Task => color(theme.task),
         Kind::Event => color(theme.event),
     };
-    let block = popup_block(&format!(" {verb} {noun} "), theme, section_color);
-    let inner = block.inner(area);
 
     const LABEL_WIDTH: usize = 11;
     // Space left for the value after "› " + label + " ".
-    let value_width = (inner.width as usize).saturating_sub(LABEL_WIDTH + 3);
+    let value_width = text_width.saturating_sub(LABEL_WIDTH + 3);
     let focused = form.focused();
 
     let mut lines: Vec<Line> = Vec::new();
@@ -711,7 +713,12 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         } else {
             Style::new().fg(color(theme.muted))
         };
-        let value = field_value(form, *field, is_focused, value_width);
+        // Values can't wrap (they're one input each), so the rare too-long one (the day
+        // checkboxes on a narrow screen) is shortened with "…" instead.
+        let value = truncate(
+            &field_value(form, *field, is_focused, value_width),
+            value_width,
+        );
         lines.push(Line::from(vec![
             Span::styled(if is_focused { "› " } else { "  " }, label_style),
             Span::styled(
@@ -720,20 +727,26 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
             ),
             Span::styled(value, Style::new().fg(color(theme.fg))),
         ]));
-        // Right under the date: show how the typed text was understood.
-        if *field == Field::Date {
-            lines.push(date_preview(form, theme, today));
-        }
-        if *field == Field::Time {
-            lines.push(time_preview(form, theme));
+        // Right under the date and time: how the typed text was understood, wrapped under
+        // the value column (14 = "› " + label + " ").
+        let preview = match field {
+            Field::Date => Some(date_preview(form, theme, today)),
+            Field::Time => Some(time_preview(form, theme)),
+            _ => None,
+        };
+        if let Some((text, slot)) = preview {
+            let style = Style::new().fg(color(slot));
+            lines.extend(wrapped_lines(&text, text_width, 14, style));
         }
     }
     lines.push(Line::default());
     match &form.error {
-        Some(message) => lines.push(Line::from(Span::styled(
-            format!("  {message}"),
+        Some(message) => lines.extend(wrapped_lines(
+            &format!("  {message}"),
+            text_width,
+            2,
             Style::new().fg(color(theme.danger)),
-        ))),
+        )),
         None => lines.push(Line::default()),
     }
     // The hint names the keys that do something on the focused field.
@@ -742,8 +755,10 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         Field::Days => "↑↓ move · ←→ day · Space on/off · Enter save · Esc cancel",
         _ => "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
     };
-    lines.push(hint_line(hint, theme));
+    lines.extend(hint_lines(hint, text_width, theme));
 
+    let area = centered(frame.area(), width, popup_height(lines.len()));
+    let block = popup_block(&format!(" {verb} {noun} "), theme, section_color);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -805,17 +820,17 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
     }
 }
 
-/// The muted line under the date field: either the understood date or how to type one.
-fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
+/// The muted text under the date field (indented to the value column): the understood date,
+/// or how to type one. Returned as (text, color slot); the caller wraps it to fit.
+fn date_preview(form: &Form, theme: &Theme, today: NaiveDate) -> (String, Rgb) {
     let indent = " ".repeat(14);
-    let line = |text: String, slot| Line::from(Span::styled(text, Style::new().fg(color(slot))));
     // Weekday repeats: say where an unscheduled or empty date will land when saved.
     // (`rule @ pattern` matches the pattern and also names the whole value `rule`.)
     if let Ok(rule @ RepeatRule::Weekdays(_)) = form.repeat_rule() {
         match parse_date_input(&form.date_text, today) {
             Ok(Some(date)) if scheduled_on_or_after(rule, date) != date => {
                 let moved = scheduled_on_or_after(rule, date);
-                return line(
+                return (
                     format!(
                         "{indent}→ {} isn't a repeat day: saves as {}",
                         date.format("%a"),
@@ -826,7 +841,7 @@ fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
             }
             Ok(None) => {
                 let first = scheduled_on_or_after(rule, today);
-                return line(
+                return (
                     format!(
                         "{indent}→ empty: saves as {} (first repeat day)",
                         first.format("%a %b %d")
@@ -837,7 +852,7 @@ fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
             _ => {}
         }
     }
-    let (text, slot) = match parse_date_input(&form.date_text, today) {
+    match parse_date_input(&form.date_text, today) {
         Ok(Some(date)) => {
             let days = days_until(date, today);
             let relative = match days {
@@ -857,14 +872,14 @@ fn date_preview<'a>(form: &Form, theme: &Theme, today: NaiveDate) -> Line<'a> {
             theme.muted,
         ),
         Err(_) => (format!("{indent}? not a date yet"), theme.warn),
-    };
-    Line::from(Span::styled(text, Style::new().fg(color(slot))))
+    }
 }
 
-/// The muted line under the time field: the understood time, or how to type one.
-fn time_preview<'a>(form: &Form, theme: &Theme) -> Line<'a> {
+/// The muted text under the time field: the understood time, or how to type one.
+/// Returned as (text, color slot); the caller wraps it to fit.
+fn time_preview(form: &Form, theme: &Theme) -> (String, Rgb) {
     let indent = " ".repeat(14);
-    let (text, slot) = match parse_time_input(&form.time_text) {
+    match parse_time_input(&form.time_text) {
         Ok(Some(time)) => (
             format!("{indent}→ {}", format_time(time, form.prefs.time_format)),
             theme.ok,
@@ -874,16 +889,17 @@ fn time_preview<'a>(form: &Form, theme: &Theme) -> Line<'a> {
             theme.muted,
         ),
         Err(_) => (format!("{indent}? not a time yet"), theme.warn),
-    };
-    Line::from(Span::styled(text, Style::new().fg(color(slot))))
+    }
 }
 
-/// A dim one-line list of keys at the bottom of a popup.
-fn hint_line<'a>(text: &'a str, theme: &Theme) -> Line<'a> {
-    Line::from(Span::styled(
-        format!("  {text}"),
+/// The dim list of keys at the bottom of a popup, wrapped onto more lines if it's too wide.
+fn hint_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    wrapped_lines(
+        &format!("  {text}"),
+        width,
+        2,
         Style::new().fg(color(theme.muted)),
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -1135,6 +1151,105 @@ mod tests {
         let form = Form::edit(&item, FormPrefs::default());
         assert_eq!(form.repeat_choice, PICK_DAYS);
         assert_eq!(form.validate(today()).unwrap().repeat, item.repeat);
+    }
+
+    /// Renders the dialog at each test width and checks that every expected text is complete.
+    fn assert_dialog_shows(form: &Form, expected: &[&str]) {
+        use crate::ui::test_support::{WIDTHS, assert_shows, screen_text};
+        use zerohour_core::theme::THEMES;
+        for width in WIDTHS {
+            let screen = screen_text(width, 50, |frame| {
+                draw(frame, form, &THEMES[0], IconMode::Unicode, today());
+            });
+            assert_shows(&screen, width, expected);
+        }
+    }
+
+    #[test]
+    fn choose_kind_step_is_never_cut_off() {
+        assert_dialog_shows(
+            &Form::new_add(FormPrefs::default()),
+            &[
+                "Something to do, optionally with a due date.",
+                "A date to count down to, like a birthday or holiday.",
+                "Tab switch · Enter continue · t/e pick · Esc cancel",
+            ],
+        );
+    }
+
+    #[test]
+    fn task_form_labels_previews_and_hints_are_never_cut_off() {
+        let mut form = task_form();
+        assert_dialog_shows(
+            &form,
+            &[
+                "Title",
+                "Priority",
+                "Due date",
+                "Due time",
+                "Repeat",
+                "Notes",
+                "e.g. 12/25, 2026-12-25, +3d, +2w, tomorrow, fri",
+                "e.g. 2pm, 2:30 pm, 14:30 (empty = any time that day)",
+                "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
+            ],
+        );
+        focus_on(&mut form, Field::Date);
+        assert_dialog_shows(
+            &form,
+            &["Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel"],
+        );
+        // A long error message.
+        form.error = parse_date_input("not a date at all", today()).err();
+        let message = form.error.clone().unwrap();
+        assert_dialog_shows(&form, &[message.as_str()]);
+    }
+
+    #[test]
+    fn repeat_and_weekday_rows_are_never_cut_off() {
+        let mut form = task_form();
+        form.repeat_choice = PICK_DAYS;
+        form.days = DaySet::MON_THU;
+        form.date_text = "sat".into();
+        focus_on(&mut form, Field::Days);
+        assert_dialog_shows(
+            &form,
+            &[
+                "Days",
+                "‹ ›Su [x]Mo [x]Tu [x]We [x]Th [ ]Fr [ ]Sa",
+                "→ Sat isn't a repeat day: saves as Mon Oct 12",
+                "↑↓ move · ←→ day · Space on/off · Enter save · Esc cancel",
+            ],
+        );
+        form.repeat_choice = CUSTOM;
+        assert_dialog_shows(&form, &["Every", "Unit"]);
+    }
+
+    #[test]
+    fn event_form_is_never_cut_off() {
+        let mut form = task_form();
+        form.kind = Kind::Event;
+        focus_on(&mut form, Field::KeepAfterPass);
+        assert_dialog_shows(
+            &form,
+            &["Keep after", "[ ] show after the date passes", "Date"],
+        );
+    }
+
+    #[test]
+    fn calendar_over_the_form_is_never_cut_off() {
+        let mut form = task_form();
+        focus_on(&mut form, Field::Date);
+        form.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE), today());
+        assert_dialog_shows(
+            &form,
+            &[
+                "October 2026",
+                "Su Mo Tu We Th Fr Sa",
+                "←→↑↓/hjkl day · PgUp/Dn month",
+                "t today · w week: Su · ⏎ pick",
+            ],
+        );
     }
 
     #[test]
