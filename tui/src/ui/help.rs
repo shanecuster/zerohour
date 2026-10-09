@@ -22,6 +22,7 @@ const KEYS: &[(&str, &str)] = &[
     ("p", "show/hide one-off events that have passed"),
     ("v", "layout: split 50/50 ↔ events fit their content"),
     ("T", "times: 12-hour ↔ 24-hour"),
+    ("b", "title banner on/off (shows at 30+ rows)"),
     ("Tab / s", "switch to stats and back"),
     ("t", "theme picker (live preview)"),
     ("i", "icons: Nerd Font → Unicode → ASCII"),
@@ -42,7 +43,7 @@ const SYNC_KEYS: &[(&str, &str)] = &[];
 /// Draws the help popup.
 pub fn draw(frame: &mut Frame, theme: &Theme, icons: IconMode) {
     // Sync builds list extra keys, so the popup is a bit taller there.
-    let height = if cfg!(feature = "sync") { 32 } else { 30 };
+    let height = if cfg!(feature = "sync") { 33 } else { 31 };
     let area = centered(frame.area(), 72, height);
     let block = popup_block(" Help ", theme, color(theme.accent));
     let key_style = Style::new()

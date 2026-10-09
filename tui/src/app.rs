@@ -156,6 +156,9 @@ pub struct App {
     pub show_passed: bool,
     /// Split 50/50 or fit-to-content (toggled with `v`, saved in settings).
     pub layout: LayoutMode,
+    /// Show the big title banner when the screen has room (toggled with `b`, saved in
+    /// settings; on unless switched off).
+    pub show_banner: bool,
     /// First day of the week in the date picker (switched with `w` in the picker).
     pub week_start: WeekStart,
     /// Where the date picker's day grid was last drawn, while it's open (for mouse clicks).
@@ -200,6 +203,8 @@ impl App {
 
         // Read before `db` moves into the struct below (after a move, `db` can't be used here).
         let layout = LayoutMode::parse(db.get_setting(settings_keys::LAYOUT)?.as_deref());
+        // Anything but an explicit "off" (including nothing saved yet) means on.
+        let show_banner = db.get_setting(settings_keys::BANNER)?.as_deref() != Some("off");
         let week_start = WeekStart::parse(db.get_setting(settings_keys::WEEK_START)?.as_deref());
         let time_format = TimeFormat::parse(db.get_setting(settings_keys::TIME_FORMAT)?.as_deref());
 
@@ -221,6 +226,7 @@ impl App {
             status: None,
             show_passed: false,
             layout,
+            show_banner,
             week_start,
             calendar_grid: None,
             should_quit: false,
@@ -533,6 +539,19 @@ impl App {
                         title: item.title.clone(),
                     };
                 }
+            }
+            Action::ToggleBanner => {
+                self.show_banner = !self.show_banner;
+                self.db.set_setting(
+                    settings_keys::BANNER,
+                    if self.show_banner { "on" } else { "off" },
+                )?;
+                // Say when it's on but can't show, so the key never seems to do nothing.
+                self.set_status(if self.show_banner {
+                    "Banner on (shows when the terminal is 30+ rows tall and not narrow)"
+                } else {
+                    "Banner off"
+                });
             }
             Action::ToggleTimeFormat => {
                 self.time_format = self.time_format.toggled();

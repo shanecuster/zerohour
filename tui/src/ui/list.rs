@@ -17,6 +17,7 @@
 //!
 //! **Banner**: on tall screens (30+ rows, not narrow), a big "zerohour" title and a
 //! next-event tagline sit above the Tasks box (see `banner.rs`); the boxes share what's left.
+//! `b` switches it off and on (saved in settings).
 //!
 //! **Layout** (`v` toggles, saved in settings): *split* gives Tasks and Events equal halves of
 //! the height (the default); *fit* sizes the Events box to its rows and gives Tasks the rest.
@@ -63,8 +64,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
         .and_then(|item| item.notes.clone())
         .filter(|n| !n.is_empty());
     let notes_height = u16::from(notes.is_some());
-    // The banner takes its rows first, when the screen is big enough for it.
-    let banner_height = if banner::fits(area.width, area.height, app.icon_mode) {
+    // The banner takes its rows first, when it's switched on and the screen has room.
+    let banner_height = if app.show_banner && banner::fits(area.width, area.height, app.icon_mode) {
         banner::height(app.icon_mode)
     } else {
         0
