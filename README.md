@@ -5,7 +5,11 @@ A terminal to-do list with built-in countdowns, written in Rust with [Ratatui](h
 Track **tasks** (things to do) and **events** (dates to count down to) in one clean, themeable TUI.
 Add Christmas once and it counts down every year: after the date passes, it rolls over to the next one automatically.
 
-> **Status:** early development. Screenshots coming soon.
+![The zerohour main screen with demo data: a gradient "ZEROHOUR" title banner with a tagline counting down to the next event, a Tasks section, and an Events section with countdowns](docs/screenshots/full-app-display.png)
+
+*The main screen (demo data): the title banner with a tagline counting down to the next event, tasks on top (an overdue one in red, and one due later today with a set time and the hours remaining), and upcoming events with their countdowns below.*
+
+> **Status:** early development.
 
 ## Features
 
@@ -22,6 +26,32 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
 - **Local-first.** Your data lives in a single SQLite file on your machine.
 - **Optional sync** between devices through your own CouchDB server. Off by default, and left out of the build unless you ask for it.
+
+## Screenshots
+
+![The Tasks section: tasks with priority markers and due dates, an overdue task in red, a task due later today with a set time and the hours remaining, repeating tasks marked with a circular arrow, and a task with no date](docs/screenshots/tasks.png)
+
+*Tasks, sorted by priority (↑ high, ● medium, ↓ low) and then due date. An overdue task is marked ⚠ and shown in red; a task due later today shows its time and the hours remaining; a task due later in the week shows its time and the days remaining; repeating tasks are marked ↻. A task without a due date simply has no date.*
+
+![The Events section: events with their dates and day countdowns, some marked as repeating monthly or yearly](docs/screenshots/events.png)
+
+*Events count down to their date in days, soonest first. Repeating events show how they repeat (↻ monthly, ↻ yearly) and roll over to the next date on their own.*
+
+![The Add dialog with two choices, Task ("Something to do, optionally with a due date.") and Event ("A date to count down to, like a birthday or holiday.")](docs/screenshots/add-task-or-event.png)
+
+*Adding something starts with one choice: a task or an event.*
+
+![The New task form with fields for title, priority, due date, due time, repeat, and notes, and example formats under the date and time fields](docs/screenshots/new-task-display.png)
+
+*The new-task form. Under the due date and due time, hints show what you can type (12/25, +3d, tomorrow, 2pm, 14:30...); they wrap onto a second line when the dialog is narrow.*
+
+![The statistics screen: summary cards for completed tasks, streak, overdue tasks, and on-time rate, a bar chart of completions for each of the last 12 weeks, and a breakdown by priority](docs/screenshots/statistics.png)
+
+*Statistics: completed tasks (all time, this week, this month), the current and best streak, overdue tasks, the on-time rate, a bar chart of completions for each of the last 12 weeks, and a breakdown by priority.*
+
+![The theme picker listing Everforest, Dracula, Gruvbox, Catppuccin, Nord, Solarized, and Tokyo Night, each with color swatches](docs/screenshots/theme-switcher.png)
+
+*The theme picker previews each theme live as you move through the list.*
 
 ## Install
 
