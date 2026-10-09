@@ -48,6 +48,11 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 - Sync: items with a due time or a weekday repeat are written as document version 2; older builds skip
   only those items. Everything else stays version 1.
 
+### Fixed
+
+- In the task list, a long timed due label ("today 12:00 PM · in 11h") no longer runs into the
+  priority after it: the due column keeps one blank column after its widest label.
+
 ## [0.1.0] - 2026-10-08
 
 ### Added
