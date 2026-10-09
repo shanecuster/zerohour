@@ -5,7 +5,11 @@ A terminal to-do list with built-in countdowns, written in Rust with [Ratatui](h
 Track **tasks** (things to do) and **events** (dates to count down to) in one clean, themeable TUI.
 Add Christmas once and it counts down every year: after the date passes, it rolls over to the next one automatically.
 
-> **Status:** early development. Screenshots coming soon.
+![The zerohour main screen with demo data](docs/screenshots/full-app-display.png)
+
+*The main screen (demo data): the title banner with a countdown to the next event, tasks on top with an overdue one in red and one due at 4:00 PM, and upcoming events below.*
+
+> **Status:** early development.
 
 ## Features
 
@@ -22,6 +26,28 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
 - **Local-first.** Your data lives in a single SQLite file on your machine.
 - **Optional sync** between devices through your own CouchDB server. Off by default, and left out of the build unless you ask for it.
+
+## Screenshots
+
+<img src="docs/screenshots/tasks-and-events.png" alt="Tasks and Events sections" width="260">
+
+*Tasks and events each get their own section, color, and marker; repeating items show a ↻.*
+
+![Choosing between a task and an event](docs/screenshots/add-task-or-event.png)
+
+*Adding something starts with one choice: a task or an event.*
+
+![The new task form](docs/screenshots/new-task-display.png)
+
+*The new-task form, with hints for the dates and times you can type.*
+
+![The statistics screen](docs/screenshots/statistics.png)
+
+*Statistics: completed tasks, current streak, overdue count, on-time rate, and completions per week.*
+
+![The theme picker](docs/screenshots/theme-switcher.png)
+
+*The theme picker previews each theme live as you move through the list.*
 
 ## Install
 
