@@ -37,6 +37,9 @@ pub enum Action {
     TogglePassed,
     /// Show the help overlay.
     Help,
+    /// Open the sync settings (only in builds with the `sync` feature).
+    #[cfg(feature = "sync")]
+    SyncSettings,
     /// Leave the app.
     Quit,
 }
@@ -64,6 +67,10 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('i') => Action::CycleIcons,
         KeyCode::Char('p') => Action::TogglePassed,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
+        // `#[cfg]` on a match arm: in local-only builds this key simply does nothing, exactly
+        // as before sync existed.
+        #[cfg(feature = "sync")]
+        KeyCode::Char('c') => Action::SyncSettings,
         // Esc deliberately does NOT quit: it's the "close this popup" key, and pressing it
         // one time too many shouldn't exit the app.
         KeyCode::Char('q') => Action::Quit,

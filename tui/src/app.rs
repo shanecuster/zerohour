@@ -23,7 +23,11 @@ use zerohour_core::stats::{self, Stats};
 use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
 
 use crate::input::{Action, main_action};
+#[cfg(feature = "sync")]
+use crate::sync::{Job, SyncUi, WorkerMsg};
 use crate::ui::add::{Form, FormData, FormOutcome};
+#[cfg(feature = "sync")]
+use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
 
 /// Which full screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +60,9 @@ pub enum Overlay {
     },
     /// First-run "do you see this icon?" question.
     IconCheck,
+    /// The sync settings popup (only in builds with the `sync` feature).
+    #[cfg(feature = "sync")]
+    SyncSettings(SyncForm),
 }
 
 /// A one-line message shown on the bottom border (e.g. "Done: Pay rent").
@@ -106,11 +113,26 @@ pub struct App {
     pub should_quit: bool,
     /// Running with `--demo` (in-memory data, nothing is saved).
     pub demo: bool,
+    /// Sync settings, status and background jobs (only with the `sync` feature).
+    #[cfg(feature = "sync")]
+    pub sync: SyncUi,
+    /// Show a status message when the running sync finishes successfully. True for syncs
+    /// you asked for; false for the quiet one at startup (errors are always shown).
+    #[cfg(feature = "sync")]
+    announce_sync: bool,
 }
 
 impl App {
     /// Builds the app from an open database: loads settings, then the lists.
-    pub fn new(db: Db, demo: bool) -> Result<App> {
+    ///
+    /// `db_path` is the database file (for sync's background connection); `None` in demo
+    /// mode, which never syncs.
+    pub fn new(db: Db, demo: bool, db_path: Option<std::path::PathBuf>) -> Result<App> {
+        // Local-only builds have no use for the path. `let _ =` marks it as deliberately unused.
+        #[cfg(not(feature = "sync"))]
+        let _ = db_path;
+        #[cfg(feature = "sync")]
+        let sync = SyncUi::new(&db, db_path)?;
         let theme = theme_by_name(&db.get_setting(settings_keys::THEME)?.unwrap_or_default());
         // No saved icon mode means this is the first run: ask whether Nerd Font icons show up.
         let saved_icons = db.get_setting(settings_keys::ICON_MODE)?;
@@ -141,6 +163,10 @@ impl App {
             show_passed: false,
             should_quit: false,
             demo,
+            #[cfg(feature = "sync")]
+            sync,
+            #[cfg(feature = "sync")]
+            announce_sync: false,
         };
         if demo {
             app.set_status("Demo mode: sample data, nothing is saved. Press ? for help.");
@@ -211,8 +237,9 @@ impl App {
         Ok(())
     }
 
-    /// Called about once a second by the main loop. If the date changed (we passed midnight),
-    /// reload so countdowns update and repeating events roll over.
+    /// Called by the main loop after every key and at least once a second. If the date
+    /// changed (we passed midnight), reload so countdowns update and repeating events roll
+    /// over. With sync, also picks up results from the background worker.
     pub fn tick(&mut self) {
         let today = local_today();
         if today != self.today {
@@ -221,6 +248,20 @@ impl App {
                 self.set_error(e);
             }
         }
+        #[cfg(feature = "sync")]
+        if let Err(e) = self.poll_sync() {
+            self.set_error(e);
+        }
+    }
+
+    /// How long the main loop may wait for a key before calling [`App::tick`] again.
+    /// Short while a sync job runs, so its result shows up promptly.
+    pub fn poll_interval(&self) -> std::time::Duration {
+        #[cfg(feature = "sync")]
+        if self.sync.busy() {
+            return std::time::Duration::from_millis(200);
+        }
+        std::time::Duration::from_secs(1)
     }
 
     /// Entry point for every key press. Errors become a status message instead of a crash.
@@ -290,6 +331,12 @@ impl App {
                 self.overlay = Overlay::None;
                 return Ok(());
             }
+            #[cfg(feature = "sync")]
+            Overlay::SyncSettings(form) => {
+                let outcome = form.handle_key(key);
+                self.sync_form_outcome(outcome)?;
+                return Ok(());
+            }
         }
 
         // No popup open: translate the key into an action for the current screen.
@@ -331,6 +378,11 @@ impl App {
             }
             Action::Help => {
                 self.overlay = Overlay::Help;
+                return Ok(());
+            }
+            #[cfg(feature = "sync")]
+            Action::SyncSettings => {
+                self.open_sync_settings();
                 return Ok(());
             }
             _ => {}
@@ -380,6 +432,8 @@ impl App {
             | Action::Theme
             | Action::CycleIcons
             | Action::Help => {}
+            #[cfg(feature = "sync")]
+            Action::SyncSettings => {}
         }
         Ok(())
     }
@@ -469,6 +523,151 @@ impl App {
                 self.set_status(format!("Done: \"{title}\". Next one due {due}"));
             }
             None => self.set_status(format!("Done: \"{title}\"")),
+        }
+        Ok(())
+    }
+
+    /// Opens the sync settings popup and asks the worker where passwords are stored.
+    #[cfg(feature = "sync")]
+    fn open_sync_settings(&mut self) {
+        if self.sync.db_path.is_none() {
+            self.set_status("Sync is off in demo mode, so sample data never reaches your server.");
+            return;
+        }
+        self.overlay = Overlay::SyncSettings(SyncForm::new(&self.sync.settings));
+        self.sync.test_result = None;
+        let settings = self.sync.settings.clone();
+        self.sync.start(Job::Probe, settings);
+    }
+
+    /// Acts on what the user did in the sync settings popup.
+    #[cfg(feature = "sync")]
+    fn sync_form_outcome(&mut self, outcome: SyncFormOutcome) -> Result<()> {
+        match outcome {
+            SyncFormOutcome::Continue => {}
+            SyncFormOutcome::Close => self.overlay = Overlay::None,
+            SyncFormOutcome::Save { settings, password } => {
+                if self.sync.busy() {
+                    self.sync_form_message(
+                        "A sync job is still running; try again in a moment.",
+                        true,
+                    );
+                    return Ok(());
+                }
+                settings.save(&self.db)?;
+                self.sync.settings_changed(settings.clone(), &self.db)?;
+                if !settings.enabled {
+                    // Switching off also clears the header indicator (`SyncUi::visible`).
+                    self.sync_form_message(
+                        "Saved. Sync is off: this device stays local-only.",
+                        false,
+                    );
+                }
+                if password.is_some() || settings.enabled {
+                    if settings.enabled {
+                        self.sync_form_message("Saved. Syncing…", false);
+                        self.announce_sync = true;
+                    }
+                    let then_sync = settings.enabled;
+                    self.sync.start(
+                        Job::Save {
+                            password,
+                            then_sync,
+                        },
+                        settings,
+                    );
+                }
+            }
+            SyncFormOutcome::Test { settings, password } => {
+                self.sync.test_result = None;
+                if !self.sync.start(Job::Test { password }, settings) {
+                    self.sync_form_message(
+                        "A sync job is still running; try again in a moment.",
+                        true,
+                    );
+                } else {
+                    self.sync_form_message("Testing…", false);
+                }
+            }
+            SyncFormOutcome::Reset => {
+                if self.sync.busy() {
+                    self.sync_form_message("A sync is running; reset when it's done.", true);
+                    return Ok(());
+                }
+                self.db.clear_sync_state()?;
+                self.sync.synced_docs = 0;
+                self.sync_form_message(
+                    "Sync state reset. Your data is untouched; the next sync re-checks everything.",
+                    false,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Shows a message inside the sync settings popup, if it's open.
+    #[cfg(feature = "sync")]
+    fn sync_form_message(&mut self, text: &str, is_error: bool) {
+        if let Overlay::SyncSettings(form) = &mut self.overlay {
+            form.message = Some((text.to_string(), is_error));
+        }
+    }
+
+    /// Reads results from the background sync worker and reacts to them.
+    #[cfg(feature = "sync")]
+    fn poll_sync(&mut self) -> Result<()> {
+        for message in self.sync.poll() {
+            match message {
+                WorkerMsg::Synced(Ok(report)) => {
+                    // Other devices' changes are in the file now; show them.
+                    self.refresh()?;
+                    self.sync.synced_docs = self.db.synced_doc_count()?;
+                    let skew = report.clock_skew_secs.map(|s| {
+                        format!(
+                            " ⚠ This clock is {} min off the server's; fix it so the newest edit wins.",
+                            (s.abs() + 59) / 60
+                        )
+                    });
+                    if self.announce_sync || skew.is_some() {
+                        self.set_status(format!(
+                            "Synced: {} in, {} out.{}",
+                            report.pulled,
+                            report.pushed,
+                            skew.unwrap_or_default()
+                        ));
+                    }
+                    if report.skipped_newer > 0 {
+                        self.set_error(anyhow::anyhow!(
+                            "{} synced item(s) need a newer zerohour; update this device.",
+                            report.skipped_newer
+                        ));
+                    }
+                    self.sync_form_message("Saved and synced.", false);
+                    self.announce_sync = false;
+                }
+                WorkerMsg::Synced(Err(error)) => {
+                    // Shown in the header too; the status line says why.
+                    let text = format!("Sync: {error}");
+                    self.sync_form_message(&text, !error.is_offline());
+                    if error.is_offline() {
+                        self.set_status(text);
+                    } else {
+                        self.set_error(anyhow::anyhow!(text));
+                    }
+                    self.announce_sync = false;
+                }
+                WorkerMsg::PasswordSaved => self.sync_form_message("Password saved.", false),
+                WorkerMsg::Failed(text) => self.sync_form_message(&text, true),
+                // The result itself is stored in `self.sync.test_result`, which the popup draws;
+                // clear the "Testing…" message so it doesn't cover the result.
+                WorkerMsg::Tested(_) => {
+                    if let Overlay::SyncSettings(form) = &mut self.overlay {
+                        form.message = None;
+                    }
+                }
+                // Only updates `self.sync`, which the popup draws from directly.
+                WorkerMsg::Storage { .. } => {}
+            }
         }
         Ok(())
     }

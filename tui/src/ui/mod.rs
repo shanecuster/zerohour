@@ -11,6 +11,7 @@
 //! - [`stats`]    — the stats screen with the weekly bar chart.
 //! - [`settings`] — the theme picker and the first-run icon check.
 //! - [`help`]     — the `?` help overlay.
+//! - `sync_settings` — the sync settings popup (only with the `sync` feature).
 //!
 //! This file has the entry point [`draw`] plus small helpers every screen uses.
 
@@ -19,6 +20,8 @@ pub mod help;
 pub mod list;
 pub mod settings;
 pub mod stats;
+#[cfg(feature = "sync")]
+pub mod sync_settings;
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
@@ -62,6 +65,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Overlay::ConfirmDelete { title, .. } => settings::draw_confirm_delete(frame, theme, title),
         Overlay::IconCheck => settings::draw_icon_check(frame, theme),
+        #[cfg(feature = "sync")]
+        Overlay::SyncSettings(form) => {
+            sync_settings::draw(frame, form, &app.sync, theme, app.icon_mode);
+        }
     }
 }
 
@@ -92,11 +99,19 @@ pub fn screen_block<'a>(app: &'a App, subtitle: &'a str) -> Block<'a> {
         Span::styled(subtitle, Style::new().fg(color(theme.muted))),
         Span::raw(" "),
     ]);
-    let date = Line::from(Span::styled(
+    // Right side of the top border: the sync indicator (sync builds, when switched on), then
+    // the date. `mut` is only needed in sync builds, hence the `allow`.
+    #[allow(unused_mut)]
+    let mut right: Vec<Span> = Vec::new();
+    #[cfg(feature = "sync")]
+    if let Some(indicator) = sync_indicator(app) {
+        right.push(indicator);
+    }
+    right.push(Span::styled(
         format!(" {} ", app.today.format("%a %b %d %Y")),
         Style::new().fg(color(theme.muted)),
-    ))
-    .alignment(Alignment::Right);
+    ));
+    let date = Line::from(right).alignment(Alignment::Right);
 
     let mut block = Block::bordered()
         .border_type(BorderType::Rounded)
@@ -118,6 +133,45 @@ pub fn screen_block<'a>(app: &'a App, subtitle: &'a str) -> Block<'a> {
         );
     }
     block
+}
+
+/// The small sync status in the header: never synced / syncing / synced 14:03 / offline /
+/// sync error. `None` (nothing drawn) when sync is switched off, so a local-only setup looks
+/// exactly as it always did.
+#[cfg(feature = "sync")]
+fn sync_indicator(app: &App) -> Option<Span<'static>> {
+    use crate::sync::SyncState;
+    use zerohour_core::icons::Icon;
+
+    if !app.sync.visible() {
+        return None;
+    }
+    let theme = app.theme;
+    let (icon, text, slot) = match &app.sync.state {
+        SyncState::Never => (Icon::Sync, "never synced".to_string(), theme.muted),
+        SyncState::Syncing => (Icon::Sync, "syncing…".to_string(), theme.accent),
+        SyncState::Synced(time) => {
+            let local = time.with_timezone(&chrono::Local);
+            // Today: just the time. Earlier: the date, so a stale sync is obvious.
+            let when = if local.date_naive() == app.today {
+                local.format("%H:%M").to_string()
+            } else {
+                local.format("%b %d").to_string()
+            };
+            let slot = if app.sync.clock_skew_secs.is_some() {
+                theme.warn
+            } else {
+                theme.ok
+            };
+            (Icon::Synced, format!("synced {when}"), slot)
+        }
+        SyncState::Offline => (Icon::Offline, "offline".to_string(), theme.warn),
+        SyncState::Error(_) => (Icon::SyncError, "sync error".to_string(), theme.danger),
+    };
+    Some(Span::styled(
+        format!(" {} {text} ·", icon.get(app.icon_mode)),
+        Style::new().fg(color(slot)),
+    ))
 }
 
 /// A bordered popup box with a title, in the given border color.

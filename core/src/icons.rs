@@ -82,6 +82,14 @@ pub enum Icon {
     Stats,
     /// The settings / theme picker.
     Settings,
+    /// Sync in progress (and the generic "sync" marker).
+    Sync,
+    /// Last sync succeeded.
+    Synced,
+    /// Last sync failed.
+    SyncError,
+    /// The sync server couldn't be reached.
+    Offline,
 }
 
 impl Icon {
@@ -104,6 +112,10 @@ impl Icon {
             Icon::Overdue => ("\u{f071}", "!", "!"),     // nf-fa-exclamation_triangle
             Icon::Stats => ("\u{f080}", "▤", "#"),       // nf-fa-bar_chart
             Icon::Settings => ("\u{f013}", "≡", "*"),    // nf-fa-cog
+            Icon::Sync => ("\u{f021}", "⇅", "<>"),       // nf-fa-refresh
+            Icon::Synced => ("\u{f0c2}", "✓", "ok"),     // nf-fa-cloud
+            Icon::SyncError => ("\u{f06a}", "✗", "!!"),  // nf-fa-exclamation_circle
+            Icon::Offline => ("\u{f127}", "○", "--"),    // nf-fa-chain_broken
         }
     }
 
@@ -133,7 +145,7 @@ pub fn priority_icon(priority: crate::model::Priority) -> Icon {
 mod tests {
     use super::*;
 
-    const ALL_ICONS: [Icon; 10] = [
+    const ALL_ICONS: [Icon; 14] = [
         Icon::Task,
         Icon::Done,
         Icon::Event,
@@ -144,6 +156,10 @@ mod tests {
         Icon::Overdue,
         Icon::Stats,
         Icon::Settings,
+        Icon::Sync,
+        Icon::Synced,
+        Icon::SyncError,
+        Icon::Offline,
     ];
 
     #[test]
