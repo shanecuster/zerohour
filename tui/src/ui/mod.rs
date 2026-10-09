@@ -8,6 +8,7 @@
 //! Submodules:
 //! - [`list`]     — the main screen: Tasks section above, Events section below.
 //! - [`add`]      — the add/edit dialog (also owns that dialog's state and keys).
+//! - [`calendar`] — the month-grid date picker that opens over the add/edit dialog.
 //! - [`stats`]    — the stats screen with the weekly bar chart.
 //! - [`settings`] — the theme picker and the first-run icon check.
 //! - [`help`]     — the `?` help overlay.
@@ -16,6 +17,7 @@
 //! This file has the entry point [`draw`] plus small helpers every screen uses.
 
 pub mod add;
+pub mod calendar;
 pub mod help;
 pub mod list;
 pub mod settings;

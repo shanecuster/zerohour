@@ -15,6 +15,7 @@ use anyhow::Result;
 use chrono::{Local, NaiveDate, Utc};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::TableState;
+use zerohour_core::calendar::WeekStart;
 use zerohour_core::db::{Db, settings_keys};
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
@@ -146,6 +147,8 @@ pub struct App {
     pub show_passed: bool,
     /// Split 50/50 or fit-to-content (toggled with `v`, saved in settings).
     pub layout: LayoutMode,
+    /// First day of the week in the date picker (switched with `w` in the picker).
+    pub week_start: WeekStart,
     /// Set to true to leave the main loop.
     pub should_quit: bool,
     /// Running with `--demo` (in-memory data, nothing is saved).
@@ -185,6 +188,7 @@ impl App {
 
         // Read before `db` moves into the struct below (after a move, `db` can't be used here).
         let layout = LayoutMode::parse(db.get_setting(settings_keys::LAYOUT)?.as_deref());
+        let week_start = WeekStart::parse(db.get_setting(settings_keys::WEEK_START)?.as_deref());
 
         let mut app = App {
             db,
@@ -202,6 +206,7 @@ impl App {
             status: None,
             show_passed: false,
             layout,
+            week_start,
             should_quit: false,
             demo,
             #[cfg(feature = "sync")]
@@ -342,6 +347,11 @@ impl App {
                         self.overlay = Overlay::None;
                         self.save_form(data)?;
                     }
+                    FormOutcome::WeekStartChanged(start) => {
+                        self.week_start = start;
+                        self.db
+                            .set_setting(settings_keys::WEEK_START, start.as_str())?;
+                    }
                 }
                 return Ok(());
             }
@@ -455,10 +465,10 @@ impl App {
             }
             Action::Top => self.selected = 0,
             Action::Bottom => self.selected = rows.saturating_sub(1),
-            Action::Add => self.overlay = Overlay::Form(Form::new_add()),
+            Action::Add => self.overlay = Overlay::Form(Form::new_add(self.week_start)),
             Action::Edit => {
                 if let Some(item) = self.selected_item() {
-                    self.overlay = Overlay::Form(Form::edit(item));
+                    self.overlay = Overlay::Form(Form::edit(item, self.week_start));
                 }
             }
             Action::Complete => self.complete_selected()?,

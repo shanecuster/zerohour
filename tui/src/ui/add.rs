@@ -8,6 +8,9 @@
 //!
 //! Editing skips step 1 (an item's kind can't change) and starts with the fields pre-filled.
 //!
+//! The date field also has a month-grid picker (Ctrl+D or F2, see `calendar.rs`); typing a
+//! date still works.
+//!
 //! This file holds the form's *state* ([`Form`]), its *key handling* ([`Form::handle_key`]), and
 //! its *drawing* ([`draw`]). The app only sees the result: [`FormOutcome::Save`] with a
 //! validated [`FormData`], or `Cancel`.
@@ -18,11 +21,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
+use zerohour_core::calendar::WeekStart;
 use zerohour_core::icons::{Icon, IconMode};
 use zerohour_core::model::{Item, Kind, Priority, RepeatRule, Unit};
 use zerohour_core::repeat::{days_until, parse_date_input};
 use zerohour_core::theme::Theme;
 
+use super::calendar::{self, Calendar, CalendarOutcome};
 use super::{centered, color, popup_block, tail_fit};
 
 /// The repeat options shown in the form, in cycling order. The last one ("custom") reveals the
@@ -110,6 +115,9 @@ pub enum FormOutcome {
     Cancel,
     /// User pressed Enter and everything was valid: save this.
     Save(FormData),
+    /// The user switched the calendar's first day of the week; the app saves the setting.
+    /// The form stays open.
+    WeekStartChanged(WeekStart),
 }
 
 /// The whole state of the add/edit dialog.
@@ -135,11 +143,16 @@ pub struct Form {
     pub focus: usize,
     /// Validation message shown at the bottom (cleared on the next key press).
     pub error: Option<String>,
+    /// The date picker, while it's open over the form.
+    pub calendar: Option<Calendar>,
+    /// First day of the week for the date picker (from settings).
+    pub week_start: WeekStart,
 }
 
 impl Form {
     /// A blank form for adding something new (starts at the Task/Event choice).
-    pub fn new_add() -> Form {
+    /// `week_start` is the saved first day of the week, for the date picker.
+    pub fn new_add(week_start: WeekStart) -> Form {
         Form {
             step: Step::ChooseKind,
             kind: Kind::Task,
@@ -154,12 +167,14 @@ impl Form {
             notes: String::new(),
             focus: 0,
             error: None,
+            calendar: None,
+            week_start,
         }
     }
 
     /// A form pre-filled from an existing item, for editing (skips the Task/Event step).
-    pub fn edit(item: &Item) -> Form {
-        let mut form = Form::new_add();
+    pub fn edit(item: &Item, week_start: WeekStart) -> Form {
+        let mut form = Form::new_add(week_start);
         form.step = Step::Fields;
         form.kind = item.kind;
         form.editing = Some(item.id.clone());
@@ -219,6 +234,23 @@ impl Form {
     /// Handles one key press. `today` is needed to validate dates on save.
     pub fn handle_key(&mut self, key: KeyEvent, today: NaiveDate) -> FormOutcome {
         self.error = None;
+        // While the date picker is open, it gets every key (Esc closes only the picker).
+        if let Some(calendar) = &mut self.calendar {
+            match calendar.handle_key(key, today) {
+                CalendarOutcome::Continue => {}
+                CalendarOutcome::Cancel => self.calendar = None,
+                CalendarOutcome::Pick(date) => {
+                    // ISO form: unambiguous, and exactly what editing shows too.
+                    self.date_text = date.format("%Y-%m-%d").to_string();
+                    self.calendar = None;
+                }
+                CalendarOutcome::WeekStartChanged(start) => {
+                    self.week_start = start;
+                    return FormOutcome::WeekStartChanged(start);
+                }
+            }
+            return FormOutcome::Continue;
+        }
         if key.code == KeyCode::Esc {
             return FormOutcome::Cancel;
         }
@@ -280,6 +312,14 @@ impl Form {
             KeyCode::Right => self.cycle(field, true),
             KeyCode::Char(' ') if field == Field::KeepAfterPass => {
                 self.keep_after_pass = !self.keep_after_pass;
+            }
+            // Ctrl+D or F2 on the date field opens the month-grid picker, starting on the date
+            // typed so far (or today if it's empty or not a date yet).
+            KeyCode::Char('d') | KeyCode::F(2)
+                if field == Field::Date && (ctrl || key.code == KeyCode::F(2)) =>
+            {
+                let current = parse_date_input(&self.date_text, today).ok().flatten();
+                self.calendar = Some(Calendar::new(current, today, self.week_start));
             }
             // Ctrl+U clears the focused text field (same as in a shell).
             KeyCode::Char('u') if ctrl => {
@@ -404,6 +444,10 @@ pub fn draw(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMode, toda
         Step::ChooseKind => draw_choose_kind(frame, form, theme, icons),
         Step::Fields => draw_fields(frame, form, theme, today),
     }
+    // The date picker goes on top of the form.
+    if let Some(calendar) = &form.calendar {
+        calendar::draw(frame, calendar, theme, today);
+    }
 }
 
 /// Step 1: "Task or Event?"
@@ -514,10 +558,13 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         ))),
         None => lines.push(Line::default()),
     }
-    lines.push(hint_line(
-        "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
-        theme,
-    ));
+    // On the date field, mention the picker instead of the ←→ hint (which does nothing there).
+    let hint = if focused == Field::Date {
+        "Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel"
+    } else {
+        "Tab/↑↓ move · ←→ change · Enter save · Esc cancel"
+    };
+    lines.push(hint_line(hint, theme));
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -616,7 +663,7 @@ mod tests {
 
     #[test]
     fn tab_flips_kind_then_enter_shows_event_fields() {
-        let mut form = Form::new_add();
+        let mut form = Form::new_add(WeekStart::Sunday);
         assert_eq!(form.kind, Kind::Task);
         form.handle_key(key(KeyCode::Tab), today());
         assert_eq!(form.kind, Kind::Event);
@@ -629,7 +676,7 @@ mod tests {
 
     #[test]
     fn typing_a_task_and_saving() {
-        let mut form = Form::new_add();
+        let mut form = Form::new_add(WeekStart::Sunday);
         form.handle_key(key(KeyCode::Enter), today()); // Task
         type_text(&mut form, "Renew registration");
         form.handle_key(key(KeyCode::Tab), today()); // -> priority
@@ -649,7 +696,7 @@ mod tests {
 
     #[test]
     fn custom_repeat_reveals_every_n_fields() {
-        let mut form = Form::new_add();
+        let mut form = Form::new_add(WeekStart::Sunday);
         form.step = Step::Fields;
         form.title = "x".into();
         form.repeat_choice = CUSTOM;
@@ -670,7 +717,7 @@ mod tests {
 
     #[test]
     fn validation_errors() {
-        let mut form = Form::new_add();
+        let mut form = Form::new_add(WeekStart::Sunday);
         form.step = Step::Fields;
         assert!(form.validate(today()).is_err(), "empty title");
         form.title = "Party".into();
@@ -683,6 +730,45 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_d_opens_the_calendar_and_enter_fills_the_date() {
+        let mut form = Form::new_add(WeekStart::Sunday);
+        form.handle_key(key(KeyCode::Enter), today()); // Task
+        form.focus = form
+            .fields()
+            .iter()
+            .position(|f| *f == Field::Date)
+            .unwrap();
+        type_text(&mut form, "12/25");
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        form.handle_key(ctrl_d, today());
+        let calendar = form.calendar.as_ref().expect("picker open");
+        assert_eq!(
+            calendar.cursor,
+            NaiveDate::from_ymd_opt(2026, 12, 25).unwrap()
+        );
+
+        // Esc closes only the picker, then F2 reopens it; → and Enter pick Dec 26.
+        form.handle_key(key(KeyCode::Esc), today());
+        assert!(form.calendar.is_none());
+        assert_eq!(form.step, Step::Fields, "the form is still open");
+        form.handle_key(key(KeyCode::F(2)), today());
+        form.handle_key(key(KeyCode::Right), today());
+        form.handle_key(key(KeyCode::Enter), today());
+        assert!(form.calendar.is_none());
+        assert_eq!(form.date_text, "2026-12-26");
+    }
+
+    #[test]
+    fn plain_d_is_still_typed_and_the_picker_only_opens_on_the_date_field() {
+        let mut form = Form::new_add(WeekStart::Sunday);
+        form.handle_key(key(KeyCode::Enter), today());
+        type_text(&mut form, "dd"); // title field
+        assert_eq!(form.title, "dd");
+        form.handle_key(key(KeyCode::F(2)), today());
+        assert!(form.calendar.is_none(), "not on the title field");
+    }
+
+    #[test]
     fn edit_prefills_and_round_trips_repeat() {
         let mut item = Item::new(Kind::Event, "Xmas", chrono::Utc::now());
         item.date = NaiveDate::from_ymd_opt(2026, 12, 25);
@@ -690,7 +776,7 @@ mod tests {
             n: 2,
             unit: Unit::Months,
         };
-        let form = Form::edit(&item);
+        let form = Form::edit(&item, WeekStart::Sunday);
         assert_eq!(form.step, Step::Fields);
         let data = form.validate(today()).unwrap();
         assert_eq!(data.repeat, item.repeat);

@@ -6,6 +6,7 @@
 //! Module map:
 //! - [`model`]  — the data types: `Item` (a task or event), `Priority`, `RepeatRule`, `Completion`.
 //! - [`repeat`] — date math: next occurrence of a repeat, days-until countdowns, parsing typed dates.
+//! - [`calendar`] — month-grid math for the date picker (which date goes in which cell).
 //! - [`db`]     — SQLite storage: schema, migrations, create/read/update/delete, completion log.
 //! - [`stats`]  — statistics (streaks, per-week counts, overdue) computed from the completion log.
 //! - [`theme`]  — named color slots and the built-in palettes (Everforest, Dracula, ...).
@@ -15,6 +16,7 @@
 //! A Rust "crate" is a package; a "module" is one file (or folder) inside it. `pub mod x;`
 //! below tells the compiler "there is a file `x.rs`, and other crates may use what's public in it".
 
+pub mod calendar;
 pub mod db;
 pub mod icons;
 pub mod model;

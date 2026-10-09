@@ -121,6 +121,8 @@ pub mod settings_keys {
     /// Main screen layout: "split" (Tasks and Events share the height 50/50, the default) or
     /// "fit" (the Events box shrinks to its content).
     pub const LAYOUT: &str = "layout";
+    /// First day of the week in the calendar picker: "sunday" (default) or "monday".
+    pub const WEEK_START: &str = "week_start";
 }
 
 /// A handle to the open database. All storage goes through this.
