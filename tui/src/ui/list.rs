@@ -15,6 +15,9 @@
 //! Tasks and events each get their own color (theme `task` / `event` slots) AND their own
 //! marker icon, so color is never the only way to tell them apart.
 //!
+//! **Layout** (`v` toggles, saved in settings): *split* gives Tasks and Events equal halves of
+//! the height (the default); *fit* sizes the Events box to its rows and gives Tasks the rest.
+//!
 //! **Narrow mode** (under [`NARROW_WIDTH`] columns): the priority text, repeat label and date
 //! columns are dropped, countdowns get shorter ("3d"), and long titles end in `…`.
 
@@ -30,7 +33,7 @@ use zerohour_core::repeat::{days_until, is_overdue};
 use zerohour_core::theme::{Rgb, Theme};
 
 use super::{NARROW_WIDTH, color, screen_block, truncate, width_u16};
-use crate::app::{App, EventRow};
+use crate::app::{App, EventRow, LayoutMode};
 
 /// From this width up, an extra column shows the actual date ("Fri Dec 25").
 const DATE_COLUMN_WIDTH: u16 = 90;
@@ -49,16 +52,23 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
     let narrow = area.width < NARROW_WIDTH;
     let show_dates = area.width >= DATE_COLUMN_WIDTH;
 
-    // The Events box is sized to its rows (+2 for borders), but never more than half the
-    // space; Tasks get everything else. One line for notes of the selected item (if any),
-    // one line for the key hints.
-    let event_rows = app.events.len().max(1) as u16;
-    let events_height = (event_rows + 2).clamp(3, (inner.height / 2).max(3));
+    // One line for notes of the selected item (if any), one line for the key hints; the two
+    // section boxes share what's left according to the layout mode.
     let notes = app
         .selected_item()
         .and_then(|item| item.notes.clone())
         .filter(|n| !n.is_empty());
     let notes_height = u16::from(notes.is_some());
+    let sections_height = inner.height.saturating_sub(notes_height + 1);
+    let events_height = match app.layout {
+        LayoutMode::Split => split_heights(sections_height).1,
+        // Fit: the Events box is sized to its rows (+2 for borders), but never more than half
+        // the space; Tasks get everything else. (This is the original phase 1 layout.)
+        LayoutMode::Fit => {
+            let event_rows = app.events.len().max(1) as u16;
+            (event_rows + 2).clamp(3, (inner.height / 2).max(3))
+        }
+    };
 
     // `Layout::vertical(...).areas(rect)` splits a rectangle into rows. `Fill(1)` takes
     // whatever space is left after the fixed `Length`s.
@@ -85,6 +95,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &mut App) {
         );
     }
     draw_footer(frame, footer_area, app.theme, narrow);
+}
+
+/// Split layout: divides `height` lines into (tasks, events) halves. An odd line goes to Tasks.
+///
+/// Equal halves also give each box its minimum height whenever the screen can fit both: with
+/// at least 10 lines, each box gets at least 5 (3 rows plus its borders). On a smaller
+/// terminal the two still share equally, so neither disappears.
+fn split_heights(height: u16) -> (u16, u16) {
+    let events = height / 2;
+    (height - events, events)
 }
 
 /// The bordered box around one section, titled with its marker, name and item count.
@@ -425,4 +445,39 @@ fn draw_footer(frame: &mut Frame, area: Rect, theme: &Theme, narrow: bool) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smallest useful section box: 3 rows plus the top and bottom borders.
+    const MIN_SECTION_HEIGHT: u16 = 5;
+
+    #[test]
+    fn split_gives_equal_halves_with_the_odd_line_to_tasks() {
+        assert_eq!(split_heights(20), (10, 10));
+        assert_eq!(split_heights(21), (11, 10));
+        assert_eq!(split_heights(0), (0, 0));
+    }
+
+    #[test]
+    fn split_meets_the_minimum_whenever_both_fit() {
+        for height in 2 * MIN_SECTION_HEIGHT..200 {
+            let (tasks, events) = split_heights(height);
+            assert!(tasks >= MIN_SECTION_HEIGHT && events >= MIN_SECTION_HEIGHT);
+            assert_eq!(tasks + events, height);
+        }
+    }
+
+    #[test]
+    fn layout_setting_defaults_to_split() {
+        assert_eq!(LayoutMode::parse(None), LayoutMode::Split);
+        assert_eq!(LayoutMode::parse(Some("garbage")), LayoutMode::Split);
+        assert_eq!(LayoutMode::parse(Some("fit")), LayoutMode::Fit);
+        for mode in [LayoutMode::Split, LayoutMode::Fit] {
+            assert_eq!(LayoutMode::parse(Some(mode.as_str())), mode);
+            assert_eq!(mode.toggled().toggled(), mode);
+        }
+    }
 }

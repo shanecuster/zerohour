@@ -38,6 +38,41 @@ pub enum Screen {
     Stats,
 }
 
+/// How the main screen divides its height between the Tasks and Events boxes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// Equal halves (the default), so neither section gets squeezed.
+    Split,
+    /// The Events box is sized to its rows (up to half the screen); Tasks get the rest.
+    Fit,
+}
+
+impl LayoutMode {
+    /// The text saved in the settings table.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayoutMode::Split => "split",
+            LayoutMode::Fit => "fit",
+        }
+    }
+
+    /// Reads the saved text; anything unknown (or nothing saved) means the default, `Split`.
+    pub fn parse(s: Option<&str>) -> LayoutMode {
+        match s {
+            Some("fit") => LayoutMode::Fit,
+            _ => LayoutMode::Split,
+        }
+    }
+
+    /// The other mode (what `v` switches to).
+    pub fn toggled(self) -> LayoutMode {
+        match self {
+            LayoutMode::Split => LayoutMode::Fit,
+            LayoutMode::Fit => LayoutMode::Split,
+        }
+    }
+}
+
 /// Which popup (if any) is open on top of the screen. Only one at a time.
 ///
 /// Variants carry the popup's own state, e.g. the theme picker remembers the theme that was
@@ -109,6 +144,8 @@ pub struct App {
     pub status: Option<Status>,
     /// Also show one-off events whose date has passed (toggled with `p`).
     pub show_passed: bool,
+    /// Split 50/50 or fit-to-content (toggled with `v`, saved in settings).
+    pub layout: LayoutMode,
     /// Set to true to leave the main loop.
     pub should_quit: bool,
     /// Running with `--demo` (in-memory data, nothing is saved).
@@ -146,6 +183,9 @@ impl App {
             Overlay::None
         };
 
+        // Read before `db` moves into the struct below (after a move, `db` can't be used here).
+        let layout = LayoutMode::parse(db.get_setting(settings_keys::LAYOUT)?.as_deref());
+
         let mut app = App {
             db,
             today: local_today(),
@@ -161,6 +201,7 @@ impl App {
             stats: Stats::default(),
             status: None,
             show_passed: false,
+            layout,
             should_quit: false,
             demo,
             #[cfg(feature = "sync")]
@@ -428,6 +469,15 @@ impl App {
                         title: item.title.clone(),
                     };
                 }
+            }
+            Action::ToggleLayout => {
+                self.layout = self.layout.toggled();
+                self.db
+                    .set_setting(settings_keys::LAYOUT, self.layout.as_str())?;
+                self.set_status(match self.layout {
+                    LayoutMode::Split => "Layout: tasks and events share the screen 50/50",
+                    LayoutMode::Fit => "Layout: events box fits its content",
+                });
             }
             Action::TogglePassed => {
                 self.show_passed = !self.show_passed;

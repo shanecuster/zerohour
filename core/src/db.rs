@@ -118,6 +118,9 @@ pub mod settings_keys {
     pub const THEME: &str = "theme";
     /// Icon mode: "nerd", "unicode" or "ascii". Missing = first run, ask the user.
     pub const ICON_MODE: &str = "icon_mode";
+    /// Main screen layout: "split" (Tasks and Events share the height 50/50, the default) or
+    /// "fit" (the Events box shrinks to its content).
+    pub const LAYOUT: &str = "layout";
 }
 
 /// A handle to the open database. All storage goes through this.
