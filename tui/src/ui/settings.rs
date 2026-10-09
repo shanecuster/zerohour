@@ -7,11 +7,11 @@
 use ratatui::Frame;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph};
 use zerohour_core::icons::{Icon, IconMode};
 use zerohour_core::theme::{THEMES, Theme};
 
-use super::{centered, color, popup_block};
+use super::{centered, color, popup_block, popup_height, popup_text_width, wrapped_lines};
 
 /// The theme list with color swatches. `selected` is the row being previewed.
 pub fn draw_theme_picker(frame: &mut Frame, theme: &Theme, selected: usize, icons: IconMode) {
@@ -61,8 +61,9 @@ pub fn draw_theme_picker(frame: &mut Frame, theme: &Theme, selected: usize, icon
 
 /// First-run question: can this terminal show Nerd Font icons?
 pub fn draw_icon_check(frame: &mut Frame, theme: &Theme) {
-    let area = centered(frame.area(), 64, 13);
-    let block = popup_block(" Icon check ", theme, color(theme.accent));
+    // 64 columns or the terminal width; the height follows from the wrapped text.
+    let width = 64.min(frame.area().width);
+    let text_width = popup_text_width(width);
     let accent = Style::new()
         .fg(color(theme.accent))
         .add_modifier(Modifier::BOLD);
@@ -73,8 +74,13 @@ pub fn draw_icon_check(frame: &mut Frame, theme: &Theme) {
         .map(|icon| icon.get(IconMode::Nerd))
         .join("  ");
 
-    let lines = vec![
-        Line::from("Do you see icons between the brackets (not boxes or ?)"),
+    let mut lines = wrapped_lines(
+        "Do you see icons between the brackets (not boxes or ?)",
+        text_width,
+        0,
+        Style::new().fg(color(theme.fg)),
+    );
+    lines.extend([
         Line::default(),
         Line::from(vec![
             Span::raw("        [  "),
@@ -95,28 +101,36 @@ pub fn draw_icon_check(frame: &mut Frame, theme: &Theme) {
             )),
         ]),
         Line::default(),
-        Line::from(Span::styled(
-            "Want the icons? Set your terminal font to a Nerd Font \"Mono\" variant, \
-             e.g. JetBrainsMono Nerd Font Mono. Change modes anytime with i.",
-            muted,
-        )),
-    ];
+    ]);
+    lines.extend(wrapped_lines(
+        "Want the icons? Set your terminal font to a Nerd Font \"Mono\" variant, \
+         e.g. JetBrainsMono Nerd Font Mono. Change modes anytime with i.",
+        text_width,
+        0,
+        muted,
+    ));
+    let area = centered(frame.area(), width, popup_height(lines.len()));
+    let block = popup_block(" Icon check ", theme, color(theme.accent));
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// "Delete this item?" confirmation, in the danger color.
+///
+/// A long title wraps onto more lines and the popup grows to fit, so the y/n keys below it are
+/// never pushed out of view.
 pub fn draw_confirm_delete(frame: &mut Frame, theme: &Theme, title: &str) {
-    let area = centered(frame.area(), 50, 6);
-    let block = popup_block(" Delete? ", theme, color(theme.danger));
+    let width = 50.min(frame.area().width);
     let accent = Style::new()
         .fg(color(theme.danger))
         .add_modifier(Modifier::BOLD);
-    let lines = vec![
-        Line::from(format!("Delete \"{title}\"?")),
+    let mut lines = wrapped_lines(
+        &format!("Delete \"{title}\"?"),
+        popup_text_width(width),
+        0,
+        Style::new().fg(color(theme.fg)),
+    );
+    lines.extend([
         Line::default(),
         Line::from(vec![
             Span::styled("y ", accent),
@@ -129,12 +143,58 @@ pub fn draw_confirm_delete(frame: &mut Frame, theme: &Theme, title: &str) {
             ),
             Span::raw("keep"),
         ]),
-    ];
+    ]);
+    let area = centered(frame.area(), width, popup_height(lines.len()));
+    let block = popup_block(" Delete? ", theme, color(theme.danger));
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::test_support::{WIDTHS, assert_shows, screen_text};
+
+    #[test]
+    fn theme_picker_is_never_cut_off() {
+        for width in WIDTHS {
+            let screen = screen_text(width, 40, |frame| {
+                draw_theme_picker(frame, &THEMES[0], 0, IconMode::Unicode);
+            });
+            let mut expected: Vec<&str> = THEMES.iter().map(|t| t.name).collect();
+            expected.extend(["↑↓ preview · Enter keep · Esc cancel", "icons: unicode"]);
+            assert_shows(&screen, width, &expected);
+        }
+    }
+
+    #[test]
+    fn icon_check_is_never_cut_off() {
+        for width in WIDTHS {
+            let screen = screen_text(width, 40, |frame| draw_icon_check(frame, &THEMES[0]));
+            assert_shows(
+                &screen,
+                width,
+                &[
+                    "Do you see icons between the brackets (not boxes or ?)",
+                    "y yes, use Nerd Font icons",
+                    "n no, use plain symbols (☐ ◷)",
+                    "Want the icons? Set your terminal font to a Nerd Font \"Mono\" variant, \
+                     e.g. JetBrainsMono Nerd Font Mono. Change modes anytime with i.",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn delete_confirmation_with_a_long_title_is_never_cut_off() {
+        let title = "Call the insurance company about the windshield claim, the rental car, \
+                     and the repair shop's estimate before Friday afternoon";
+        for width in WIDTHS {
+            let screen = screen_text(width, 40, |frame| {
+                draw_confirm_delete(frame, &THEMES[0], title);
+            });
+            let question = format!("Delete \"{title}\"?");
+            assert_shows(&screen, width, &[question.as_str(), "y delete n keep"]);
+        }
+    }
 }
