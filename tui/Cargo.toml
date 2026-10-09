@@ -37,4 +37,5 @@ unicode-width.workspace = true
 # `cargo install --path tui` builds a local-only app with no network code.
 [features]
 # CouchDB sync: install with `cargo install --path tui --features sync`.
-sync = ["zerohour-core/sync"]
+# Includes the OS keyring for the password (with a 0600-file fallback).
+sync = ["zerohour-core/sync", "zerohour-core/keyring"]

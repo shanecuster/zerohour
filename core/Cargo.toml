@@ -26,11 +26,22 @@ rusqlite.workspace = true
 serde.workspace = true
 # Platform data directory lookup for the default database location.
 directories.workspace = true
-# Our error enum (`DbError`).
+# Our error enums (`DbError`, `SyncError`).
 thiserror.workspace = true
+# --- optional, only with the `sync` feature ---
+# HTTP client for CouchDB.
+ureq = { workspace = true, optional = true }
+# JSON for CouchDB documents.
+serde_json = { workspace = true, optional = true }
+# --- optional, only with the `keyring` feature ---
+# The OS password store. Its own feature so the Android app can use sync without it (Android
+# stores the password in its Keystore through the `SecretStore` trait instead).
+keyring = { workspace = true, optional = true }
 
 # Optional parts of the crate, switched on with `--features ...`. Nothing here is on by default,
 # so a plain build is local-only and contains no network code at all.
 [features]
-# CouchDB sync (core/src/sync/). Off by default.
-sync = []
+# CouchDB sync (core/src/sync/). Off by default. `dep:x` turns on the optional dependency x.
+sync = ["dep:ureq", "dep:serde_json"]
+# Keep the sync password in the OS keyring (falls back to a 0600 file when there is none).
+keyring = ["sync", "dep:keyring"]

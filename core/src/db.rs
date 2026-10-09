@@ -8,6 +8,10 @@
 //! schema later (e.g. adding tags), append a new entry to [`MIGRATIONS`] — never edit an old
 //! one, because existing databases have already run it.
 //!
+//! **Sync.** The sync bookkeeping SQL (the `sync_docs` table) lives in `sync/store.rs`, behind
+//! the `sync` feature, so local-only builds don't even compile it. It reuses the helpers below,
+//! which is why a few of them are `pub(crate)` (visible inside this crate only).
+//!
 //! **Formats.** Calendar dates are stored as `YYYY-MM-DD` text. Timestamps are stored as UTC in
 //! RFC 3339 text (`2026-10-08T14:03:00Z`). Text sorts correctly and is easy to read with the
 //! `sqlite3` command-line tool when debugging.
@@ -105,7 +109,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
-const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
+pub(crate) const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
                             completed_at, created_at, updated_at, deleted";
 
 /// Well-known keys for the settings table, so typos become compile errors instead of bugs.
@@ -121,7 +125,8 @@ pub mod settings_keys {
 /// It owns the SQLite `Connection`; when the `Db` is dropped (goes out of scope), Rust closes
 /// the connection automatically. No manual cleanup needed — that's ownership at work.
 pub struct Db {
-    conn: Connection,
+    /// `pub(crate)` so the sync bookkeeping in `sync/store.rs` can run its own SQL.
+    pub(crate) conn: Connection,
 }
 
 impl Db {
@@ -285,15 +290,7 @@ impl Db {
 
     /// Loads one item by id (including deleted ones), or `None` if there's no such id.
     pub fn get_item(&self, id: &str) -> Result<Option<Item>> {
-        let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
-        // `.optional()` turns "no rows" into `Ok(None)` instead of an error.
-        let raw = self
-            .conn
-            .query_row(&sql, [id], RawItem::from_row)
-            .optional()?;
-        // `.map(...)` converts the inner RawItem if present; `.transpose()` flips
-        // `Option<Result<Item>>` into `Result<Option<Item>>` so `?` can be used on it.
-        raw.map(RawItem::into_item).transpose()
+        get_item_on(&self.conn, id)
     }
 
     /// Every item that isn't deleted, open and completed, tasks and events.
@@ -372,13 +369,7 @@ impl Db {
             insert_completion_on(&tx, &completion)?;
         }
         let next = match next {
-            Some(next) if row_exists_on(&tx, "items", &next.id)? => {
-                let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
-                Some(
-                    tx.query_row(&sql, [&next.id], RawItem::from_row)?
-                        .into_item()?,
-                )
-            }
+            Some(next) if row_exists_on(&tx, "items", &next.id)? => get_item_on(&tx, &next.id)?,
             Some(next) => {
                 insert_item_on(&tx, &next)?;
                 Some(next)
@@ -397,34 +388,7 @@ impl Db {
 
     /// The whole completion log, oldest first. This is the input for `stats::compute`.
     pub fn list_completions(&self) -> Result<Vec<Completion>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue
-             FROM completions ORDER BY completed_at",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, bool>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, item_id, completed_at, title, priority, was_overdue) = row?;
-            out.push(Completion {
-                id,
-                item_id,
-                completed_at: ts_from_db(&completed_at)?,
-                title_snapshot: title,
-                priority_snapshot: Priority::parse(&priority)
-                    .ok_or_else(|| DbError::BadData(format!("unknown priority '{priority}'")))?,
-                was_overdue,
-            });
-        }
-        Ok(out)
+        completions_where(&self.conn, "1 = 1")
     }
 
     // ---- settings ----------------------------------------------------------------------
@@ -466,11 +430,69 @@ pub fn default_db_path() -> Option<PathBuf> {
 // transaction: a rusqlite `Transaction` "derefs" to a `Connection`, meaning `&tx` can be
 // passed wherever `&Connection` is expected.
 
+/// Loads completions matching an SQL condition (`filter`), oldest first.
+///
+/// `filter` is always a constant written in this crate (e.g. `"1 = 1"` for "all rows"), never
+/// user input, so pasting it into the SQL is safe.
+pub(crate) fn completions_where(conn: &Connection, filter: &str) -> Result<Vec<Completion>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue
+         FROM completions WHERE {filter} ORDER BY completed_at"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, bool>(5)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, item_id, completed_at, title, priority, was_overdue) = row?;
+        out.push(Completion {
+            id,
+            item_id,
+            completed_at: ts_from_db(&completed_at)?,
+            title_snapshot: title,
+            priority_snapshot: Priority::parse(&priority)
+                .ok_or_else(|| DbError::BadData(format!("unknown priority '{priority}'")))?,
+            was_overdue,
+        });
+    }
+    Ok(out)
+}
+
+/// Loads one item by id using the given connection or transaction.
+pub(crate) fn get_item_on(conn: &Connection, id: &str) -> Result<Option<Item>> {
+    let sql = format!("SELECT {ITEM_COLUMNS} FROM items WHERE id = ?1");
+    // `.optional()` turns "no rows" into `Ok(None)` instead of an error.
+    let raw = conn.query_row(&sql, [id], RawItem::from_row).optional()?;
+    // `.map(...)` converts the inner RawItem if present; `.transpose()` flips
+    // `Option<Result<Item>>` into `Result<Option<Item>>` so `?` can be used on it.
+    raw.map(RawItem::into_item).transpose()
+}
+
 /// Inserts an item row using the given connection or transaction.
-fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
+pub(crate) fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
+    write_item_on(conn, item, "INSERT")
+}
+
+/// Inserts an item row, or overwrites the row with the same id. Used when sync brings in a
+/// newer version of an item.
+#[cfg(feature = "sync")]
+pub(crate) fn replace_item_on(conn: &Connection, item: &Item) -> Result<()> {
+    write_item_on(conn, item, "INSERT OR REPLACE")
+}
+
+/// Shared body of [`insert_item_on`] and `replace_item_on`: `verb` is the SQL that starts the
+/// statement (a constant, never user input).
+fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
     conn.execute(
         &format!(
-            "INSERT INTO items ({ITEM_COLUMNS})
+            "{verb} INTO items ({ITEM_COLUMNS})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
         ),
         params![
@@ -493,7 +515,7 @@ fn insert_item_on(conn: &Connection, item: &Item) -> Result<()> {
 
 /// True if `table` has a row with this `id`. `table` is always one of our own constant names,
 /// never user input, so building the SQL with `format!` is safe here.
-fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<bool> {
+pub(crate) fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<bool> {
     let found = conn
         .query_row(
             &format!("SELECT 1 FROM {table} WHERE id = ?1"),
@@ -505,7 +527,7 @@ fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<bool> {
 }
 
 /// Inserts a completion row using the given connection or transaction.
-fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
+pub(crate) fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
     conn.execute(
         "INSERT INTO completions
              (id, item_id, completed_at, title_snapshot, priority_snapshot, was_overdue)
@@ -526,7 +548,7 @@ fn insert_completion_on(conn: &Connection, c: &Completion) -> Result<()> {
 ///
 /// Reading happens in two steps because rusqlite's row callback can only return rusqlite
 /// errors; parsing our own formats (dates, enums) happens afterwards with our own errors.
-struct RawItem {
+pub(crate) struct RawItem {
     id: String,
     kind: String,
     title: String,
@@ -546,7 +568,7 @@ impl RawItem {
     ///
     /// `Row<'_>` has a *lifetime* parameter: the row borrows from the running query and is only
     /// valid while it runs. `'_` tells Rust "work out that lifetime yourself".
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<RawItem> {
+    pub(crate) fn from_row(row: &Row<'_>) -> rusqlite::Result<RawItem> {
         Ok(RawItem {
             id: row.get(0)?,
             kind: row.get(1)?,
@@ -564,7 +586,7 @@ impl RawItem {
     }
 
     /// Parses the text columns into proper types, failing with a clear message on bad data.
-    fn into_item(self) -> Result<Item> {
+    pub(crate) fn into_item(self) -> Result<Item> {
         let bad = |what: &str, value: &str| DbError::BadData(format!("unknown {what} '{value}'"));
         Ok(Item {
             kind: Kind::parse(&self.kind).ok_or_else(|| bad("kind", &self.kind))?,
@@ -585,24 +607,24 @@ impl RawItem {
 }
 
 /// Date -> `"2026-12-25"`.
-fn date_to_db(date: NaiveDate) -> String {
+pub(crate) fn date_to_db(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
 /// `"2026-12-25"` -> Date.
-fn date_from_db(s: &str) -> Result<NaiveDate> {
+pub(crate) fn date_from_db(s: &str) -> Result<NaiveDate> {
     NaiveDate::parse_from_str(s, "%Y-%m-%d")
         .map_err(|_| DbError::BadData(format!("bad date '{s}'")))
 }
 
 /// Timestamp -> `"2026-10-08T14:03:00.123Z"` (RFC 3339, always UTC, always the same width
 /// so that text sorting equals time sorting).
-fn ts_to_db(ts: DateTime<Utc>) -> String {
+pub(crate) fn ts_to_db(ts: DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// RFC 3339 text -> UTC timestamp.
-fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn ts_from_db(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|ts| ts.with_timezone(&Utc))
         .map_err(|_| DbError::BadData(format!("bad timestamp '{s}'")))

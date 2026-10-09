@@ -1,0 +1,5 @@
+[
+{"ok":true,"id":"item:0f8e2c1a-5b7d-4c3e-9a10-2b4c6d8e0f12","rev":"3-c9dd1ad3a76b0c4da6bd8a91e4b8f0aa"},
+{"id":"item:7a1c9e3b-2d4f-4a6b-8c0d-1e2f3a4b5c6d","error":"conflict","reason":"Document update conflict."},
+{"id":"completion:5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9","error":"forbidden","reason":"Only admins may write here."}
+]
