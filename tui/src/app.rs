@@ -20,6 +20,7 @@ use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::clock::TimeFormat;
 use zerohour_core::db::{Db, settings_keys};
+use zerohour_core::form::FormData;
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
 use zerohour_core::stats::{self, Stats};
@@ -29,7 +30,7 @@ use zerohour_core::view::{self, EventRow};
 use crate::input::{Action, main_action};
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
-use crate::ui::add::{Form, FormData, FormOutcome, FormPrefs};
+use crate::ui::add::{Form, FormOutcome, FormPrefs};
 use crate::ui::calendar::GridArea;
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};

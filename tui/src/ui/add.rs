@@ -15,22 +15,24 @@
 //! The date field also has a month-grid picker (Ctrl+D or F2, see `calendar.rs`); typing a
 //! date still works.
 //!
-//! This file holds the form's *state* ([`Form`]), its *key handling* ([`Form::handle_key`]), and
-//! its *drawing* ([`draw`]). The app only sees the result: [`FormOutcome::Save`] with a
-//! validated [`FormData`], or `Cancel`.
+//! The form's values, which fields appear, the repeat choices, validation and the date/time
+//! previews live in core (`zerohour_core::form`), so the Android app's form behaves exactly
+//! the same. This file holds the terminal side: the dialog *state* on top of that ([`Form`]),
+//! its *key handling* ([`Form::handle_key`]), and its *drawing* ([`draw`]). The app only sees
+//! the result: [`FormOutcome::Save`] with a validated [`FormData`], or `Cancel`.
 
-use chrono::NaiveDate;
-use chrono::{NaiveTime, Weekday};
+use chrono::{NaiveDate, Weekday};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use zerohour_core::calendar::WeekStart;
-use zerohour_core::clock::{TimeFormat, format_time, parse_time_input};
+use zerohour_core::clock::TimeFormat;
+use zerohour_core::form::{Field, FormData, FormInput, RepeatChoice};
 use zerohour_core::icons::{Icon, IconMode};
-use zerohour_core::model::{DaySet, Item, Kind, Priority, RepeatRule, Unit};
-use zerohour_core::repeat::{days_until, parse_date_input, scheduled_on_or_after};
+use zerohour_core::model::{Item, Kind, Priority, Unit};
+use zerohour_core::repeat::parse_date_input;
 use zerohour_core::theme::{Rgb, Theme};
 
 use super::calendar::{self, Calendar, CalendarOutcome, GridArea};
@@ -39,132 +41,11 @@ use super::{
 };
 use zerohour_core::calendar::add_months;
 
-/// The repeat options shown in the form, in cycling order. "custom" reveals the "every N" and
-/// unit fields; "weekdays", "Mon–Thu" and "pick days" reveal the day checkboxes. ("Every day"
-/// is just "daily".)
-const REPEAT_CHOICES: [&str; 9] = [
-    "none",
-    "daily",
-    "weekdays",
-    "Mon–Thu",
-    "weekly",
-    "monthly",
-    "yearly",
-    "custom",
-    "pick days",
-];
-// Indexes into REPEAT_CHOICES, so the code below can say what it means.
-/// "none".
-const NONE: usize = 0;
-/// "daily".
-const DAILY: usize = 1;
-/// "weekdays" (Mon–Fri preset).
-const WEEKDAYS: usize = 2;
-/// "Mon–Thu" preset.
-const MON_THU: usize = 3;
-/// "weekly".
-const WEEKLY: usize = 4;
-/// "monthly".
-const MONTHLY: usize = 5;
-/// "yearly".
-const YEARLY: usize = 6;
-/// "custom" (every N days/weeks/months).
-const CUSTOM: usize = 7;
-/// "pick days" (any set of weekdays).
-const PICK_DAYS: usize = 8;
-
-/// True for the choices that repeat on a set of weekdays (and show the day checkboxes).
-fn is_day_choice(choice: usize) -> bool {
-    matches!(choice, WEEKDAYS | MON_THU | PICK_DAYS)
-}
-
-/// The repeat choice that names a day set: a preset if it matches one, else "pick days".
-fn choice_for_days(days: DaySet) -> usize {
-    match days {
-        DaySet::WEEKDAYS => WEEKDAYS,
-        DaySet::MON_THU => MON_THU,
-        _ => PICK_DAYS,
-    }
-}
-
 /// Which step of the dialog we're on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     ChooseKind,
     Fields,
-}
-
-/// One input in the form. Which ones appear depends on the kind (see [`Form::fields`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
-    Title,
-    Priority,
-    Date,
-    /// Tasks only: optional due time (needs a date).
-    Time,
-    Repeat,
-    /// The day checkboxes, for weekday-set repeats.
-    Days,
-    EveryN,
-    EveryUnit,
-    KeepAfterPass,
-    Notes,
-}
-
-impl Field {
-    /// The label shown to the left of the input.
-    fn label(self, kind: Kind) -> &'static str {
-        match self {
-            Field::Title => "Title",
-            Field::Priority => "Priority",
-            Field::Date if kind == Kind::Task => "Due date",
-            Field::Date => "Date",
-            Field::Time => "Due time",
-            Field::Repeat => "Repeat",
-            Field::Days => "Days",
-            Field::EveryN => "Every",
-            Field::EveryUnit => "Unit",
-            Field::KeepAfterPass => "Keep after",
-            Field::Notes => "Notes",
-        }
-    }
-
-    /// True for free-text inputs (typing goes into them).
-    fn is_text(self) -> bool {
-        matches!(
-            self,
-            Field::Title | Field::Date | Field::Time | Field::EveryN | Field::Notes
-        )
-    }
-}
-
-/// The validated result of a form, ready to be written to the database.
-#[derive(Debug, Clone)]
-pub struct FormData {
-    /// `Some(id)` when editing an existing item, `None` when adding a new one.
-    pub editing: Option<String>,
-    pub kind: Kind,
-    pub title: String,
-    pub notes: Option<String>,
-    pub priority: Priority,
-    pub date: Option<NaiveDate>,
-    /// Tasks only; always `None` for events.
-    pub due_time: Option<NaiveTime>,
-    pub repeat: RepeatRule,
-    pub keep_after_pass: bool,
-}
-
-impl FormData {
-    /// Copies the form's values onto an item (new or existing). Leaves ids/timestamps alone.
-    pub fn apply_to(&self, item: &mut Item) {
-        item.title = self.title.clone();
-        item.notes = self.notes.clone();
-        item.priority = self.priority;
-        item.date = self.date;
-        item.due_time = self.due_time;
-        item.repeat = self.repeat;
-        item.keep_after_pass = self.keep_after_pass;
-    }
 }
 
 /// What happened after a key press in the form.
@@ -182,29 +63,17 @@ pub enum FormOutcome {
 
 /// The whole state of the add/edit dialog.
 ///
-/// Inputs are kept as the raw text the user typed (e.g. `date_text`), and only parsed when
-/// saving, so a half-typed date like "12/2" doesn't get rejected while you're still typing.
+/// The values themselves (title, typed date, repeat choice...) live in a core
+/// [`FormInput`], shared with the Android app, which also knows which fields appear and how to
+/// validate them. This struct adds only what the terminal needs on top: the step, which field
+/// has focus, the day-checkbox cursor, the error line, and the open date picker.
 #[derive(Debug, Clone)]
 pub struct Form {
     pub step: Step,
-    pub kind: Kind,
-    /// `Some(id)` when editing.
-    pub editing: Option<String>,
-    pub title: String,
-    pub priority: Priority,
-    pub date_text: String,
-    /// The due time as typed ("2pm", "14:30"); empty = no time.
-    pub time_text: String,
-    /// Index into [`REPEAT_CHOICES`].
-    pub repeat_choice: usize,
-    pub every_n: String,
-    pub unit: Unit,
-    /// The chosen weekdays, for weekday-set repeats.
-    pub days: DaySet,
+    /// Everything typed or chosen so far (see `zerohour_core::form`).
+    pub input: FormInput,
     /// Which day checkbox ←/→ is on (0..7, in the order shown).
     pub day_cursor: usize,
-    pub keep_after_pass: bool,
-    pub notes: String,
     /// Index into `self.fields()` of the focused input.
     pub focus: usize,
     /// Validation message shown at the bottom (cleared on the next key press).
@@ -231,19 +100,8 @@ impl Form {
     pub fn new_add(prefs: FormPrefs) -> Form {
         Form {
             step: Step::ChooseKind,
-            kind: Kind::Task,
-            editing: None,
-            title: String::new(),
-            priority: Priority::Medium,
-            date_text: String::new(),
-            time_text: String::new(),
-            repeat_choice: 0,
-            every_n: "2".to_string(),
-            unit: Unit::Weeks,
-            days: DaySet::WEEKDAYS,
+            input: FormInput::default(),
             day_cursor: 0,
-            keep_after_pass: false,
-            notes: String::new(),
             focus: 0,
             error: None,
             calendar: None,
@@ -255,39 +113,7 @@ impl Form {
     pub fn edit(item: &Item, prefs: FormPrefs) -> Form {
         let mut form = Form::new_add(prefs);
         form.step = Step::Fields;
-        form.kind = item.kind;
-        form.editing = Some(item.id.clone());
-        form.title = item.title.clone();
-        form.priority = item.priority;
-        // Dates are shown in ISO form; the user can type any accepted form over it.
-        form.date_text = item
-            .date
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_default();
-        // Shown in the user's style; both styles can be typed back in.
-        form.time_text = item
-            .due_time
-            .map(|t| format_time(t, prefs.time_format))
-            .unwrap_or_default();
-        form.keep_after_pass = item.keep_after_pass;
-        form.notes = item.notes.clone().unwrap_or_default();
-        // Map the stored rule back onto the choice list (+ the custom fields).
-        form.repeat_choice = match item.repeat {
-            RepeatRule::None => NONE,
-            RepeatRule::Daily => DAILY,
-            RepeatRule::Weekly => WEEKLY,
-            RepeatRule::Monthly => MONTHLY,
-            RepeatRule::Yearly => YEARLY,
-            RepeatRule::EveryN { n, unit } => {
-                form.every_n = n.to_string();
-                form.unit = unit;
-                CUSTOM
-            }
-            RepeatRule::Weekdays(days) => {
-                form.days = days;
-                choice_for_days(days)
-            }
-        };
+        form.input = FormInput::from_item(item, prefs.time_format);
         form
     }
 
@@ -298,7 +124,7 @@ impl Form {
             return;
         };
         if let Some(date) = grid.date_at(calendar, column, row) {
-            self.date_text = date.format("%Y-%m-%d").to_string();
+            self.input.set_date(date);
             self.calendar = None;
         }
     }
@@ -310,30 +136,9 @@ impl Form {
         }
     }
 
-    /// The inputs shown for the current kind, top to bottom.
+    /// The inputs shown for the current kind and repeat choice, top to bottom (core decides).
     pub fn fields(&self) -> Vec<Field> {
-        let mut fields = vec![Field::Title];
-        if self.kind == Kind::Task {
-            fields.push(Field::Priority);
-        }
-        fields.push(Field::Date);
-        if self.kind == Kind::Task {
-            fields.push(Field::Time);
-        }
-        fields.push(Field::Repeat);
-        if is_day_choice(self.repeat_choice) {
-            fields.push(Field::Days);
-        }
-        if self.repeat_choice == CUSTOM {
-            fields.push(Field::EveryN);
-            fields.push(Field::EveryUnit);
-        }
-        // "Keep after pass" only matters for one-off events (repeating ones roll forward).
-        if self.kind == Kind::Event && self.repeat_choice == NONE {
-            fields.push(Field::KeepAfterPass);
-        }
-        fields.push(Field::Notes);
-        fields
+        self.input.fields()
     }
 
     /// The currently focused input.
@@ -353,8 +158,8 @@ impl Form {
                 CalendarOutcome::Continue => {}
                 CalendarOutcome::Cancel => self.calendar = None,
                 CalendarOutcome::Pick(date) => {
-                    // ISO form: unambiguous, and exactly what editing shows too.
-                    self.date_text = date.format("%Y-%m-%d").to_string();
+                    // Core writes it in ISO form: unambiguous, and what editing shows too.
+                    self.input.set_date(date);
                     self.calendar = None;
                 }
                 CalendarOutcome::WeekStartChanged(start) => {
@@ -384,18 +189,18 @@ impl Form {
             | KeyCode::Down
             | KeyCode::Char('j')
             | KeyCode::Char('k') => {
-                self.kind = match self.kind {
+                self.input.kind = match self.input.kind {
                     Kind::Task => Kind::Event,
                     Kind::Event => Kind::Task,
                 };
             }
             // Shortcuts: press t or e to pick and continue in one go.
             KeyCode::Char('t') => {
-                self.kind = Kind::Task;
+                self.input.kind = Kind::Task;
                 self.step = Step::Fields;
             }
             KeyCode::Char('e') => {
-                self.kind = Kind::Event;
+                self.input.kind = Kind::Event;
                 self.step = Step::Fields;
             }
             KeyCode::Enter => self.step = Step::Fields,
@@ -411,7 +216,7 @@ impl Form {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
         match key.code {
-            KeyCode::Enter => match self.validate(today) {
+            KeyCode::Enter => match self.input.validate(today) {
                 Ok(data) => return FormOutcome::Save(data),
                 Err(message) => self.error = Some(message),
             },
@@ -424,7 +229,7 @@ impl Form {
             KeyCode::Left => self.cycle(field, false),
             KeyCode::Right => self.cycle(field, true),
             KeyCode::Char(' ') if field == Field::KeepAfterPass => {
-                self.keep_after_pass = !self.keep_after_pass;
+                self.input.keep_after_pass = !self.input.keep_after_pass;
             }
             KeyCode::Char(' ') if field == Field::Days => self.toggle_day(),
             // Ctrl+D or F2 on the date field opens the month-grid picker, starting on the date
@@ -432,7 +237,9 @@ impl Form {
             KeyCode::Char('d') | KeyCode::F(2)
                 if field == Field::Date && (ctrl || key.code == KeyCode::F(2)) =>
             {
-                let current = parse_date_input(&self.date_text, today).ok().flatten();
+                let current = parse_date_input(&self.input.date_text, today)
+                    .ok()
+                    .flatten();
                 self.calendar = Some(Calendar::new(current, today, self.prefs.week_start));
             }
             // Ctrl+U clears the focused text field (same as in a shell).
@@ -466,11 +273,11 @@ impl Form {
     /// to change the string that lives inside `self`.
     fn text_mut(&mut self, field: Field) -> Option<&mut String> {
         match field {
-            Field::Title => Some(&mut self.title),
-            Field::Date => Some(&mut self.date_text),
-            Field::Time => Some(&mut self.time_text),
-            Field::EveryN => Some(&mut self.every_n),
-            Field::Notes => Some(&mut self.notes),
+            Field::Title => Some(&mut self.input.title),
+            Field::Date => Some(&mut self.input.date_text),
+            Field::Time => Some(&mut self.input.time_text),
+            Field::EveryN => Some(&mut self.input.every_n),
+            Field::Notes => Some(&mut self.input.notes),
             _ => None,
         }
     }
@@ -489,121 +296,43 @@ impl Form {
             Field::Priority => {
                 let i = Priority::ALL
                     .iter()
-                    .position(|&p| p == self.priority)
+                    .position(|&p| p == self.input.priority)
                     .unwrap_or(1);
-                self.priority = Priority::ALL[step(i, Priority::ALL.len(), right)];
+                self.input.priority = Priority::ALL[step(i, Priority::ALL.len(), right)];
             }
             Field::Repeat => {
-                self.repeat_choice = step(self.repeat_choice, REPEAT_CHOICES.len(), right);
-                // The presets fill in their days; "pick days" keeps whatever was there.
-                match self.repeat_choice {
-                    WEEKDAYS => self.days = DaySet::WEEKDAYS,
-                    MON_THU => self.days = DaySet::MON_THU,
-                    _ => {}
-                }
+                let i = RepeatChoice::ALL
+                    .iter()
+                    .position(|&c| c == self.input.repeat)
+                    .unwrap_or(0);
+                // `set_repeat` also fills in a preset's days ("pick days" keeps what's there).
+                self.input
+                    .set_repeat(RepeatChoice::ALL[step(i, RepeatChoice::ALL.len(), right)]);
             }
             // On the day checkboxes, ←/→ move between days (Space toggles one).
             Field::Days => self.day_cursor = step(self.day_cursor, 7, right),
             Field::EveryUnit => {
-                let i = Unit::ALL.iter().position(|&u| u == self.unit).unwrap_or(0);
-                self.unit = Unit::ALL[step(i, Unit::ALL.len(), right)];
+                let i = Unit::ALL
+                    .iter()
+                    .position(|&u| u == self.input.unit)
+                    .unwrap_or(0);
+                self.input.unit = Unit::ALL[step(i, Unit::ALL.len(), right)];
             }
-            Field::KeepAfterPass => self.keep_after_pass = !self.keep_after_pass,
+            Field::KeepAfterPass => self.input.keep_after_pass = !self.input.keep_after_pass,
             _ => {}
         }
     }
 
     /// The days in the order the checkboxes are shown (following the calendar's week start).
     fn day_order(&self) -> [Weekday; 7] {
-        use Weekday::*;
-        match self.prefs.week_start {
-            WeekStart::Sunday => [Sun, Mon, Tue, Wed, Thu, Fri, Sat],
-            WeekStart::Monday => [Mon, Tue, Wed, Thu, Fri, Sat, Sun],
-        }
+        self.prefs.week_start.weekdays()
     }
 
-    /// Space on the day checkboxes: flips the day under the cursor, then shows the matching
-    /// preset name if the new set is one ("weekdays", "Mon–Thu"), or "pick days".
+    /// Space on the day checkboxes: flips the day under the cursor (core then names the
+    /// matching preset, "weekdays" / "Mon–Thu", or "pick days").
     fn toggle_day(&mut self) {
         let day = self.day_order()[self.day_cursor];
-        self.days = self.days.toggled(day);
-        self.repeat_choice = choice_for_days(self.days);
-    }
-
-    /// The repeat rule currently chosen, or an error message for a bad "every N" or an empty
-    /// set of days.
-    fn repeat_rule(&self) -> Result<RepeatRule, String> {
-        Ok(match self.repeat_choice {
-            NONE => RepeatRule::None,
-            DAILY => RepeatRule::Daily,
-            WEEKLY => RepeatRule::Weekly,
-            MONTHLY => RepeatRule::Monthly,
-            YEARLY => RepeatRule::Yearly,
-            WEEKDAYS | MON_THU | PICK_DAYS => {
-                if self.days.is_empty() {
-                    return Err("Pick at least one day.".to_string());
-                }
-                // All seven days is just "daily", stored as such (and readable by every build).
-                if self.days == DaySet::ALL {
-                    RepeatRule::Daily
-                } else {
-                    RepeatRule::Weekdays(self.days)
-                }
-            }
-            _ => {
-                let n: u32 = self
-                    .every_n
-                    .parse()
-                    .ok()
-                    .filter(|n| (1..=999).contains(n))
-                    .ok_or("\"Every\" must be a number from 1 to 999.")?;
-                RepeatRule::EveryN { n, unit: self.unit }
-            }
-        })
-    }
-
-    /// Checks every field and builds the result, or explains what's wrong.
-    pub fn validate(&self, today: NaiveDate) -> Result<FormData, String> {
-        let title = self.title.trim();
-        if title.is_empty() {
-            return Err("Please enter a title.".to_string());
-        }
-        let typed_date = parse_date_input(&self.date_text, today)?;
-        let repeat = self.repeat_rule()?;
-        // Weekday repeats: an empty date becomes the first scheduled day from today, and a
-        // date on an unscheduled day moves forward to the next scheduled one.
-        let date = match (typed_date, repeat) {
-            (Some(date), RepeatRule::Weekdays(_)) => Some(scheduled_on_or_after(repeat, date)),
-            (None, RepeatRule::Weekdays(_)) => Some(scheduled_on_or_after(repeat, today)),
-            (date, _) => date,
-        };
-        if self.kind == Kind::Event && date.is_none() {
-            return Err("Events need a date to count down to.".to_string());
-        }
-        // Only tasks have a due time, and it needs a date to belong to.
-        let due_time = if self.kind == Kind::Task {
-            parse_time_input(&self.time_text)?
-        } else {
-            None
-        };
-        if due_time.is_some() && date.is_none() {
-            return Err("A due time needs a due date.".to_string());
-        }
-        let notes = self.notes.trim();
-        Ok(FormData {
-            editing: self.editing.clone(),
-            kind: self.kind,
-            title: title.to_string(),
-            notes: (!notes.is_empty()).then(|| notes.to_string()),
-            priority: self.priority,
-            date,
-            due_time,
-            repeat,
-            // Only meaningful for one-off events; stored false otherwise to keep data tidy.
-            keep_after_pass: self.kind == Kind::Event
-                && !repeat.is_repeating()
-                && self.keep_after_pass,
-        })
+        self.input.toggle_day(day);
     }
 }
 
@@ -636,7 +365,7 @@ fn draw_choose_kind(frame: &mut Frame, form: &Form, theme: &Theme, icons: IconMo
 
     // One option = a name line plus a hint line; the chosen one gets an arrow and color.
     let option = |kind: Kind, name: &str, icon: Icon, hint: &str, section_color| {
-        let chosen = form.kind == kind;
+        let chosen = form.input.kind == kind;
         let marker = if chosen { "› " } else { "  " };
         let name_style = if chosen {
             Style::new().fg(section_color).add_modifier(Modifier::BOLD)
@@ -687,13 +416,13 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
     // to fit, so the height is worked out from the lines once they're built.
     let width = 64.min(frame.area().width);
     let text_width = popup_text_width(width);
-    let (verb, noun) = match (&form.editing, form.kind) {
+    let (verb, noun) = match (&form.input.editing, form.input.kind) {
         (Some(_), Kind::Task) => ("Edit", "task"),
         (Some(_), Kind::Event) => ("Edit", "event"),
         (None, Kind::Task) => ("New", "task"),
         (None, Kind::Event) => ("New", "event"),
     };
-    let section_color = match form.kind {
+    let section_color = match form.input.kind {
         Kind::Task => color(theme.task),
         Kind::Event => color(theme.event),
     };
@@ -722,7 +451,7 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         lines.push(Line::from(vec![
             Span::styled(if is_focused { "› " } else { "  " }, label_style),
             Span::styled(
-                format!("{:<LABEL_WIDTH$} ", field.label(form.kind)),
+                format!("{:<LABEL_WIDTH$} ", field.label(form.input.kind)),
                 label_style,
             ),
             Span::styled(value, Style::new().fg(color(theme.fg))),
@@ -774,15 +503,19 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
         }
     };
     match field {
-        Field::Priority => choice(form.priority.label()),
-        Field::Repeat => choice(REPEAT_CHOICES[form.repeat_choice]),
+        Field::Priority => choice(form.input.priority.label()),
+        Field::Repeat => choice(form.input.repeat.label()),
         Field::Days => {
             // "[x]Mo [x]Tu [ ]We ..."; the day under the cursor shows as "‹x›Mo" when focused.
             form.day_order()
                 .iter()
                 .enumerate()
                 .map(|(i, &day)| {
-                    let mark = if form.days.contains(day) { "x" } else { " " };
+                    let mark = if form.input.days.contains(day) {
+                        "x"
+                    } else {
+                        " "
+                    };
                     // Two-letter name: the first two characters of chrono's "Mon", "Tue"...
                     let name: String = day.to_string().chars().take(2).collect();
                     if focused && i == form.day_cursor {
@@ -794,19 +527,23 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
                 .collect::<Vec<_>>()
                 .join(" ")
         }
-        Field::EveryUnit => choice(form.unit.as_str()),
+        Field::EveryUnit => choice(form.input.unit.as_str()),
         Field::KeepAfterPass => {
-            let box_ = if form.keep_after_pass { "[x]" } else { "[ ]" };
+            let box_ = if form.input.keep_after_pass {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             format!("{box_} show after the date passes")
         }
         _ => {
             // Text field: show the end of the text if it's too long (that's where you type).
             let text = match field {
-                Field::Title => &form.title,
-                Field::Date => &form.date_text,
-                Field::Time => &form.time_text,
-                Field::EveryN => &form.every_n,
-                _ => &form.notes,
+                Field::Title => &form.input.title,
+                Field::Date => &form.input.date_text,
+                Field::Time => &form.input.time_text,
+                Field::EveryN => &form.input.every_n,
+                _ => &form.input.notes,
             };
             debug_assert!(field.is_text());
             if focused {
@@ -820,77 +557,22 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
     }
 }
 
-/// The muted text under the date field (indented to the value column): the understood date,
-/// or how to type one. Returned as (text, color slot); the caller wraps it to fit.
+/// The line under the date field, indented to the value column: the understood date, or how
+/// to type one. The words and color slot come from core; returned as (text, color) for the
+/// caller to wrap.
 fn date_preview(form: &Form, theme: &Theme, today: NaiveDate) -> (String, Rgb) {
-    let indent = " ".repeat(14);
-    // Weekday repeats: say where an unscheduled or empty date will land when saved.
-    // (`rule @ pattern` matches the pattern and also names the whole value `rule`.)
-    if let Ok(rule @ RepeatRule::Weekdays(_)) = form.repeat_rule() {
-        match parse_date_input(&form.date_text, today) {
-            Ok(Some(date)) if scheduled_on_or_after(rule, date) != date => {
-                let moved = scheduled_on_or_after(rule, date);
-                return (
-                    format!(
-                        "{indent}→ {} isn't a repeat day: saves as {}",
-                        date.format("%a"),
-                        moved.format("%a %b %d")
-                    ),
-                    theme.warn,
-                );
-            }
-            Ok(None) => {
-                let first = scheduled_on_or_after(rule, today);
-                return (
-                    format!(
-                        "{indent}→ empty: saves as {} (first repeat day)",
-                        first.format("%a %b %d")
-                    ),
-                    theme.ok,
-                );
-            }
-            _ => {}
-        }
-    }
-    match parse_date_input(&form.date_text, today) {
-        Ok(Some(date)) => {
-            let days = days_until(date, today);
-            let relative = match days {
-                0 => "today".to_string(),
-                1 => "tomorrow".to_string(),
-                -1 => "yesterday".to_string(),
-                n if n > 0 => format!("in {n} days"),
-                n => format!("{} days ago", -n),
-            };
-            (
-                format!("{indent}→ {} · {relative}", date.format("%a %b %d %Y")),
-                theme.ok,
-            )
-        }
-        Ok(None) => (
-            format!("{indent}e.g. 12/25, 2026-12-25, +3d, +2w, tomorrow, fri"),
-            theme.muted,
-        ),
-        Err(_) => (format!("{indent}? not a date yet"), theme.warn),
-    }
+    let (text, slot) = form.input.date_preview(today);
+    (format!("{PREVIEW_INDENT}{text}"), theme.slot(slot))
 }
 
-/// The muted text under the time field: the understood time, or how to type one.
-/// Returned as (text, color slot); the caller wraps it to fit.
+/// The line under the time field: the understood time, or how to type one (words from core).
 fn time_preview(form: &Form, theme: &Theme) -> (String, Rgb) {
-    let indent = " ".repeat(14);
-    match parse_time_input(&form.time_text) {
-        Ok(Some(time)) => (
-            format!("{indent}→ {}", format_time(time, form.prefs.time_format)),
-            theme.ok,
-        ),
-        Ok(None) => (
-            format!("{indent}e.g. 2pm, 2:30 pm, 14:30 (empty = any time that day)"),
-            theme.muted,
-        ),
-        Err(_) => (format!("{indent}? not a time yet"), theme.warn),
-    }
+    let (text, slot) = form.input.time_preview(form.prefs.time_format);
+    (format!("{PREVIEW_INDENT}{text}"), theme.slot(slot))
 }
+
+/// Previews start under the value column: "› " + an 11-wide label + " " = 14 columns.
+const PREVIEW_INDENT: &str = "              ";
 
 /// The dim list of keys at the bottom of a popup, wrapped onto more lines if it's too wide.
 fn hint_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
@@ -905,6 +587,8 @@ fn hint_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveTime;
+    use zerohour_core::model::{DaySet, RepeatRule};
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()
@@ -923,9 +607,9 @@ mod tests {
     #[test]
     fn tab_flips_kind_then_enter_shows_event_fields() {
         let mut form = Form::new_add(FormPrefs::default());
-        assert_eq!(form.kind, Kind::Task);
+        assert_eq!(form.input.kind, Kind::Task);
         form.handle_key(key(KeyCode::Tab), today());
-        assert_eq!(form.kind, Kind::Event);
+        assert_eq!(form.input.kind, Kind::Event);
         form.handle_key(key(KeyCode::Enter), today());
         assert_eq!(form.step, Step::Fields);
         let fields = form.fields();
@@ -957,12 +641,12 @@ mod tests {
     fn custom_repeat_reveals_every_n_fields() {
         let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
-        form.title = "x".into();
-        form.repeat_choice = CUSTOM;
+        form.input.title = "x".into();
+        form.input.repeat = RepeatChoice::Custom;
         assert!(form.fields().contains(&Field::EveryN));
-        form.every_n = "3".into();
-        form.unit = Unit::Days;
-        let data = form.validate(today()).unwrap();
+        form.input.every_n = "3".into();
+        form.input.unit = Unit::Days;
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(
             data.repeat,
             RepeatRule::EveryN {
@@ -970,22 +654,22 @@ mod tests {
                 unit: Unit::Days
             }
         );
-        form.every_n = "0".into();
-        assert!(form.validate(today()).is_err());
+        form.input.every_n = "0".into();
+        assert!(form.input.validate(today()).is_err());
     }
 
     #[test]
     fn validation_errors() {
         let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
-        assert!(form.validate(today()).is_err(), "empty title");
-        form.title = "Party".into();
-        form.kind = Kind::Event;
-        assert!(form.validate(today()).is_err(), "event without date");
-        form.date_text = "nonsense".into();
-        assert!(form.validate(today()).is_err(), "bad date");
-        form.date_text = "12/25".into();
-        assert!(form.validate(today()).is_ok());
+        assert!(form.input.validate(today()).is_err(), "empty title");
+        form.input.title = "Party".into();
+        form.input.kind = Kind::Event;
+        assert!(form.input.validate(today()).is_err(), "event without date");
+        form.input.date_text = "nonsense".into();
+        assert!(form.input.validate(today()).is_err(), "bad date");
+        form.input.date_text = "12/25".into();
+        assert!(form.input.validate(today()).is_ok());
     }
 
     #[test]
@@ -1014,7 +698,7 @@ mod tests {
         form.handle_key(key(KeyCode::Right), today());
         form.handle_key(key(KeyCode::Enter), today());
         assert!(form.calendar.is_none());
-        assert_eq!(form.date_text, "2026-12-26");
+        assert_eq!(form.input.date_text, "2026-12-26");
     }
 
     #[test]
@@ -1022,7 +706,7 @@ mod tests {
         let mut form = Form::new_add(FormPrefs::default());
         form.handle_key(key(KeyCode::Enter), today());
         type_text(&mut form, "dd"); // title field
-        assert_eq!(form.title, "dd");
+        assert_eq!(form.input.title, "dd");
         form.handle_key(key(KeyCode::F(2)), today());
         assert!(form.calendar.is_none(), "not on the title field");
     }
@@ -1031,21 +715,21 @@ mod tests {
     fn tasks_take_an_optional_due_time_that_needs_a_date() {
         let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
-        form.title = "standup".into();
+        form.input.title = "standup".into();
         assert!(form.fields().contains(&Field::Time));
-        form.time_text = "2pm".into();
-        assert!(form.validate(today()).is_err(), "time without a date");
-        form.date_text = "today".into();
-        let data = form.validate(today()).unwrap();
+        form.input.time_text = "2pm".into();
+        assert!(form.input.validate(today()).is_err(), "time without a date");
+        form.input.date_text = "today".into();
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(data.due_time, NaiveTime::from_hms_opt(14, 0, 0));
-        form.time_text = "25:00".into();
-        assert!(form.validate(today()).is_err(), "bad time");
+        form.input.time_text = "25:00".into();
+        assert!(form.input.validate(today()).is_err(), "bad time");
 
         // Events have no time field and never store one.
-        form.kind = Kind::Event;
+        form.input.kind = Kind::Event;
         assert!(!form.fields().contains(&Field::Time));
-        form.time_text = "2pm".into();
-        assert_eq!(form.validate(today()).unwrap().due_time, None);
+        form.input.time_text = "2pm".into();
+        assert_eq!(form.input.validate(today()).unwrap().due_time, None);
     }
 
     #[test]
@@ -1054,20 +738,23 @@ mod tests {
         item.date = Some(today());
         item.due_time = NaiveTime::from_hms_opt(14, 0, 0);
         let twelve = Form::edit(&item, FormPrefs::default());
-        assert_eq!(twelve.time_text, "2:00 PM");
+        assert_eq!(twelve.input.time_text, "2:00 PM");
         let prefs = FormPrefs {
             time_format: TimeFormat::Hour24,
             ..FormPrefs::default()
         };
-        assert_eq!(Form::edit(&item, prefs).time_text, "14:00");
-        assert_eq!(twelve.validate(today()).unwrap().due_time, item.due_time);
+        assert_eq!(Form::edit(&item, prefs).input.time_text, "14:00");
+        assert_eq!(
+            twelve.input.validate(today()).unwrap().due_time,
+            item.due_time
+        );
     }
 
     /// A task form on the fields step with a title, ready for repeat tests.
     fn task_form() -> Form {
         let mut form = Form::new_add(FormPrefs::default());
         form.step = Step::Fields;
-        form.title = "standup".into();
+        form.input.title = "standup".into();
         form
     }
 
@@ -1083,13 +770,13 @@ mod tests {
         focus_on(&mut form, Field::Repeat);
         form.handle_key(key(KeyCode::Right), today()); // daily
         form.handle_key(key(KeyCode::Right), today()); // weekdays
-        assert_eq!(REPEAT_CHOICES[form.repeat_choice], "weekdays");
-        assert_eq!(form.days, DaySet::WEEKDAYS);
+        assert_eq!(form.input.repeat.label(), "weekdays");
+        assert_eq!(form.input.days, DaySet::WEEKDAYS);
         assert!(form.fields().contains(&Field::Days));
         form.handle_key(key(KeyCode::Right), today()); // Mon–Thu
-        assert_eq!(form.days, DaySet::MON_THU);
-        form.date_text = "2026-10-10".into(); // a Saturday, not one of Mon–Thu...
-        let data = form.validate(today()).unwrap();
+        assert_eq!(form.input.days, DaySet::MON_THU);
+        form.input.date_text = "2026-10-10".into(); // a Saturday, not one of Mon–Thu...
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(data.repeat, RepeatRule::Weekdays(DaySet::MON_THU));
         // ...so the saved date moves forward to Monday.
         assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 10, 12));
@@ -1098,8 +785,8 @@ mod tests {
     #[test]
     fn toggling_days_switches_between_presets_and_pick_days() {
         let mut form = task_form();
-        form.repeat_choice = WEEKDAYS;
-        form.days = DaySet::WEEKDAYS;
+        form.input.repeat = RepeatChoice::Weekdays;
+        form.input.days = DaySet::WEEKDAYS;
         focus_on(&mut form, Field::Days);
         // Sunday-first order: index 5 is Friday. Turning it off leaves Mon–Thu.
         form.day_cursor = 0;
@@ -1107,34 +794,37 @@ mod tests {
             form.handle_key(key(KeyCode::Right), today());
         }
         form.handle_key(key(KeyCode::Char(' ')), today());
-        assert_eq!(form.days, DaySet::MON_THU);
-        assert_eq!(form.repeat_choice, MON_THU);
+        assert_eq!(form.input.days, DaySet::MON_THU);
+        assert_eq!(form.input.repeat, RepeatChoice::MonThu);
         // Turning Saturday on is no preset: "pick days".
         form.handle_key(key(KeyCode::Right), today());
         form.handle_key(key(KeyCode::Char(' ')), today());
-        assert_eq!(form.repeat_choice, PICK_DAYS);
+        assert_eq!(form.input.repeat, RepeatChoice::PickDays);
     }
 
     #[test]
     fn day_sets_validate_and_fill_a_missing_date() {
         let mut form = task_form();
-        form.repeat_choice = PICK_DAYS;
-        form.days = DaySet::EMPTY;
-        assert!(form.validate(today()).is_err(), "no days picked");
-        form.days = DaySet::ALL;
-        assert_eq!(form.validate(today()).unwrap().repeat, RepeatRule::Daily);
+        form.input.repeat = RepeatChoice::PickDays;
+        form.input.days = DaySet::EMPTY;
+        assert!(form.input.validate(today()).is_err(), "no days picked");
+        form.input.days = DaySet::ALL;
+        assert_eq!(
+            form.input.validate(today()).unwrap().repeat,
+            RepeatRule::Daily
+        );
         // Empty date: filled with the first scheduled day from today. Today (Thu Oct 8) is
         // one of Mon–Thu, so it's today; for Mondays only, it's the next Monday.
-        form.days = DaySet::MON_THU;
-        let data = form.validate(today()).unwrap();
+        form.input.days = DaySet::MON_THU;
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(data.date, Some(today()));
-        form.days = DaySet::EMPTY.toggled(Weekday::Mon);
-        let data = form.validate(today()).unwrap();
+        form.input.days = DaySet::EMPTY.toggled(Weekday::Mon);
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 10, 12));
         // Events may repeat on weekdays too, and get a date filled in the same way.
-        form.kind = Kind::Event;
+        form.input.kind = Kind::Event;
         assert_eq!(
-            form.validate(today()).unwrap().date,
+            form.input.validate(today()).unwrap().date,
             NaiveDate::from_ymd_opt(2026, 10, 12)
         );
     }
@@ -1145,12 +835,12 @@ mod tests {
         item.date = NaiveDate::from_ymd_opt(2026, 10, 12);
         item.repeat = RepeatRule::Weekdays(DaySet::MON_THU);
         let form = Form::edit(&item, FormPrefs::default());
-        assert_eq!(form.repeat_choice, MON_THU);
+        assert_eq!(form.input.repeat, RepeatChoice::MonThu);
         let odd = DaySet::EMPTY.toggled(Weekday::Mon).toggled(Weekday::Sat);
         item.repeat = RepeatRule::Weekdays(odd);
         let form = Form::edit(&item, FormPrefs::default());
-        assert_eq!(form.repeat_choice, PICK_DAYS);
-        assert_eq!(form.validate(today()).unwrap().repeat, item.repeat);
+        assert_eq!(form.input.repeat, RepeatChoice::PickDays);
+        assert_eq!(form.input.validate(today()).unwrap().repeat, item.repeat);
     }
 
     /// Renders the dialog at each test width and checks that every expected text is complete.
@@ -1208,9 +898,9 @@ mod tests {
     #[test]
     fn repeat_and_weekday_rows_are_never_cut_off() {
         let mut form = task_form();
-        form.repeat_choice = PICK_DAYS;
-        form.days = DaySet::MON_THU;
-        form.date_text = "sat".into();
+        form.input.repeat = RepeatChoice::PickDays;
+        form.input.days = DaySet::MON_THU;
+        form.input.date_text = "sat".into();
         focus_on(&mut form, Field::Days);
         assert_dialog_shows(
             &form,
@@ -1221,14 +911,14 @@ mod tests {
                 "↑↓ move · ←→ day · Space on/off · Enter save · Esc cancel",
             ],
         );
-        form.repeat_choice = CUSTOM;
+        form.input.repeat = RepeatChoice::Custom;
         assert_dialog_shows(&form, &["Every", "Unit"]);
     }
 
     #[test]
     fn event_form_is_never_cut_off() {
         let mut form = task_form();
-        form.kind = Kind::Event;
+        form.input.kind = Kind::Event;
         focus_on(&mut form, Field::KeepAfterPass);
         assert_dialog_shows(
             &form,
@@ -1262,7 +952,7 @@ mod tests {
         };
         let form = Form::edit(&item, FormPrefs::default());
         assert_eq!(form.step, Step::Fields);
-        let data = form.validate(today()).unwrap();
+        let data = form.input.validate(today()).unwrap();
         assert_eq!(data.repeat, item.repeat);
         assert_eq!(data.date, item.date);
         assert_eq!(data.editing.as_deref(), Some(item.id.as_str()));
