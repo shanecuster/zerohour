@@ -203,6 +203,65 @@ pub fn theme_by_name(name: &str) -> &'static Theme {
         .unwrap_or(&THEMES[0])
 }
 
+/// The *name* of a color slot, without the color itself.
+///
+/// Shared code that decides how something should look (see `view.rs`: "an overdue task's due
+/// text is `Danger`") returns a `Slot`, and each UI looks the color up in its current theme
+/// with [`Theme::slot`]. That way the decision lives in one place for the TUI and the Android
+/// app, and neither ever hard-codes a color.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Slot {
+    Bg,
+    Fg,
+    Muted,
+    Border,
+    Accent,
+    Selection,
+    Task,
+    Event,
+    Ok,
+    Warn,
+    Danger,
+}
+
+impl Slot {
+    /// Every slot, in the same order as the fields of [`Theme`] (handy for swatches and tests).
+    pub const ALL: [Slot; 11] = [
+        Slot::Bg,
+        Slot::Fg,
+        Slot::Muted,
+        Slot::Border,
+        Slot::Accent,
+        Slot::Selection,
+        Slot::Task,
+        Slot::Event,
+        Slot::Ok,
+        Slot::Warn,
+        Slot::Danger,
+    ];
+}
+
+impl Theme {
+    /// The color this theme gives `slot`.
+    ///
+    /// The `match` lists every slot, so adding a slot without a color here won't compile.
+    pub fn slot(&self, slot: Slot) -> Rgb {
+        match slot {
+            Slot::Bg => self.bg,
+            Slot::Fg => self.fg,
+            Slot::Muted => self.muted,
+            Slot::Border => self.border,
+            Slot::Accent => self.accent,
+            Slot::Selection => self.selection,
+            Slot::Task => self.task,
+            Slot::Event => self.event,
+            Slot::Ok => self.ok,
+            Slot::Warn => self.warn,
+            Slot::Danger => self.danger,
+        }
+    }
+}
+
 /// The position of a theme in [`THEMES`] (used by the theme picker), defaulting to 0.
 pub fn theme_index(name: &str) -> usize {
     THEMES
@@ -289,6 +348,17 @@ mod tests {
         assert_eq!(theme_by_name("tokyo night").name, "Tokyo Night");
         assert_eq!(theme_by_name("no such theme").name, DEFAULT_THEME);
         assert_eq!(theme_index("Gruvbox"), 2);
+    }
+
+    #[test]
+    fn slots_look_up_their_own_field() {
+        let t = &THEMES[0];
+        assert_eq!(t.slot(Slot::Bg), t.bg);
+        assert_eq!(t.slot(Slot::Task), t.task);
+        assert_eq!(t.slot(Slot::Danger), t.danger);
+        // Every slot is listed once in ALL.
+        let seen: std::collections::HashSet<Slot> = Slot::ALL.into_iter().collect();
+        assert_eq!(seen.len(), Slot::ALL.len());
     }
 
     #[test]

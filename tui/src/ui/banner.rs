@@ -3,13 +3,12 @@
 //!
 //! The letters come from `zerohour_core::banner` (half-block letters, or plain ASCII in ASCII
 //! icon mode). This file decides whether there's room for them ([`fits`]), colors them, and
-//! writes the tagline.
+//! draws the tagline (whose words come from `zerohour_core::view`, shared with Android).
 //!
 //! **Colors** come only from theme slots: each column of the letters gets a color part of the
 //! way from the `accent` slot (left edge) to the `event` slot (right edge), computed with
 //! `Rgb::lerp`. So every theme gets its own gradient, and nothing is hard-coded.
 
-use chrono::NaiveDate;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
@@ -18,6 +17,7 @@ use ratatui::widgets::Paragraph;
 use zerohour_core::banner;
 use zerohour_core::icons::IconMode;
 use zerohour_core::theme::{Rgb, Theme};
+use zerohour_core::view;
 
 use super::{NARROW_WIDTH, color, truncate};
 use crate::app::App;
@@ -74,17 +74,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    // The tagline: the next event's countdown, or today's date if there's none.
-    let next = app
-        .events
-        .iter()
-        // Visible events only (the list already leaves out hidden ones), and only upcoming
-        // ones: passed events shown with `p` have negative days.
-        .find_map(|row| match row.days {
-            Some(days) if days >= 0 => Some((row.item.title.as_str(), days)),
-            _ => None,
-        });
-    let text = tagline_text(next, app.today);
+    // The tagline: the next event's countdown, or today's date if there's none. Core picks
+    // the event (visible, upcoming ones only) and writes the words.
+    let text = view::tagline_text(view::next_upcoming(&app.events), app.today);
     lines.push(Line::from(Span::styled(
         truncate(&text, usize::from(area.width)),
         Style::new().fg(color(theme.muted)),
@@ -102,20 +94,6 @@ fn column_color(theme: &Theme, column: usize, width: usize) -> Rgb {
     // (`width.max(2) - 1` is never 0, so this never divides by zero.)
     let t = column as f32 / (width.max(2) - 1) as f32;
     theme.accent.lerp(theme.event, t)
-}
-
-/// The tagline: "Christmas is today!", "1 day to Christmas", "77 days to Christmas", or the
-/// date (e.g. "Fri Oct 09 2026") when there's no upcoming event.
-///
-/// `next` is the soonest upcoming event as (title, days until it). The app's event list is
-/// already sorted soonest first, so the caller just passes the first upcoming one.
-pub fn tagline_text(next: Option<(&str, i64)>, today: NaiveDate) -> String {
-    match next {
-        Some((title, 0)) => format!("{title} is today!"),
-        Some((title, 1)) => format!("1 day to {title}"),
-        Some((title, days)) => format!("{days} days to {title}"),
-        None => today.format("%a %b %d %Y").to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -162,23 +140,5 @@ mod tests {
                 theme.accent.lerp(theme.event, 0.5)
             );
         }
-    }
-
-    #[test]
-    fn tagline_wording() {
-        let today = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
-        assert_eq!(
-            tagline_text(Some(("Launch day", 0)), today),
-            "Launch day is today!"
-        );
-        assert_eq!(
-            tagline_text(Some(("Conference", 1)), today),
-            "1 day to Conference"
-        );
-        assert_eq!(
-            tagline_text(Some(("Christmas", 77)), today),
-            "77 days to Christmas"
-        );
-        assert_eq!(tagline_text(None, today), "Fri Oct 09 2026");
     }
 }

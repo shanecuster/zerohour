@@ -35,6 +35,7 @@ use ratatui::widgets::{Block, BorderType, Padding};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use zerohour_core::APP_NAME;
 use zerohour_core::theme::{Rgb, Theme};
+use zerohour_core::view;
 
 use crate::app::{App, Overlay, Screen};
 
@@ -118,7 +119,7 @@ pub fn screen_block<'a>(app: &'a App, subtitle: &'a str) -> Block<'a> {
         right.push(indicator);
     }
     right.push(Span::styled(
-        format!(" {} ", app.today.format("%a %b %d %Y")),
+        format!(" {} ", view::long_date(app.today)),
         Style::new().fg(color(theme.muted)),
     ));
     let date = Line::from(right).alignment(Alignment::Right);
