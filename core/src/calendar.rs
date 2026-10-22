@@ -51,6 +51,17 @@ impl WeekStart {
         }
     }
 
+    /// The seven weekdays in display order, starting with this week start. Used for the day
+    /// checkboxes in the add/edit form, so they follow the same order as the calendar.
+    pub fn weekdays(self) -> [Weekday; 7] {
+        // `use Weekday::*` lets us write `Sun` instead of `Weekday::Sun` inside this function.
+        use Weekday::*;
+        match self {
+            WeekStart::Sunday => [Sun, Mon, Tue, Wed, Thu, Fri, Sat],
+            WeekStart::Monday => [Mon, Tue, Wed, Thu, Fri, Sat, Sun],
+        }
+    }
+
     /// Two-letter column headers, in display order (e.g. `["Su", "Mo", ...]`).
     pub fn day_labels(self) -> [&'static str; 7] {
         match self {

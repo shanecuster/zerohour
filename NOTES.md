@@ -365,7 +365,50 @@ employers or servers), built so the main screen and the stats screen both look p
   **Command:** `cargo run -p zerohour -- --demo` (then `Tab` for the stats screen)
   **When:** for README images or to check a theme; the data is fictional and always current.
 
-### Next: Phase 3 (Android)
+---
 
-The Android app can reuse `zerohour_core::sync` as-is (enable the `sync` feature, not
-`keyring`), and provide its own `SecretStore` backed by the Android Keystore.
+## Phase 3, step 1: shared screen logic in core (done 2026-10-22)
+
+Branch `feature/core-view`. Preparation for the Android app: everything that decides *what*
+the screens show moved from `tui/` into `core/`, so the phone can't drift from the terminal.
+Nothing changes on screen.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/theme.rs` | `Slot`: the *name* of a theme color (`Danger`, `Muted`...), and `Theme::slot` to look it up. Shared code says "draw this in Danger"; each app picks the actual color. |
+| `core/src/view.rs` | The main screen's content: which tasks and events are listed and in what order (`open_tasks`, `event_rows`), the "due in 3d" / "78 days" texts and their color slots (`due_label`, `countdown_label`), the banner tagline, and small texts (dates, repeat labels). |
+| `core/src/form.rs` | The add/edit form: the values as typed (`FormInput`), which fields appear, the repeat choices with the weekday presets, validation (`validate` → `FormData`), and the date/time previews. |
+| `core/src/calendar.rs` | `WeekStart::weekdays`: the day order for the day checkboxes. |
+| `tui/` | Calls the above. The TUI's `Form` now holds a core `FormInput` plus what only the terminal needs (focus, cursor, error line, calendar popup). |
+
+**Tests:** 150 without sync, 208 with. The column-alignment tests now check core's labels.
+
+### How "identical output" was checked
+
+Before the change, a temporary test (never committed) drew about 47,600 screens:
+- **Screens:** main, stats and the add/edit form, with demo data plus extra edge cases.
+- **Variations:** 3 dates, 3 icon modes, 12/24-hour times, 2 themes, 6 terminal sizes, with
+  and without passed events, and different selected rows.
+- **Recorded:** every cell's character, colors and bold/italic, plus each form's validation
+  result.
+
+After each commit the same screens were drawn again and compared: all identical, with and
+without sync.
+
+### Decisions for Phase 3 (Android)
+
+- **Sync password on Android**: kept on the Kotlin side, encrypted with a key that lives in the
+  Android Keystore, and passed into Rust for each sync (`sync_database(..., password, ...)`).
+  The phone doesn't implement Rust's `SecretStore` trait. That trait (OS keyring or `0600`
+  file) stays a desktop thing. Android builds core with `sync` but without `keyring`.
+- **Phone sync is https only**: no plain `http://`, not even on a private network.
+- **Demo data** will move into core and be used only by Android *debug* builds, in memory,
+  never syncing.
+- **Touch**: one tap opens edit; swipe right completes; swipe left asks before deleting; the
+  checkbox only shows state.
+- **Reminders**: the core reminder planner (migration 4) and Android alarms are the *last* step
+  of Phase 3. The desktop `zerohour remind` command and ntfy stay in Phase 4.
+- **No machine-specific paths** (JDK, SDK) in committed files: environment variables or a
+  git-ignored file only. Signing keys and keystores stay out of git.

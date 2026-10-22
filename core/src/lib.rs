@@ -9,10 +9,13 @@
 //! - [`banner`]   — the big "zerohour" title letters (two fonts, picked by icon mode).
 //! - [`calendar`] — month-grid math for the date picker (which date goes in which cell).
 //! - [`clock`]  — times of day: parsing "2pm", 12/24-hour display, "in 3h" countdowns.
+//! - [`form`]   — the add/edit form's fields, repeat choices, validation and previews.
 //! - [`db`]     — SQLite storage: schema, migrations, create/read/update/delete, completion log.
 //! - [`stats`]  — statistics (streaks, per-week counts, overdue) computed from the completion log.
 //! - [`theme`]  — named color slots and the built-in palettes (Everforest, Dracula, ...).
 //! - [`icons`]  — every icon in one table with Nerd Font / Unicode / ASCII versions.
+//! - [`view`]   — what the main screen lists and how (sorting, "due in 3d" texts, color slots,
+//!   tagline), shared by the TUI and the Android app so they show the same thing.
 //! - `sync`     — optional CouchDB sync (only with the `sync` cargo feature; see `sync/mod.rs`).
 //!
 //! A Rust "crate" is a package; a "module" is one file (or folder) inside it. `pub mod x;`
@@ -22,6 +25,7 @@ pub mod banner;
 pub mod calendar;
 pub mod clock;
 pub mod db;
+pub mod form;
 pub mod icons;
 pub mod model;
 pub mod repeat;
@@ -31,6 +35,7 @@ pub mod stats;
 #[cfg(feature = "sync")]
 pub mod sync;
 pub mod theme;
+pub mod view;
 
 /// The app's name, used for the data folder, window titles, and the header.
 ///

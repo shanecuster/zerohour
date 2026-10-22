@@ -20,16 +20,17 @@ use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::clock::TimeFormat;
 use zerohour_core::db::{Db, settings_keys};
+use zerohour_core::form::FormData;
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
-use zerohour_core::repeat::{days_until, event_is_visible, event_target};
 use zerohour_core::stats::{self, Stats};
 use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
+use zerohour_core::view::{self, EventRow};
 
 use crate::input::{Action, main_action};
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
-use crate::ui::add::{Form, FormData, FormOutcome, FormPrefs};
+use crate::ui::add::{Form, FormOutcome, FormPrefs};
 use crate::ui::calendar::GridArea;
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
@@ -111,16 +112,6 @@ pub struct Status {
     pub text: String,
     /// Errors are drawn in the theme's `danger` color.
     pub is_error: bool,
-}
-
-/// An event plus its precomputed countdown, so drawing doesn't redo date math.
-#[derive(Debug, Clone)]
-pub struct EventRow {
-    pub item: Item,
-    /// The date being counted down to (rolled forward if repeating).
-    pub target: Option<NaiveDate>,
-    /// Days from today to `target`: 0 = today, negative = already passed.
-    pub days: Option<i64>,
 }
 
 /// The whole application state.
@@ -258,53 +249,10 @@ impl App {
         let today = self.today;
         let items = self.db.list_items()?;
 
-        // Open tasks only: completed ones stay in the database as history (and in stats).
-        let mut tasks: Vec<Item> = items
-            .iter()
-            .filter(|i| i.kind == Kind::Task && !i.is_completed())
-            .cloned()
-            .collect();
-        // Sort by priority (High first), then due date (soonest first, no date last), then
-        // title. `then_with` only looks at the next rule when the previous one is a tie.
-        tasks.sort_by(|a, b| {
-            b.priority
-                .cmp(&a.priority)
-                .then_with(|| match (a.date, b.date) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                })
-                // Same day: timed tasks first, earliest first; untimed ones after them.
-                .then_with(|| match (a.due_time, b.due_time) {
-                    (Some(x), Some(y)) => x.cmp(&y),
-                    (Some(_), None) => std::cmp::Ordering::Less,
-                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                    (None, None) => std::cmp::Ordering::Equal,
-                })
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-        });
-
-        let mut events: Vec<EventRow> = items
-            .iter()
-            .filter(|i| i.kind == Kind::Event)
-            .filter(|i| self.show_passed || event_is_visible(i, today))
-            .map(|i| {
-                let target = event_target(i, today);
-                EventRow {
-                    item: i.clone(),
-                    target,
-                    days: target.map(|t| days_until(t, today)),
-                }
-            })
-            .collect();
-        // Soonest first; passed events (negative days) go to the bottom, most recent first.
-        // `sort_by_key` sorts by a computed key; tuples compare element by element.
-        events.sort_by_key(|e| match e.days {
-            Some(d) if d >= 0 => (0, d),
-            Some(d) => (1, -d),
-            None => (2, 0),
-        });
+        // Which tasks and events to list, and in what order, is decided in core
+        // (`zerohour_core::view`), so the Android app lists exactly the same things.
+        let tasks = view::open_tasks(&items);
+        let events = view::event_rows(&items, today, self.show_passed);
 
         let completions = self.db.list_completions()?;
         self.stats = stats::compute(&completions, &items, self.now, &Local);
