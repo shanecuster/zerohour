@@ -12,7 +12,6 @@
 //! ran `reset`.
 
 mod app;
-mod demo;
 mod input;
 #[cfg(feature = "sync")]
 mod sync;
@@ -23,6 +22,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use clap::Parser;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -35,6 +35,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{cursor, execute};
 use zerohour_core::APP_NAME;
 use zerohour_core::db::{Db, default_db_path};
+use zerohour_core::demo;
 
 use crate::app::{App, local_now};
 
@@ -93,7 +94,7 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
     // `--demo` without `--db`: a throwaway in-memory database filled with samples.
     if args.demo && args.db.is_none() {
         let db = Db::open_in_memory()?;
-        demo::seed(&db, local_now()).context("couldn't load the demo data")?;
+        demo::seed(&db, local_now(), &Local).context("couldn't load the demo data")?;
         return Ok((db, None));
     }
 
@@ -106,7 +107,7 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
     // The DbError message already names the file and the problem.
     let db = Db::open(&path)?;
     if args.demo {
-        demo::seed(&db, local_now()).context("couldn't load the demo data")?;
+        demo::seed(&db, local_now(), &Local).context("couldn't load the demo data")?;
         return Ok((db, None));
     }
     Ok((db, Some(path)))
@@ -216,6 +217,31 @@ mod tests {
         let (_db, path) = open_database(&args).unwrap();
         assert!(path.is_none());
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// The stats the app itself computes (what the screen draws) match the demo's design, and
+    /// match what core's stats give for the same seeded data in the machine's time zone.
+    #[test]
+    fn app_shows_the_same_stats() {
+        use zerohour_core::demo::STREAK_DAYS;
+        use zerohour_core::stats::{self, WEEKS_SHOWN};
+
+        let db = Db::open_in_memory().unwrap();
+        let now = local_now();
+        demo::seed(&db, now, &Local).unwrap();
+        let app = App::new(db, true, None).unwrap();
+        assert_eq!(app.stats.current_streak, STREAK_DAYS as u32);
+        assert_eq!(app.stats.overdue_count, 1);
+        assert_eq!(app.stats.per_week.len(), WEEKS_SHOWN);
+
+        // The same demo, seeded as of the app's own "now", with stats computed directly.
+        let other = Db::open_in_memory().unwrap();
+        demo::seed(&other, app.now, &Local).unwrap();
+        let items = other.list_items().unwrap();
+        let completions = other.list_completions().unwrap();
+        let expected = stats::compute(&completions, &items, app.now, &Local);
+        assert_eq!(app.stats.total_all, expected.total_all);
+        assert_eq!(app.stats.by_priority, expected.by_priority);
     }
 
     /// A unique-enough suffix for a temp file name (process id + nanoseconds).

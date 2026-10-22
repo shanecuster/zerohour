@@ -253,7 +253,7 @@ Work in order. Finish and test each phase before the next. After each phase: upd
 - Handle offline gracefully: failed sync never blocks the app, just shows a status indicator.
 
 ### Phase 3 — Android
-- Android Studio project (Kotlin + Jetpack Compose) in an `android/` folder.
+- Android Studio project (Kotlin + Jetpack Compose) in its own repository, `zerohour-android` (not a folder in this repo). It pins `zerohour-core` as a git dependency at one exact commit, so a change here never reaches the app until the pin is moved on purpose.
 - Rust `core` exposed via UniFFI; build with `cargo-ndk` (targets: `aarch64-linux-android`, `x86_64-linux-android`, `armv7-linux-androideabi`).
 - Look like a TUI: bundled monospace Nerd Font (e.g. JetBrains Mono), box-drawing borders drawn on Canvas, the same theme palettes from `core`, block-character bar charts, `[ ]`/`[x]` checkboxes.
 - Touch: tap to select, swipe to complete/delete, `[+]` button, bottom tab bar (Tasks / Events / Stats).

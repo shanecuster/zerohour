@@ -1,4 +1,5 @@
-//! Sample data for `zerohour --demo`, so the layout can be judged (and screenshotted) right away.
+//! Sample data for `zerohour --demo` and the Android debug builds, so the layout can be judged
+//! (and screenshotted) right away.
 //!
 //! Everything here is fictional: no real people, places, employers or servers. All dates are
 //! relative to "now", so the demo always looks current:
@@ -11,16 +12,21 @@
 //!   current streak of exactly [`STREAK_DAYS`] days, a few late completions, and a priority mix
 //!   of roughly 40% Medium, 35% High and 25% Low.
 //!
-//! `main.rs` only ever seeds an in-memory database (or a file the person named with `--db`), and
-//! demo mode never syncs, so none of this can reach the real database, server or keyring.
+//! It lives in `core` (not in the TUI) so the terminal app and the Android app show exactly the
+//! same sample data. Each app decides *where* it goes: the TUI seeds an in-memory database (or a
+//! file the person named with `--db`), Android debug builds an in-memory one. Neither ever syncs
+//! demo data, so none of this can reach the real database, server or keyring.
+//!
+//! Like the rest of `core`, nothing here reads the clock or the machine's time zone: the caller
+//! passes "now" and the time zone in.
 
-use anyhow::Result;
 use chrono::{
-    DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Timelike, Utc,
+    DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
 };
-use zerohour_core::db::Db;
-use zerohour_core::model::{Completion, DaySet, Item, Kind, Priority, RepeatRule, Unit, new_id};
-use zerohour_core::stats::{WEEKS_SHOWN, week_start};
+
+use crate::db::{Db, Result};
+use crate::model::{Completion, DaySet, Item, Kind, Priority, RepeatRule, Unit, new_id};
+use crate::stats::{WEEKS_SHOWN, week_start};
 
 /// Length of the "current streak" the stats screen shows: the last this-many days (ending
 /// yesterday) all have completions, and the day before them has none.
@@ -75,11 +81,18 @@ type SampleEvent = (&'static str, NaiveDate, RepeatRule, Option<&'static str>);
 
 /// Fills the database with sample tasks, events, and completion history.
 ///
-/// `now` is the local date and time, passed in (rather than read from the clock) so tests can
-/// seed the demo as of any moment they like.
-pub fn seed(db: &Db, now: NaiveDateTime) -> Result<()> {
+/// - `now`: the local date and time, passed in (rather than read from the clock) so tests can
+///   seed the demo as of any moment they like.
+/// - `tz`: the user's time zone, used to turn local times into the UTC timestamps the database
+///   stores, so each completion lands on the intended *local* day (the day the stats screen
+///   counts it on). Generic over `TimeZone` for the same reason as
+///   [`stats::compute`](crate::stats::compute): the apps pass `chrono::Local`, tests pass `Utc`
+///   or a fixed offset so they don't depend on the machine running them.
+///
+/// Returns the first database error, if any (the database is left part-filled in that case).
+pub fn seed<Tz: TimeZone>(db: &Db, now: NaiveDateTime, tz: &Tz) -> Result<()> {
     let today = now.date();
-    let created = local_to_utc(now);
+    let created = local_to_utc(now, tz);
     // A tiny helper: today + n days (negative n = in the past).
     let day = |n: i64| today + TimeDelta::days(n);
 
@@ -197,7 +210,7 @@ pub fn seed(db: &Db, now: NaiveDateTime) -> Result<()> {
     let mut date = first_day;
     while date < today {
         for k in 0..completions_on(date, today, first_day) {
-            let completed_at = local_to_utc(date.and_time(afternoon(k)));
+            let completed_at = local_to_utc(date.and_time(afternoon(k)), tz);
             let priority = PRIORITY_CYCLE[n % PRIORITY_CYCLE.len()];
             let title = HISTORY_TITLES[n % HISTORY_TITLES.len()];
             let late = n % LATE_EVERY == 5;
@@ -305,15 +318,16 @@ fn next_christmas(today: NaiveDate) -> NaiveDate {
     }
 }
 
-/// Converts a local wall-clock time to UTC for storage.
+/// Converts a wall-clock time in `tz` to UTC for storage.
 ///
-/// Going through local time makes sure a completion lands on the intended day in YOUR time
+/// Going through the user's zone makes sure a completion lands on the intended day in THEIR time
 /// zone, which is the zone the stats screen uses.
-fn local_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
-    // `.earliest()` picks a time even on the rare DST-change hour where a local time is
+fn local_to_utc<Tz: TimeZone>(naive: NaiveDateTime, tz: &Tz) -> DateTime<Utc> {
+    // `and_local_timezone` takes the zone by value, so we hand it a copy (`clone`; zones are
+    // tiny). `.earliest()` picks a time even on the rare DST-change hour where a local time is
     // ambiguous; if it doesn't exist at all, treat it as UTC (only a demo).
     naive
-        .and_local_timezone(Local)
+        .and_local_timezone(tz.clone())
         .earliest()
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or_else(|| naive.and_utc())
@@ -322,8 +336,29 @@ fn local_to_utc(naive: NaiveDateTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zerohour_core::repeat::is_overdue;
-    use zerohour_core::stats::{self, Stats};
+    use crate::repeat::is_overdue;
+    use crate::stats::{self, Stats};
+    use chrono::FixedOffset;
+
+    /// The time zones every test runs in: UTC, and a fixed UTC−6 (like Denver in winter), where
+    /// an afternoon completion is already "tomorrow" in UTC. Fixed zones, never `Local`, so the
+    /// results don't depend on the machine running the tests.
+    fn zones() -> Vec<FixedOffset> {
+        // Both offsets are within ±24h, so `east_opt` always succeeds.
+        vec![
+            FixedOffset::east_opt(0).unwrap(),
+            FixedOffset::west_opt(6 * 3600).unwrap(),
+        ]
+    }
+
+    /// Every (moment, zone) pair the tests check.
+    fn cases() -> Vec<(NaiveDateTime, FixedOffset)> {
+        // `flat_map` pairs each moment with each zone and flattens the result into one list.
+        moments()
+            .into_iter()
+            .flat_map(|now| zones().into_iter().map(move |tz| (now, tz)))
+            .collect()
+    }
 
     /// A spread of moments to seed the demo at: a Monday morning, a Thursday after the report
     /// is due, a late Sunday evening, the day after Christmas, and New Year's Day.
@@ -345,21 +380,22 @@ mod tests {
         .collect()
     }
 
-    /// Seeds a fresh in-memory database as of `now` and returns its items and stats, computed
-    /// exactly the way `App::refresh` does for the stats screen.
-    fn seeded(now: NaiveDateTime) -> (Vec<Item>, Vec<Completion>, Stats) {
+    /// Seeds a fresh in-memory database as of `now` in zone `tz` and returns its items and
+    /// stats, computed the way the apps do for the stats screen.
+    fn seeded(now: NaiveDateTime, tz: &FixedOffset) -> (Vec<Item>, Vec<Completion>, Stats) {
         let db = Db::open_in_memory().unwrap();
-        seed(&db, now).unwrap();
+        seed(&db, now, tz).unwrap();
         let items = db.list_items().unwrap();
         let completions = db.list_completions().unwrap();
-        let stats = stats::compute(&completions, &items, now, &Local);
+        let stats = stats::compute(&completions, &items, now, tz);
         (items, completions, stats)
     }
 
+    /// Every event is upcoming, and exactly one open task is overdue, whatever the moment.
     #[test]
     fn no_past_events_and_exactly_one_overdue_task() {
-        for now in moments() {
-            let (items, _, _) = seeded(now);
+        for (now, tz) in cases() {
+            let (items, _, _) = seeded(now, &tz);
             let today = now.date();
             let open: Vec<&Item> = items.iter().filter(|i| !i.is_completed()).collect();
 
@@ -392,14 +428,15 @@ mod tests {
         }
     }
 
+    /// The completion log covers exactly the twelve charted weeks, up to yesterday.
     #[test]
     fn history_spans_the_last_twelve_weeks() {
-        for now in moments() {
-            let (_, completions, stats) = seeded(now);
+        for (now, tz) in cases() {
+            let (_, completions, stats) = seeded(now, &tz);
             let today = now.date();
             let days: Vec<NaiveDate> = completions
                 .iter()
-                .map(|c| c.completed_at.with_timezone(&Local).date_naive())
+                .map(|c| c.completed_at.with_timezone(&tz).date_naive())
                 .collect();
             let oldest_monday = week_start(today) - TimeDelta::weeks(11);
             assert_eq!(*days.iter().min().unwrap(), oldest_monday);
@@ -415,10 +452,11 @@ mod tests {
         }
     }
 
+    /// The stats screen gets the designed streak, overdue count, late share and priority mix.
     #[test]
     fn stats_look_populated() {
-        for now in moments() {
-            let (_, _, stats) = seeded(now);
+        for (now, tz) in cases() {
+            let (_, _, stats) = seeded(now, &tz);
             assert_eq!(stats.current_streak, STREAK_DAYS as u32, "at {now}");
             assert_eq!(stats.longest_streak, STREAK_DAYS as u32, "at {now}");
             assert_eq!(stats.overdue_count, 1);
@@ -442,6 +480,7 @@ mod tests {
         }
     }
 
+    /// The "due later today" time is on the hour and never spills into tomorrow.
     #[test]
     fn later_today_stays_today() {
         let date = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
@@ -451,26 +490,12 @@ mod tests {
         assert_eq!(later_today(at(22, 30)), at(23, 59));
     }
 
+    /// Christmas is this year's until it has passed, then next year's.
     #[test]
     fn next_christmas_is_never_in_the_past() {
         let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
         assert_eq!(next_christmas(d(2026, 10, 9)), d(2026, 12, 25));
         assert_eq!(next_christmas(d(2026, 12, 25)), d(2026, 12, 25));
         assert_eq!(next_christmas(d(2026, 12, 26)), d(2027, 12, 25));
-    }
-
-    /// The stats the app itself computes (what the screen draws) match the demo's design.
-    #[test]
-    fn app_shows_the_same_stats() {
-        let db = Db::open_in_memory().unwrap();
-        let now = crate::app::local_now();
-        seed(&db, now).unwrap();
-        let app = crate::app::App::new(db, true, None).unwrap();
-        assert_eq!(app.stats.current_streak, STREAK_DAYS as u32);
-        assert_eq!(app.stats.overdue_count, 1);
-        assert_eq!(app.stats.per_week.len(), WEEKS_SHOWN);
-        let (_, _, expected) = seeded(app.now);
-        assert_eq!(app.stats.total_all, expected.total_all);
-        assert_eq!(app.stats.by_priority, expected.by_priority);
     }
 }
