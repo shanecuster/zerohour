@@ -412,3 +412,39 @@ without sync.
   of Phase 3. The desktop `zerohour remind` command and ntfy stay in Phase 4.
 - **No machine-specific paths** (JDK, SDK) in committed files: environment variables or a
   git-ignored file only. Signing keys and keystores stay out of git.
+
+---
+
+## Phase 3, step 1b: demo data in core (done 2026-10-22)
+
+Branch `feature/core-demo`. The `--demo` sample data moved from `tui/src/demo.rs` to
+`core/src/demo.rs`, so the Android debug builds can show exactly the same tasks, events and
+stats history. Nothing changes on screen.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/demo.rs` | The seeder, unchanged in content. `seed(db, now, tz)` now also takes the time zone (like `stats::compute`), so core never reads the machine's zone, and it returns core's `DbError` instead of `anyhow`. |
+| `tui/src/main.rs` | Calls `zerohour_core::demo::seed(&db, local_now(), &Local)`. The test that needs the TUI's `App` (`app_shows_the_same_stats`) moved here. |
+| `docs/BUILD_PLAN.md` | Phase 3 now says the Android app is its own repository, `zerohour-android`, pinning core by commit. |
+
+**Tests:** 150 without sync, 208 with (the same totals: five demo tests moved from `tui` to
+`core`). The core demo tests now run in UTC and a fixed UTC−6 zone instead of the machine's.
+
+### How "same data, same screens" was checked
+
+- A temporary test (never committed) seeded the old TUI seeder and the new core one side by side
+  at 3,365 moments spread over two years, in three time zones (Denver, Berlin, Auckland, so
+  daylight-saving changes are covered), and compared every item and completion field except the
+  random IDs: all identical.
+- The old (`f372000`) and new release binaries ran `--demo` in tmux at 120×45 and 50×40, and the
+  main and stats screens were captured with colors: identical.
+
+### Decisions made while building (worth knowing)
+
+- **Time zone as a parameter.** The TUI passes `chrono::Local`, which is what it used before, so
+  `--demo` behaves exactly as it did. Android will pass `Local` too.
+- **The reminder planner (migration 4) is not part of this.** It comes with the reminders step
+  at the end of Phase 3, with a backup of the real database first.
+
