@@ -222,7 +222,7 @@ The next sync compares everything again, without creating duplicates. Changing t
 
 ## Project layout
 
-- `core/`: all the logic (data model, repeat and countdown math, storage, stats, themes, icons, and the optional sync in `core/src/sync/`). It has no terminal code, so it can be reused by other front ends.
+- `core/`: all the logic (data model, repeat and countdown math, storage, stats, reminder planning, themes, icons, and the optional sync in `core/src/sync/`). It has no terminal code, so it can be reused by other front ends.
 - `tui/`: the Ratatui terminal interface.
 
 ## Roadmap

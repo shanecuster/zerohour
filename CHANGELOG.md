@@ -6,6 +6,12 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Reminder planning in core** (used by the Android app; the terminal app's reminder command comes
+  later): tasks with a due time are reminded at that time, plus an optional earlier reminder;
+  repeating ones on each scheduled day while still open; tasks due on a day without a time at a
+  set time of day (09:00 by default); an optional daily list of overdue tasks. Off until switched
+  on, set per device and never synced. No database change.
+
 - **Better `--demo` data** for screenshots, all fictional and relative to today: 8 tasks (one due
   later today, one overdue, a Mon–Thu 2:00 PM "Submit weekly report", one with notes), 5 upcoming
   events (Christmas, a product launch, a monthly book club, a concert, a trip), and 12 weeks of

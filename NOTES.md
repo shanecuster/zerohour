@@ -273,13 +273,14 @@ Branch `feature/schedule`, built on top of `feature/sync`.
   **Command:** `a` → Task → title → Due time `2pm` → Repeat `←→` to "Mon–Thu" → `Enter`
   **When:** recurring work-day tasks. Completing Thursday's makes Monday's.
 
-### Planned later: reminders (design approved, not built)
+### Planned later: the desktop `zerohour remind` command (Phase 4, not built)
+
+The reminder *planner* and its settings are now built in core (see "Phase 3, step 11a" below).
+What is still planned for the desktop:
 
 - `zerohour remind`: a command that sends any due reminders and exits, run every minute by a
   systemd user timer (`Persistent=true`; `zerohour remind --print-units` prints the unit files).
-- Fires at the due time (`reminders.lead_minutes`, default 0, adds an earlier one), and at
-  `reminders.day_time` (default 09:00) for tasks due today without a time. Overdue digest: off by
-  default.
+- What it reminds about comes from core's planner (`reminders::plan`), the same as the phone.
 - Desktop notifications with `notify-send`; optional ntfy (its own cargo feature, server and topic
   as settings, token in the `SecretStore`), enabled on one device only to avoid duplicates.
 - De-duplication in a local, never-synced table `reminders_sent (item_id, kind, fire_at, sent_at)`;
@@ -447,4 +448,60 @@ stats history. Nothing changes on screen.
   `--demo` behaves exactly as it did. Android will pass `Local` too.
 - **The reminder planner (migration 4) is not part of this.** It comes with the reminders step
   at the end of Phase 3, with a backup of the real database first.
+
+---
+
+## Phase 3, step 11a: the reminder planner in core (done 2026-10-22)
+
+Branch `feature/reminders`. Core now works out *which reminders are due when*; the Android app
+turns that into alarms and notifications. Nothing changes in the terminal app yet (its
+`zerohour remind` command is Phase 4).
+
+### What was built
+
+| File | What it does |
+|---|---|
+| `core/src/reminders.rs` | `ReminderSettings` (load and save, with defaults and checks) and the planner, `plan(items, now, until, settings, time_format)`, which returns the reminders after `now` and up to `until`, earliest first. |
+| `core/src/db.rs` | Four new setting keys: `reminders.enabled`, `reminders.lead_minutes`, `reminders.day_time`, `reminders.overdue_digest`. |
+
+### What gets a reminder
+
+- **A task with a due time:** at that time ("Due 2:00 PM"), plus `lead_minutes` earlier if set
+  ("Due in 15 min (2:00 PM)"). A lead time can cross midnight.
+- **A repeating task with a due time:** also at each later scheduled time while it stays open. A
+  missed Monday 2 PM "Fill Out Your Timesheet" (Mon–Thu) still reminds on Tuesday at 2 PM. Every
+  reminder names the stored open instance, so completing it creates the next one as usual.
+- **A task due on a day without a time:** once, at `day_time` (09:00) on that day ("Due today").
+  Only its open instance; once the day is over it is just overdue.
+- **The overdue digest** (off by default): once a day at `day_time`, the tasks overdue at that
+  moment ("3 overdue tasks", up to five titles then "and N more"). Not about one task, so it has no
+  "Done".
+- **Never:** completed or deleted tasks, tasks without a date, and events (a "morning of" event
+  notice could be a separate, off-by-default setting later).
+
+### Rules worth knowing
+
+- **Only the future.** Nothing at or before "now" is returned, so a device that was off when a
+  reminder was due never gets it replayed.
+- **Floating times.** Reminders are local wall-clock times with no time zone, like due times.
+  The app turns them into real moments with the device's current zone. On Android that is
+  `java.time`: a time inside the spring-forward gap fires just after it, a time in the fall-back
+  overlap fires at the first of the two, and after a time-zone change "2 PM" is 2 PM in the new
+  zone.
+- **Settings are per device.** They live in the `settings` table, which is never synced.
+  Reminders are off until switched on; lead time 0 (stored 0–1440, anything else counts as 0);
+  day time 09:00; digest off. Values that aren't understood fall back to the defaults.
+- **`Reminder::key()`** ("item|Kind|2026-10-26T14:00") names a reminder the same way every time
+  it is planned, so an app can schedule it exactly once and cancel the ones no longer planned.
+- **No migration 4 now.** The `reminders_sent` table was for de-duplicating a command that polls
+  every minute; an app that schedules alarms doesn't need it. It stays with the Phase 4 desktop
+  command. Checked: no build, branch or database has ever used number 4, and the real database is
+  at schema 3.
+- **No sync change.** Reminders are worked out from items; no new document fields, no `v` bump.
+
+### Save to your personal notes
+
+- **Title:** Run only the reminder tests
+  **Command:** `cargo test -p zerohour-core reminders`
+  **When:** after changing anything in `core/src/reminders.rs` or the repeat rules.
 
