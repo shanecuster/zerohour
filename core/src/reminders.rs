@@ -20,6 +20,9 @@
 //!   open instance, and the plan still reminds on Tuesday at 2 PM, Wednesday at 2 PM, and so
 //!   on: exactly the times the task is due again. Completing it creates the next instance as
 //!   usual, and the next plan follows that one;
+//! - a task due on a day *without* a time: once, at `day_time` (09:00 by default) on that day,
+//!   "Due today". Only its open instance: once that day is over, an untimed task is simply
+//!   overdue (see the digest below);
 //! - nothing that is completed or deleted, and no events.
 //!
 //! Only reminders in the future are returned. A device that was off at a reminder's time
@@ -487,6 +490,50 @@ mod plan_tests {
     }
 
     #[test]
+    fn an_untimed_task_is_reminded_at_day_time_on_its_day() {
+        let items = [
+            task("Today", Some(d(2026, 10, 22)), None),
+            task("Tomorrow", Some(d(2026, 10, 23)), None),
+            task("No date", None, None),
+        ];
+        let plan = plan48(&items, at(2026, 10, 22, 7, 0), &on(15));
+        // The lead time is only for timed tasks.
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::DayOf, at(2026, 10, 22, 9, 0)),
+                (ReminderKind::DayOf, at(2026, 10, 23, 9, 0)),
+            ]
+        );
+        assert_eq!(plan[0].title, "Today");
+        assert_eq!(plan[0].body, "Due today");
+    }
+
+    #[test]
+    fn untimed_reminders_follow_the_day_time_setting_and_skip_the_past() {
+        let items = [task("Today", Some(d(2026, 10, 22)), None)];
+        let settings = ReminderSettings {
+            day_time: t(7, 30),
+            ..on(0)
+        };
+        assert_eq!(
+            times(&plan48(&items, at(2026, 10, 22, 6, 0), &settings)),
+            [(ReminderKind::DayOf, at(2026, 10, 22, 7, 30))]
+        );
+        // Already past today's day time: nothing (and no catch-up).
+        assert!(plan48(&items, at(2026, 10, 22, 10, 0), &settings).is_empty());
+    }
+
+    #[test]
+    fn an_overdue_untimed_repeating_task_waits_for_its_open_instance() {
+        // Only the open instance is reminded: yesterday's daily untimed task is overdue now,
+        // which is the digest's job, not another "due today".
+        let mut item = task("Water plants", Some(d(2026, 10, 21)), None);
+        item.repeat = RepeatRule::Daily;
+        assert!(plan48(&[item], at(2026, 10, 22, 7, 0), &on(0)).is_empty());
+    }
+
+    #[test]
     fn the_key_names_item_kind_and_time() {
         let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
         let plan = plan48(&items, at(2026, 10, 22, 9, 0), &on(0));
@@ -506,6 +553,8 @@ pub enum ReminderKind {
     Due,
     /// `lead_minutes` before a timed task's due time.
     Lead,
+    /// At `day_time` on the day an untimed task is due.
+    DayOf,
 }
 
 /// One planned reminder.
@@ -564,8 +613,23 @@ pub fn plan(
     let in_window = |at: NaiveDateTime| at > now && at <= until;
 
     for item in items.iter().filter(|i| is_open_task(i)) {
-        // `let ... else`: continue with this item only if it has BOTH a date and a time.
-        let (Some(date), Some(time)) = (item.date, item.due_time) else {
+        // A task without a date is never reminded.
+        let Some(date) = item.date else {
+            continue;
+        };
+        // `let ... else`: the code below is for tasks WITH a due time; an untimed one gets
+        // its single "due today" reminder here and moves on.
+        let Some(time) = item.due_time else {
+            let fire_at = date.and_time(settings.day_time);
+            if in_window(fire_at) {
+                reminders.push(Reminder {
+                    item_id: item.id.clone(),
+                    kind: ReminderKind::DayOf,
+                    fire_at,
+                    title: item.title.clone(),
+                    body: "Due today".to_string(),
+                });
+            }
             continue;
         };
         // The days to look at: the open instance's due date and, for a repeating task, each
