@@ -19,6 +19,7 @@ mod remind;
 #[cfg(feature = "sync")]
 mod sync;
 mod ui;
+mod units;
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Stdout, stdout};
@@ -77,6 +78,25 @@ struct RemindArgs {
     /// Only print what would be shown now and what is planned next; show and record nothing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Print the systemd user service and timer that run this every minute (nothing is
+    /// installed; save them under ~/.config/systemd/user/ yourself).
+    #[arg(long, conflicts_with_all = ["dry_run", "print_unit"])]
+    print_units: bool,
+
+    /// Print just one of the two unit files, e.g. to redirect it into place.
+    #[arg(long, value_name = "UNIT", conflicts_with = "dry_run")]
+    print_unit: Option<UnitFile>,
+}
+
+/// Which unit file `--print-unit` prints. `ValueEnum` lets clap accept the lowercase names
+/// (`service`, `timer`) and list them in `--help`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitFile {
+    /// zerohour-remind.service
+    Service,
+    /// zerohour-remind.timer
+    Timer,
 }
 
 /// The real `main`. Returning `ExitCode` lets us print our own friendly error message and exit
@@ -159,6 +179,18 @@ fn db_path(args: &Args) -> Result<PathBuf> {
 fn run_remind(args: &Args, remind: &RemindArgs) -> Result<()> {
     if args.demo {
         bail!("`remind` works on a real database; it can't be combined with --demo");
+    }
+    // Printing the unit files never opens (or creates, or upgrades) the database.
+    if remind.print_units || remind.print_unit.is_some() {
+        let exe = std::env::current_exe().context("couldn't find the zerohour binary's path")?;
+        let db = args.db.as_deref();
+        let text = match remind.print_unit {
+            Some(UnitFile::Service) => units::service(&exe, db),
+            Some(UnitFile::Timer) => units::timer(),
+            None => units::both(&exe, db),
+        };
+        print!("{text}");
+        return Ok(());
     }
     let path = db_path(args)?;
     let db = Db::open(&path)?;
@@ -383,6 +415,36 @@ mod tests {
         };
         assert!(remind.dry_run);
         assert!(run_remind(&args, remind).is_err());
+    }
+
+    /// The unit flags parse, exclude `--dry-run`, and print without creating a database.
+    #[test]
+    fn printing_units_parses_and_never_touches_a_database() {
+        let args = Args::try_parse_from(["zerohour", "remind", "--print-unit", "timer"]).unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        assert_eq!(remind.print_unit, Some(UnitFile::Timer));
+        assert!(
+            Args::try_parse_from(["zerohour", "remind", "--print-units", "--dry-run"]).is_err()
+        );
+        assert!(Args::try_parse_from(["zerohour", "remind", "--print-unit", "socket"]).is_err());
+
+        let dir = std::env::temp_dir().join(format!("zerohour-units-test-{}", uuid_like()));
+        let file = dir.join("z.db");
+        let args = Args::try_parse_from([
+            "zerohour",
+            "remind",
+            "--print-units",
+            "--db",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        run_remind(&args, remind).unwrap();
+        assert!(!dir.exists(), "printing units must not create the database");
     }
 
     /// Only one `remind` run at a time holds the lock; it's free again once dropped.
