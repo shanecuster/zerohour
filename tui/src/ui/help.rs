@@ -27,6 +27,7 @@ const KEYS: &[(&str, &str)] = &[
     ("b", "title banner on/off (shows at 30+ rows)"),
     ("Tab / s", "switch to stats and back"),
     ("t", "theme picker (live preview)"),
+    ("n", "reminders: on/off, early, day time, test"),
     ("i", "icons: Nerd Font → Unicode → ASCII"),
     ("?", "this help"),
     ("q / Ctrl+C", "quit"),

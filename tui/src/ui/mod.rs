@@ -13,6 +13,7 @@
 //! - [`stats`]    — the stats screen with the weekly bar chart.
 //! - [`settings`] — the theme picker and the first-run icon check.
 //! - [`help`]     — the `?` help overlay.
+//! - [`reminders`] — the Reminders popup (`n`): this device's reminder settings.
 //! - `sync_settings` — the sync settings popup (only with the `sync` feature).
 //!
 //! This file has the entry point [`draw`] plus small helpers every screen uses.
@@ -22,6 +23,7 @@ pub mod banner;
 pub mod calendar;
 pub mod help;
 pub mod list;
+pub mod reminders;
 pub mod settings;
 pub mod stats;
 #[cfg(feature = "sync")]
@@ -75,6 +77,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Overlay::ConfirmDelete { title, .. } => settings::draw_confirm_delete(frame, theme, title),
         Overlay::IconCheck => settings::draw_icon_check(frame, theme),
+        Overlay::Reminders(form) => {
+            reminders::draw(frame, form, theme, app.icon_mode, app.time_format);
+        }
         #[cfg(feature = "sync")]
         Overlay::SyncSettings(form) => {
             sync_settings::draw(frame, form, &app.sync, theme, app.icon_mode);
