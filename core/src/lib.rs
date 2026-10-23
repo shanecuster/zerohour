@@ -12,6 +12,8 @@
 //! - [`form`]   — the add/edit form's fields, repeat choices, validation and previews.
 //! - [`db`]     — SQLite storage: schema, migrations, create/read/update/delete, completion log.
 //! - [`demo`]   — the fictional sample data behind `--demo` and Android debug builds.
+//! - [`reminders`] — which reminders are due when (the planner) and their settings; the apps
+//!   turn them into notifications.
 //! - [`stats`]  — statistics (streaks, per-week counts, overdue) computed from the completion log.
 //! - [`theme`]  — named color slots and the built-in palettes (Everforest, Dracula, ...).
 //! - [`icons`]  — every icon in one table with Nerd Font / Unicode / ASCII versions.
@@ -30,6 +32,7 @@ pub mod demo;
 pub mod form;
 pub mod icons;
 pub mod model;
+pub mod reminders;
 pub mod repeat;
 pub mod stats;
 // `#[cfg(feature = "sync")]` = "only compile this module when the `sync` feature is on".
