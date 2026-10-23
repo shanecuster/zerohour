@@ -12,6 +12,10 @@
 //! the `sync` feature, so local-only builds don't even compile it. It reuses the helpers below,
 //! which is why a few of them are `pub(crate)` (visible inside this crate only).
 //!
+//! **Reminders.** The `reminders_sent` table (migration 4) is the desktop `zerohour remind`
+//! command's memory of what it already showed. It is per device and never synced, like
+//! `settings`.
+//!
 //! **Formats.** Calendar dates are stored as `YYYY-MM-DD` text, due times as local `HH:MM`. Timestamps are stored as UTC in
 //! RFC 3339 text (`2026-10-08T14:03:00Z`). Text sorts correctly and is easy to read with the
 //! `sqlite3` command-line tool when debugging.
@@ -52,7 +56,7 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
 /// Version 1 is the initial schema; version 2 adds the sync bookkeeping table; version 3 adds
-/// the optional due time.
+/// the optional due time; version 4 adds the desktop reminder log.
 /// NEVER edit an entry once released; add a new one instead.
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -113,6 +117,20 @@ const MIGRATIONS: &[(i64, &str)] = &[
     -- 2 PM wherever you are. NULL = no time (the whole due day counts). Additive: existing
     -- rows get NULL, and older builds that don't know the column simply never read it.
     ALTER TABLE items ADD COLUMN due_time TEXT;
+    ",
+    ),
+    (
+        4,
+        "
+    -- The reminders the desktop `zerohour remind` command has already shown, so a command
+    -- that runs every minute shows each one only once. Purely additive, and local to this
+    -- device: it is never synced (each device shows its own notifications). Apps that schedule
+    -- alarms (Android) simply leave it empty.
+    CREATE TABLE reminders_sent (
+        key     TEXT PRIMARY KEY,  -- reminders::Reminder::key(), e.g. '<uuid>|Due|2026-10-26T14:00'
+        fire_at TEXT NOT NULL,     -- the reminder's local wall-clock time 'YYYY-MM-DDTHH:MM'
+        sent_at TEXT NOT NULL      -- when it was shown, RFC 3339 UTC
+    );
     ",
     ),
 ];
@@ -424,6 +442,55 @@ impl Db {
         completions_where(&self.conn, "1 = 1")
     }
 
+    // ---- reminders sent (desktop `zerohour remind`) ------------------------------------
+
+    /// True if the reminder with this key (see `reminders::Reminder::key`) was already shown
+    /// on this device.
+    pub fn reminder_was_sent(&self, key: &str) -> Result<bool> {
+        // `.optional()` turns "no rows" into `Ok(None)` instead of an error.
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM reminders_sent WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Remembers that a reminder was shown. Call this only *after* a successful send, so a
+    /// failed one is tried again on the next run.
+    ///
+    /// `fire_at` is the reminder's local wall-clock time (used for pruning); `sent_at` is the
+    /// moment it was shown, in UTC. Recording the same key twice is harmless: the first row is
+    /// kept ("ON CONFLICT DO NOTHING").
+    pub fn record_reminder_sent(
+        &self,
+        key: &str,
+        fire_at: NaiveDateTime,
+        sent_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO reminders_sent (key, fire_at, sent_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO NOTHING",
+            params![key, minute_to_db(fire_at), ts_to_db(sent_at)],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets the reminders whose time is before `before` (local wall-clock time), and
+    /// returns how many were removed. Keeps the table small: a reminder that old can never be
+    /// planned again by `zerohour remind`, whose window only looks a few minutes back.
+    pub fn prune_reminders_sent(&self, before: NaiveDateTime) -> Result<usize> {
+        // `fire_at` is always written by `minute_to_db` (same width, biggest unit first), so
+        // comparing the texts gives the same answer as comparing the times.
+        Ok(self.conn.execute(
+            "DELETE FROM reminders_sent WHERE fire_at < ?1",
+            [minute_to_db(before)],
+        )?)
+    }
+
     // ---- settings ----------------------------------------------------------------------
 
     /// Reads a setting, or `None` if it was never set.
@@ -664,6 +731,12 @@ pub(crate) fn time_from_db(s: &str) -> Result<NaiveTime> {
     NaiveTime::parse_from_str(s, "%H:%M").map_err(|_| DbError::BadData(format!("bad time '{s}'")))
 }
 
+/// Local date and time, to the minute -> `"2026-10-26T14:00"` (the same form as the time in a
+/// reminder's key).
+pub(crate) fn minute_to_db(at: NaiveDateTime) -> String {
+    at.format("%Y-%m-%dT%H:%M").to_string()
+}
+
 /// Timestamp -> `"2026-10-08T14:03:00.123Z"` (RFC 3339, always UTC, always the same width
 /// so that text sorting equals time sorting).
 pub(crate) fn ts_to_db(ts: DateTime<Utc>) -> String {
@@ -699,10 +772,10 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -748,7 +821,7 @@ mod tests {
 
         // Re-run initialization the way `Db::open` does on the next start.
         let db = Db::init(old.conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
         assert_eq!(
@@ -764,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn version_2_database_upgrades_to_3_with_no_due_times() {
+    fn version_2_database_upgrades_with_no_due_times() {
         // A database as the sync build left it: migrations 1 and 2 applied.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -790,12 +863,126 @@ mod tests {
         .unwrap();
 
         let db = Db::init(conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 3);
+        assert_eq!(db.schema_version().unwrap(), 4);
         let christmas = db.get_item("e1").unwrap().unwrap();
         assert_eq!(christmas.title, "Christmas");
         assert_eq!(christmas.date, Some(d(2026, 12, 25)));
         assert_eq!(christmas.repeat, RepeatRule::Yearly);
         assert_eq!(christmas.due_time, None, "existing rows get no time");
+    }
+
+    /// A database exactly as a schema-3 build leaves it, with one task, one completion, a
+    /// setting and a sync bookkeeping row in it.
+    fn version_3_database() -> (Connection, Item, Completion) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in &MIGRATIONS[..3] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, ts_to_db(now())],
+            )
+            .unwrap();
+        }
+        let old = Db { conn };
+        let mut task = Item::new(Kind::Task, "Fill Out Your Timesheet", now());
+        task.date = Some(d(2026, 10, 26));
+        task.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        old.insert_item(&task).unwrap();
+        let completion = Completion {
+            id: new_id(),
+            item_id: task.id.clone(),
+            completed_at: now(),
+            title_snapshot: task.title.clone(),
+            priority_snapshot: task.priority,
+            was_overdue: false,
+        };
+        old.insert_completion(&completion).unwrap();
+        old.set_setting(settings_keys::REMINDERS_ENABLED, "on")
+            .unwrap();
+        old.conn
+            .execute(
+                "INSERT INTO sync_docs (doc_id, rev, synced_updated_at) VALUES ('item:x', '1-a', NULL)",
+                [],
+            )
+            .unwrap();
+        (old.conn, task, completion)
+    }
+
+    #[test]
+    fn version_3_database_upgrades_to_4_adding_only_the_reminder_log() {
+        let (conn, task, completion) = version_3_database();
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 4);
+        // Every existing row is untouched.
+        assert_eq!(db.list_items().unwrap(), vec![task]);
+        assert_eq!(db.list_completions().unwrap(), vec![completion]);
+        assert_eq!(
+            db.get_setting(settings_keys::REMINDERS_ENABLED)
+                .unwrap()
+                .as_deref(),
+            Some("on")
+        );
+        let count = |table: &str| -> i64 {
+            db.conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count("sync_docs"), 1);
+        // The new table exists and starts empty.
+        assert_eq!(count("reminders_sent"), 0);
+        // Exactly one table was added: the six user tables (with schema_migrations).
+        let tables: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 6);
+    }
+
+    /// 2026-10-26 at `h:m`, local wall-clock time.
+    fn oct26(h: u32, m: u32) -> NaiveDateTime {
+        d(2026, 10, 26).and_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn a_recorded_reminder_is_remembered_and_recording_twice_is_harmless() {
+        let db = Db::open_in_memory().unwrap();
+        let key = "abc|Due|2026-10-26T14:00";
+        assert!(!db.reminder_was_sent(key).unwrap());
+        db.record_reminder_sent(key, oct26(14, 0), now()).unwrap();
+        assert!(db.reminder_was_sent(key).unwrap());
+        db.record_reminder_sent(key, oct26(14, 0), now()).unwrap();
+        // Another key is still unsent.
+        assert!(!db.reminder_was_sent("abc|Lead|2026-10-26T13:45").unwrap());
+        let fire_at: String = db
+            .conn
+            .query_row(
+                "SELECT fire_at FROM reminders_sent WHERE key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fire_at, "2026-10-26T14:00");
+    }
+
+    #[test]
+    fn pruning_removes_only_reminders_before_the_cutoff() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_reminder_sent("old", oct26(9, 0), now()).unwrap();
+        db.record_reminder_sent("edge", oct26(14, 0), now())
+            .unwrap();
+        db.record_reminder_sent("new", oct26(15, 0), now()).unwrap();
+        assert_eq!(db.prune_reminders_sent(oct26(14, 0)).unwrap(), 1);
+        assert!(!db.reminder_was_sent("old").unwrap());
+        assert!(db.reminder_was_sent("edge").unwrap());
+        assert!(db.reminder_was_sent("new").unwrap());
     }
 
     #[test]
