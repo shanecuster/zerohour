@@ -14,6 +14,12 @@
 //!
 //! **What is reminded** (see [`plan`]):
 //! - a task with a due date and time: at its due time, plus `lead_minutes` earlier if set;
+//! - a *repeating* task with a due time: also at each later scheduled time while it stays
+//!   open. A repeating task is stored as one open instance, and completing it creates the
+//!   next. If Monday's 2 PM "Fill Out Your Timesheet" (Mon–Thu) is not done, it stays the
+//!   open instance, and the plan still reminds on Tuesday at 2 PM, Wednesday at 2 PM, and so
+//!   on: exactly the times the task is due again. Completing it creates the next instance as
+//!   usual, and the next plan follows that one;
 //! - nothing that is completed or deleted, and no events.
 //!
 //! Only reminders in the future are returned. A device that was off at a reminder's time
@@ -25,12 +31,19 @@
 
 use chrono::{NaiveDateTime, NaiveTime, TimeDelta};
 
+use crate::calendar::add_days;
 use crate::clock::{TimeFormat, format_time};
 use crate::db::{Db, DbError, settings_keys};
 use crate::model::{Item, Kind};
+use crate::repeat::next_occurrence;
 
 /// The largest allowed lead time: one day, in minutes.
 pub const MAX_LEAD_MINUTES: u32 = 24 * 60;
+
+/// The most scheduled times looked at for one repeating task in one plan. A daily task in a
+/// 48-hour window needs about three; this only stops a far-too-long window (or a rule bug)
+/// from looping for ages.
+const MAX_OCCURRENCES_PER_TASK: usize = 400;
 
 /// The reminder settings, with the defaults filled in for anything not saved.
 ///
@@ -225,7 +238,7 @@ mod tests {
 #[cfg(test)]
 mod plan_tests {
     use super::*;
-    use crate::model::{Priority, RepeatRule};
+    use crate::model::{DaySet, Priority, RepeatRule};
     use chrono::{NaiveDate, Utc};
 
     /// A date.
@@ -369,6 +382,110 @@ mod plan_tests {
         assert_eq!(plan[0].body, "Due in 1 h (2:00 PM)");
     }
 
+    /// The Mon–Thu 2 PM timesheet task, with its open instance due on `date`.
+    fn timesheet(date: NaiveDate) -> Item {
+        let mut item = task("Fill Out Your Timesheet", Some(date), Some(t(14, 0)));
+        item.repeat = RepeatRule::Weekdays(DaySet::MON_THU);
+        item
+    }
+
+    #[test]
+    fn mon_thu_completed_on_thursday_next_reminds_monday_at_two() {
+        // Completing Thursday's instance creates Monday's (core's complete path), so the
+        // stored open instance is due Mon 2026-10-26 at 2 PM. Planned on Friday morning, a
+        // 4-day window holds exactly Monday 2 PM, nothing over the weekend.
+        let items = [timesheet(d(2026, 10, 26))];
+        let now = at(2026, 10, 23, 8, 0);
+        let plan = plan(
+            &items,
+            now,
+            now + TimeDelta::days(4),
+            &on(0),
+            TimeFormat::Hour12,
+        );
+        assert_eq!(times(&plan), [(ReminderKind::Due, at(2026, 10, 26, 14, 0))]);
+        assert_eq!(plan[0].body, "Due 2:00 PM");
+    }
+
+    #[test]
+    fn a_missed_monday_still_reminds_tuesday_at_two() {
+        // Monday's instance was never completed: it is still the open one on Tuesday morning.
+        let items = [timesheet(d(2026, 10, 26))];
+        let plan = plan48(&items, at(2026, 10, 27, 8, 0), &on(0));
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Due, at(2026, 10, 27, 14, 0)),
+                (ReminderKind::Due, at(2026, 10, 28, 14, 0)),
+            ]
+        );
+        // Every reminder is about the stored instance, so "Done" completes that one.
+        assert!(plan.iter().all(|r| r.item_id == items[0].id));
+    }
+
+    #[test]
+    fn a_repeating_task_reminds_on_each_scheduled_day_in_the_window_only() {
+        // Thursday evening: Friday to Sunday are not Mon–Thu days.
+        let items = [timesheet(d(2026, 10, 22))];
+        let plan = plan48(&items, at(2026, 10, 22, 18, 0), &on(0));
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn a_long_overdue_daily_task_starts_from_now() {
+        let mut item = task("Stretch", Some(d(2026, 1, 1)), Some(t(7, 0)));
+        item.repeat = RepeatRule::Daily;
+        let plan = plan48(&[item], at(2026, 10, 22, 9, 0), &on(0));
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Due, at(2026, 10, 23, 7, 0)),
+                (ReminderKind::Due, at(2026, 10, 24, 7, 0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_phone_off_for_days_gets_only_future_reminders() {
+        // Planned on Thursday morning; the phone was then off until the next Tuesday
+        // evening. Planning again from that moment never replays Thursday, Monday or
+        // Tuesday's 2 PM: only what is still ahead.
+        let items = [
+            timesheet(d(2026, 10, 22)),
+            task("One-off", Some(d(2026, 10, 23)), Some(t(10, 0))),
+        ];
+        let before = plan48(&items, at(2026, 10, 22, 9, 0), &on(0));
+        assert_eq!(before.len(), 2);
+        let after = plan48(&items, at(2026, 10, 27, 19, 0), &on(0));
+        assert_eq!(
+            times(&after),
+            [
+                (ReminderKind::Due, at(2026, 10, 28, 14, 0)),
+                (ReminderKind::Due, at(2026, 10, 29, 14, 0)),
+            ]
+        );
+        assert!(after.iter().all(|r| r.fire_at > at(2026, 10, 27, 19, 0)));
+    }
+
+    #[test]
+    fn dst_days_keep_the_wall_clock_time() {
+        // The planner has no time zone: on the days the clocks change, a reminder is still
+        // planned at the time shown on the clock. 02:30 on 2026-03-08 doesn't exist in most
+        // of the US (spring forward), and 01:30 on 2026-11-01 happens twice (fall back); what
+        // to do with those is decided by the app when it turns them into alarms.
+        let spring = [task("Spring", Some(d(2026, 3, 8)), Some(t(2, 30)))];
+        let fall = [task("Fall", Some(d(2026, 11, 1)), Some(t(1, 30)))];
+        assert_eq!(
+            times(&plan48(&spring, at(2026, 3, 7, 22, 0), &on(0))),
+            [(ReminderKind::Due, at(2026, 3, 8, 2, 30))]
+        );
+        // Planned once, not twice.
+        assert_eq!(
+            times(&plan48(&fall, at(2026, 10, 31, 22, 0), &on(0))),
+            [(ReminderKind::Due, at(2026, 11, 1, 1, 30))]
+        );
+    }
+
     #[test]
     fn the_key_names_item_kind_and_time() {
         let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
@@ -451,26 +568,53 @@ pub fn plan(
         let (Some(date), Some(time)) = (item.date, item.due_time) else {
             continue;
         };
-        let due = date.and_time(time);
-        if in_window(due) {
-            reminders.push(Reminder {
-                item_id: item.id.clone(),
-                kind: ReminderKind::Due,
-                fire_at: due,
-                title: item.title.clone(),
-                body: due_text(time, time_format),
-            });
-        }
-        // The earlier reminder, if a lead time is set. It can fall on the previous day
-        // (a task due at 00:10 with a 30-minute lead is reminded at 23:40 the day before).
-        if settings.lead_minutes > 0 && in_window(due - lead) {
-            reminders.push(Reminder {
-                item_id: item.id.clone(),
-                kind: ReminderKind::Lead,
-                fire_at: due - lead,
-                title: item.title.clone(),
-                body: lead_text(settings.lead_minutes, time, time_format),
-            });
+        // The days to look at: the open instance's due date and, for a repeating task, each
+        // later scheduled day. Start from the first scheduled day that could still have a
+        // reminder after `now` (the lead reminder is the earliest one), so a task that is long
+        // overdue doesn't walk through months of past days first.
+        let earliest = (now - lead).date().max(date);
+        let mut day = if item.repeat.is_repeating() {
+            // `next_occurrence(rule, anchor, from)`: the first scheduled day on or after
+            // `from`, counted from the task's own date (so "monthly on the 31st" stays right).
+            next_occurrence(item.repeat, date, earliest)
+        } else {
+            date
+        };
+        for _ in 0..MAX_OCCURRENCES_PER_TASK {
+            let due = day.and_time(time);
+            // Past the window, even for its earlier reminder: no later day can be inside.
+            if due - lead > until {
+                break;
+            }
+            if in_window(due) {
+                reminders.push(Reminder {
+                    item_id: item.id.clone(),
+                    kind: ReminderKind::Due,
+                    fire_at: due,
+                    title: item.title.clone(),
+                    body: due_text(time, time_format),
+                });
+            }
+            // The earlier reminder, if a lead time is set. It can fall on the previous day
+            // (a task due at 00:10 with a 30-minute lead is reminded at 23:40 the day before).
+            if settings.lead_minutes > 0 && in_window(due - lead) {
+                reminders.push(Reminder {
+                    item_id: item.id.clone(),
+                    kind: ReminderKind::Lead,
+                    fire_at: due - lead,
+                    title: item.title.clone(),
+                    body: lead_text(settings.lead_minutes, time, time_format),
+                });
+            }
+            if !item.repeat.is_repeating() {
+                break;
+            }
+            let next = next_occurrence(item.repeat, date, add_days(day, 1));
+            // A rule that doesn't move forward would loop forever; stop instead.
+            if next <= day {
+                break;
+            }
+            day = next;
         }
     }
 
