@@ -2,8 +2,8 @@
 //!
 //! This module only *plans*. It looks at the items and the time and says "remind about X at
 //! 14:00". It never reads the clock, never touches the screen and never sends anything: the
-//! Android app turns the plan into alarms and notifications (and a desktop `zerohour remind`
-//! command may do the same later). Keeping the planning here means every app reminds about the
+//! Android app turns the plan into alarms and notifications, and the desktop `zerohour remind`
+//! command (in the `tui` crate) into desktop notifications. Keeping the planning here means every app reminds about the
 //! same things at the same times, and the rules can be tested with fixed instants.
 //!
 //! **Times are floating local wall-clock times.** A task due at 2 PM is reminded at 2 PM on

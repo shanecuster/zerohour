@@ -273,19 +273,17 @@ Branch `feature/schedule`, built on top of `feature/sync`.
   **Command:** `a` → Task → title → Due time `2pm` → Repeat `←→` to "Mon–Thu" → `Enter`
   **When:** recurring work-day tasks. Completing Thursday's makes Monday's.
 
-### Planned later: the desktop `zerohour remind` command (Phase 4, not built)
+### The desktop `zerohour remind` command (Phase 4, now built)
 
-The reminder *planner* and its settings are now built in core (see "Phase 3, step 11a" below).
-What is still planned for the desktop:
+This was planned here; it is now built (see "Phase 4, step 1" at the end). Two things changed
+from this plan:
 
-- `zerohour remind`: a command that sends any due reminders and exits, run every minute by a
-  systemd user timer (`Persistent=true`; `zerohour remind --print-units` prints the unit files).
-- What it reminds about comes from core's planner (`reminders::plan`), the same as the phone.
-- Desktop notifications with `notify-send`; optional ntfy (its own cargo feature, server and topic
-  as settings, token in the `SecretStore`), enabled on one device only to avoid duplicates.
-- De-duplication in a local, never-synced table `reminders_sent (item_id, kind, fire_at, sent_at)`;
-  a row is written only after a successful send, reminders older than a grace window are skipped,
-  and moving a task's time creates a new reminder.
+- The de-duplication table is `reminders_sent (key, fire_at, sent_at)`, keyed on the planner's
+  own `Reminder::key()` (which already names the item and the kind), not
+  `(item_id, kind, fire_at, sent_at)`.
+- **ntfy is dropped from the plan for the desktop**: the phone already notifies on its own (the
+  Android app plans the same reminders), so ntfy would mostly send the same reminder twice, and it
+  would need network code, a server, a topic and a token.
 
 ---
 
@@ -505,3 +503,109 @@ turns that into alarms and notifications. Nothing changes in the terminal app ye
   **Command:** `cargo test -p zerohour-core reminders`
   **When:** after changing anything in `core/src/reminders.rs` or the repeat rules.
 
+---
+
+## Phase 4, step 1: desktop reminders, `zerohour remind` (done 2026-10-23)
+
+Branch `feature/desktop-remind`. The desktop now pops up the same reminders as the phone (core's
+planner), when you're at the desk. The desktop is never required: on days at work the phone
+covers you, and the desktop skips what it missed instead of replaying it.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/db.rs` | Migration 4: the `reminders_sent (key, fire_at, sent_at)` table, local and never synced, plus `reminder_was_sent`, `record_reminder_sent`, `prune_reminders_sent`. |
+| `tui/src/remind.rs` | One run: the 15-minute window, "already shown?", recording only after a successful send, pruning after 7 days, and the `--dry-run` preview. Works through a `Notifier` trait, so tests use a fake. |
+| `tui/src/notify.rs` | The real `Notifier`: runs `notify-send --app-name=zerohour -- <title> <body>`. |
+| `tui/src/units.rs` | The systemd user service (oneshot) and timer (every minute, `AccuracySec=1s`, `Persistent=true`) that `--print-units` / `--print-unit` print. |
+| `tui/src/main.rs` | The `remind` subcommand; `--db` now works before or after it; the lock file. |
+| `tui/src/ui/reminders.rs` | The Reminders popup (`n`): on/off, early (lead) time, day time, overdue list, and a test notification. Saved as you change it. |
+| `core/src/icons.rs` | A `Reminder` (bell) icon for the popup title. |
+
+**Tests:** 126 in core and 84 in the TUI without sync; 176 and 92 with sync. The runs use fixed local
+times and a fake notifier; one test upgrades a version-3 database and checks every row is
+untouched and only the new table was added.
+
+### How one run works (plain language)
+
+1. Take the local time now, and the local time it was 15 real minutes ago.
+2. Ask the planner for the reminders in between, using this computer's settings.
+3. For each one: already in `reminders_sent`? Skip. Otherwise show it; only if that worked,
+   write its key to `reminders_sent`.
+4. Forget records more than 7 days old, and exit.
+
+### Decisions made while building (worth knowing)
+
+- **Grace window: 15 minutes, a constant.** A reminder is shown if a run happens within 15
+  minutes of its time. Waking the computer after an hour or after days shows nothing old.
+- **The window is safe on the nights the clocks change.** Its start is the earlier of "now minus
+  15 minutes on the clock" and "the clock 15 real minutes ago". In spring, a 02:30 reminder (a
+  time that never shows on the clock) is still shown at 03:00; in fall, the repeated 01:30 is
+  shown once.
+- **A failed send is not recorded.** No D-Bus session, no notification daemon, or no
+  `notify-send`: the run prints one line and exits 0 (nobody is at this desktop, which is not an
+  error), and the next run tries again while the reminder is under 15 minutes old. Only a database
+  or flag problem exits 1.
+- **One run at a time**: a lock file next to the database (`zerohour.db.remind-lock`, empty). A
+  second run at the same moment (one by hand, one from the timer) skips instead of showing a
+  reminder twice. The operating system frees the lock when the process ends, even after a crash.
+- **Notifications are persistent** (no expire time is passed); the daemon decides what to do.
+- **No "Done" button in v1.** `notify-send` must keep running until the button is clicked, which
+  doesn't fit a command that sends and exits. Complete the task in the app (or on the phone).
+- **Nothing syncs here.** `reminders_sent` and the `reminders.*` settings are per device. The
+  sync documents didn't change (no `v` bump). The Android repo doesn't change unless it re-pins
+  core; then its database just gets the empty table.
+- **`--print-units` never opens the database**, and never writes a file: you save the units.
+- **The test notification** in the popup runs `notify-send` while the app waits; it returns as
+  soon as the daemon has taken the notification.
+
+### Possible later additions
+
+- **Skip popups when you're away** (screen locked, or idle for N minutes), off by default. The
+  practical way is logind's `LockedHint` / `IdleHint` through `loginctl`; it only works if the
+  lock screen sets them, which needs a test first (lock for a minute while a timer records them).
+- **A "Done" button**, if wanted later: it needs a process that stays alive until the click (for
+  example a transient unit per notification).
+
+### Commands
+
+```sh
+zerohour remind --dry-run                         # what would be shown now, and the next 24 hours
+zerohour remind                                   # show what is due now (the timer runs this)
+zerohour remind --print-units                     # print both systemd unit files
+zerohour remind --print-unit service > ~/.config/systemd/user/zerohour-remind.service
+zerohour remind --print-unit timer   > ~/.config/systemd/user/zerohour-remind.timer
+systemctl --user daemon-reload && systemctl --user enable --now zerohour-remind.timer
+systemctl --user list-timers zerohour-remind.timer   # when it runs next
+journalctl --user -u zerohour-remind -f              # what it showed, live
+cargo test -p zerohour remind                     # just the remind tests
+```
+
+### Keys
+
+`n` Reminders (in the popup: `↑↓` move, `Space` on/off, `←→` change, a digit or `Enter` on Day
+time to type one, `Enter` on the test button, `Esc` close; every change is saved at once)
+
+### Save to your personal notes
+
+- **Title:** Turn on zerohour desktop reminders
+  **Command:** `n` in zerohour → Reminders on → test notification; then
+  `zerohour remind --print-unit service > ~/.config/systemd/user/zerohour-remind.service`,
+  the same with `timer`, and `systemctl --user daemon-reload && systemctl --user enable --now zerohour-remind.timer`
+  **When:** once per computer that should pop up reminders (after `cargo install --path tui`).
+
+- **Title:** Why didn't a zerohour reminder pop up?
+  **Command:** `zerohour remind --dry-run` and `journalctl --user -u zerohour-remind`
+  **When:** a reminder seems missing. "already shown" = it was shown; nothing listed = check the
+  task's time and that reminders are on (`n`).
+
+- **Title:** systemd user services can't show notifications
+  **Command:** `systemctl --user show-environment | grep DBUS`; if empty, add
+  `exec-once = dbus-update-activation-environment --systemd DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY`
+  to `hyprland.conf`
+  **When:** a user service or timer should pop up notifications but `notify-send` from it fails.
+
+- **Title:** Stop zerohour desktop reminders
+  **Command:** `systemctl --user disable --now zerohour-remind.timer` (or switch them off with `n`)
+  **When:** on a computer that shouldn't remind any more.
