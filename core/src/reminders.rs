@@ -23,6 +23,8 @@
 //! - a task due on a day *without* a time: once, at `day_time` (09:00 by default) on that day,
 //!   "Due today". Only its open instance: once that day is over, an untimed task is simply
 //!   overdue (see the digest below);
+//! - with the overdue digest switched on (off by default): once a day at `day_time`, one
+//!   reminder listing the tasks that are overdue at that moment ("2 overdue tasks"), if any;
 //! - nothing that is completed or deleted, and no events.
 //!
 //! Only reminders in the future are returned. A device that was off at a reminder's time
@@ -38,10 +40,14 @@ use crate::calendar::add_days;
 use crate::clock::{TimeFormat, format_time};
 use crate::db::{Db, DbError, settings_keys};
 use crate::model::{Item, Kind};
-use crate::repeat::next_occurrence;
+use crate::repeat::{is_overdue, next_occurrence};
+use crate::view::open_tasks;
 
 /// The largest allowed lead time: one day, in minutes.
 pub const MAX_LEAD_MINUTES: u32 = 24 * 60;
+
+/// The digest lists at most this many titles, then "and N more", so it stays readable.
+const DIGEST_MAX_TITLES: usize = 5;
 
 /// The most scheduled times looked at for one repeating task in one plan. A daily task in a
 /// 48-hour window needs about three; this only stops a far-too-long window (or a rule bug)
@@ -302,7 +308,7 @@ mod plan_tests {
         assert_eq!(times(&plan), [(ReminderKind::Due, at(2026, 10, 22, 14, 0))]);
         assert_eq!(plan[0].title, "Call the bank");
         assert_eq!(plan[0].body, "Due 2:00 PM");
-        assert_eq!(plan[0].item_id, items[0].id);
+        assert_eq!(plan[0].item_id.as_deref(), Some(items[0].id.as_str()));
     }
 
     #[test]
@@ -423,7 +429,10 @@ mod plan_tests {
             ]
         );
         // Every reminder is about the stored instance, so "Done" completes that one.
-        assert!(plan.iter().all(|r| r.item_id == items[0].id));
+        assert!(
+            plan.iter()
+                .all(|r| r.item_id.as_deref() == Some(items[0].id.as_str()))
+        );
     }
 
     #[test]
@@ -533,6 +542,79 @@ mod plan_tests {
         assert!(plan48(&[item], at(2026, 10, 22, 7, 0), &on(0)).is_empty());
     }
 
+    /// Reminders on, with the overdue digest.
+    fn with_digest() -> ReminderSettings {
+        ReminderSettings {
+            overdue_digest: true,
+            ..on(0)
+        }
+    }
+
+    #[test]
+    fn the_digest_is_off_by_default() {
+        let items = [task("Late", Some(d(2026, 10, 20)), None)];
+        assert!(plan48(&items, at(2026, 10, 22, 7, 0), &on(0)).is_empty());
+    }
+
+    #[test]
+    fn the_digest_lists_whats_overdue_once_a_day() {
+        let items = [
+            task("Pay bill", Some(d(2026, 10, 20)), None),
+            task("Send report", Some(d(2026, 10, 22)), Some(t(8, 0))),
+            task("Later today", Some(d(2026, 10, 22)), Some(t(18, 0))),
+        ];
+        let plan = plan48(&items, at(2026, 10, 22, 7, 0), &with_digest());
+        let digests: Vec<&Reminder> = plan
+            .iter()
+            .filter(|r| r.kind == ReminderKind::Digest)
+            .collect();
+        // The 48 hours from Thursday 07:00 end on Saturday 07:00, before that day's 09:00:
+        // so today at 9:00 (the 8:00 report is overdue by then) and tomorrow at 9:00, when
+        // the 18:00 task is overdue too.
+        assert_eq!(digests.len(), 2);
+        assert_eq!(digests[0].fire_at, at(2026, 10, 22, 9, 0));
+        assert_eq!(digests[0].title, "2 overdue tasks");
+        assert!(digests[0].body.contains("Pay bill") && digests[0].body.contains("Send report"));
+        assert_eq!(digests[1].title, "3 overdue tasks");
+        assert_eq!(digests[0].item_id, None);
+        assert!(digests[0].key().starts_with("digest|Digest|"));
+    }
+
+    #[test]
+    fn no_digest_when_nothing_is_overdue_and_never_for_completed_or_deleted_tasks() {
+        let mut done = task("Done", Some(d(2026, 10, 20)), None);
+        done.completed_at = Some(Utc::now());
+        let mut gone = task("Deleted", Some(d(2026, 10, 20)), None);
+        gone.deleted = true;
+        let upcoming = task("Upcoming", Some(d(2026, 10, 30)), None);
+        assert!(
+            plan48(
+                &[done, gone, upcoming],
+                at(2026, 10, 22, 7, 0),
+                &with_digest()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_long_digest_is_shortened() {
+        let items: Vec<Item> = (1..=7)
+            .map(|n| task(&format!("Task {n}"), Some(d(2026, 10, 20)), None))
+            .collect();
+        let now = at(2026, 10, 22, 7, 0);
+        let plan = plan(
+            &items,
+            now,
+            at(2026, 10, 22, 12, 0),
+            &with_digest(),
+            TimeFormat::Hour12,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].title, "7 overdue tasks");
+        assert!(plan[0].body.ends_with(" and 2 more"), "{}", plan[0].body);
+    }
+
     #[test]
     fn the_key_names_item_kind_and_time() {
         let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
@@ -555,13 +637,16 @@ pub enum ReminderKind {
     Lead,
     /// At `day_time` on the day an untimed task is due.
     DayOf,
+    /// The once-a-day list of overdue tasks (not about one task).
+    Digest,
 }
 
 /// One planned reminder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reminder {
-    /// The task it is about.
-    pub item_id: String,
+    /// The task it is about, or `None` for the digest (which is about several). The apps
+    /// offer "Done" only when there is one task to complete.
+    pub item_id: Option<String>,
     /// Why it fires.
     pub kind: ReminderKind,
     /// When, as local wall-clock time (see the module docs).
@@ -580,7 +665,8 @@ impl Reminder {
     pub fn key(&self) -> String {
         format!(
             "{}|{:?}|{}",
-            self.item_id,
+            // `as_deref` borrows the text inside the `Option`; the digest has none.
+            self.item_id.as_deref().unwrap_or("digest"),
             self.kind,
             self.fire_at.format("%Y-%m-%dT%H:%M")
         )
@@ -623,7 +709,7 @@ pub fn plan(
             let fire_at = date.and_time(settings.day_time);
             if in_window(fire_at) {
                 reminders.push(Reminder {
-                    item_id: item.id.clone(),
+                    item_id: Some(item.id.clone()),
                     kind: ReminderKind::DayOf,
                     fire_at,
                     title: item.title.clone(),
@@ -652,7 +738,7 @@ pub fn plan(
             }
             if in_window(due) {
                 reminders.push(Reminder {
-                    item_id: item.id.clone(),
+                    item_id: Some(item.id.clone()),
                     kind: ReminderKind::Due,
                     fire_at: due,
                     title: item.title.clone(),
@@ -663,7 +749,7 @@ pub fn plan(
             // (a task due at 00:10 with a 30-minute lead is reminded at 23:40 the day before).
             if settings.lead_minutes > 0 && in_window(due - lead) {
                 reminders.push(Reminder {
-                    item_id: item.id.clone(),
+                    item_id: Some(item.id.clone()),
                     kind: ReminderKind::Lead,
                     fire_at: due - lead,
                     title: item.title.clone(),
@@ -682,9 +768,74 @@ pub fn plan(
         }
     }
 
+    if settings.overdue_digest {
+        reminders.extend(digests(items, now, until, settings, in_window));
+    }
+
     // Earliest first; ties in a fixed order so the plan is always the same for the same input.
     reminders.sort_by(|a, b| (a.fire_at, a.kind, &a.item_id).cmp(&(b.fire_at, b.kind, &b.item_id)));
     reminders
+}
+
+/// The overdue digests in the window: one per day at `day_time`, listing the tasks overdue at
+/// that moment (in the main screen's order), and none on a day when nothing is overdue.
+///
+/// `in_window` is the planner's "after now, not after until" test, passed in so both use the
+/// same rule. `impl Fn(NaiveDateTime) -> bool` means "any function (or closure) that takes a
+/// date-time and answers yes or no".
+fn digests(
+    items: &[Item],
+    now: NaiveDateTime,
+    until: NaiveDateTime,
+    settings: &ReminderSettings,
+    in_window: impl Fn(NaiveDateTime) -> bool,
+) -> Vec<Reminder> {
+    // Sorted the way the Tasks box lists them (core's view), so the digest reads the same.
+    let open = open_tasks(items);
+    let mut digests = Vec::new();
+    let mut day = now.date();
+    while day <= until.date() {
+        let fire_at = day.and_time(settings.day_time);
+        if in_window(fire_at) {
+            // `open_tasks` leaves out completed tasks but not deleted ones, so those are
+            // skipped here too.
+            let overdue: Vec<&str> = open
+                .iter()
+                .filter(|item| !item.deleted && is_overdue(item, fire_at))
+                .map(|item| item.title.as_str())
+                .collect();
+            if !overdue.is_empty() {
+                digests.push(Reminder {
+                    item_id: None,
+                    kind: ReminderKind::Digest,
+                    fire_at,
+                    title: digest_title(overdue.len()),
+                    body: digest_body(&overdue),
+                });
+            }
+        }
+        day = add_days(day, 1);
+    }
+    digests
+}
+
+/// "1 overdue task" / "3 overdue tasks".
+fn digest_title(count: usize) -> String {
+    if count == 1 {
+        "1 overdue task".to_string()
+    } else {
+        format!("{count} overdue tasks")
+    }
+}
+
+/// The titles, comma-separated: at most [`DIGEST_MAX_TITLES`], then "and N more".
+fn digest_body(titles: &[&str]) -> String {
+    let shown = titles.len().min(DIGEST_MAX_TITLES);
+    let mut body = titles[..shown].join(", ");
+    if titles.len() > shown {
+        body.push_str(&format!(" and {} more", titles.len() - shown));
+    }
+    body
 }
 
 /// True for a task that is still open and not deleted: the only things that are reminded.
