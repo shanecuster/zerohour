@@ -137,6 +137,15 @@ pub mod settings_keys {
     pub const TIME_FORMAT: &str = "time_format";
     /// The big "zerohour" title on the main screen: "on" (default) or "off".
     pub const BANNER: &str = "banner";
+    /// Reminders master switch: "on" or "off" (default). See `reminders.rs`.
+    pub const REMINDERS_ENABLED: &str = "reminders.enabled";
+    /// Minutes before a timed task's due time for an extra, earlier reminder: "0" (default,
+    /// none) to "1440".
+    pub const REMINDERS_LEAD_MINUTES: &str = "reminders.lead_minutes";
+    /// Time of day for untimed tasks' reminders and the overdue digest: "HH:MM", default "09:00".
+    pub const REMINDERS_DAY_TIME: &str = "reminders.day_time";
+    /// The once-a-day overdue digest: "on" or "off" (default).
+    pub const REMINDERS_OVERDUE_DIGEST: &str = "reminders.overdue_digest";
 }
 
 /// A handle to the open database. All storage goes through this.
