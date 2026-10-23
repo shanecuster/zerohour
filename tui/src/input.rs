@@ -41,6 +41,8 @@ pub enum Action {
     ToggleTimeFormat,
     /// Show or hide the big title banner.
     ToggleBanner,
+    /// Open the Reminders popup (this device's reminder settings).
+    Reminders,
     /// Show the help overlay.
     Help,
     /// Open the sync settings (only in builds with the `sync` feature).
@@ -78,6 +80,7 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('v') => Action::ToggleLayout,
         KeyCode::Char('T') => Action::ToggleTimeFormat,
         KeyCode::Char('b') => Action::ToggleBanner,
+        KeyCode::Char('n') => Action::Reminders,
         KeyCode::Char('?') | KeyCode::F(1) => Action::Help,
         // `#[cfg]` on a match arm: in local-only builds this key simply does nothing, exactly
         // as before sync existed.
@@ -122,6 +125,10 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(main_action(ctrl_c), Some(Action::Quit));
         assert_eq!(main_action(press(KeyCode::Char('z'))), None);
+        assert_eq!(
+            main_action(press(KeyCode::Char('n'))),
+            Some(Action::Reminders)
+        );
     }
 
     #[cfg(feature = "sync")]

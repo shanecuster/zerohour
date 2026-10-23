@@ -23,15 +23,19 @@ use zerohour_core::db::{Db, settings_keys};
 use zerohour_core::form::FormData;
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
+use zerohour_core::reminders::ReminderSettings;
 use zerohour_core::stats::{self, Stats};
 use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
 use zerohour_core::view::{self, EventRow};
 
 use crate::input::{Action, main_action};
+use crate::notify::NotifySend;
+use crate::remind::Notifier;
 #[cfg(feature = "sync")]
 use crate::sync::{Job, SyncUi, WorkerMsg};
 use crate::ui::add::{Form, FormOutcome, FormPrefs};
 use crate::ui::calendar::GridArea;
+use crate::ui::reminders::{RemindersForm, RemindersOutcome};
 #[cfg(feature = "sync")]
 use crate::ui::sync_settings::{SyncForm, SyncFormOutcome};
 
@@ -101,6 +105,8 @@ pub enum Overlay {
     },
     /// First-run "do you see this icon?" question.
     IconCheck,
+    /// The Reminders popup (`n`).
+    Reminders(RemindersForm),
     /// The sync settings popup (only in builds with the `sync` feature).
     #[cfg(feature = "sync")]
     SyncSettings(SyncForm),
@@ -392,6 +398,11 @@ impl App {
                 self.overlay = Overlay::None;
                 return Ok(());
             }
+            Overlay::Reminders(form) => {
+                let outcome = form.handle_key(key);
+                self.reminders_outcome(outcome)?;
+                return Ok(());
+            }
             Overlay::Help => {
                 // Any key closes help.
                 self.overlay = Overlay::None;
@@ -444,6 +455,11 @@ impl App {
             }
             Action::Help => {
                 self.overlay = Overlay::Help;
+                return Ok(());
+            }
+            Action::Reminders => {
+                let settings = ReminderSettings::load(&self.db)?;
+                self.overlay = Overlay::Reminders(RemindersForm::new(settings));
                 return Ok(());
             }
             #[cfg(feature = "sync")]
@@ -533,9 +549,44 @@ impl App {
             | Action::ToggleStats
             | Action::Theme
             | Action::CycleIcons
+            | Action::Reminders
             | Action::Help => {}
             #[cfg(feature = "sync")]
             Action::SyncSettings | Action::SyncNow => {}
+        }
+        Ok(())
+    }
+
+    /// Does what the Reminders popup asked for: saves a changed setting at once, sends the
+    /// test notification, or closes.
+    fn reminders_outcome(&mut self, outcome: RemindersOutcome) -> Result<()> {
+        // `let ... else`: the rest only makes sense while the popup is still open.
+        let Overlay::Reminders(form) = &mut self.overlay else {
+            return Ok(());
+        };
+        match outcome {
+            RemindersOutcome::Continue => {}
+            RemindersOutcome::Close => self.overlay = Overlay::None,
+            RemindersOutcome::Save(settings) => {
+                if let Err(e) = settings.save(&self.db) {
+                    // Show the problem in the popup and go back to what is really saved.
+                    form.message = Some((e.to_string(), true));
+                    form.settings = ReminderSettings::load(&self.db)?;
+                }
+            }
+            RemindersOutcome::Test => {
+                // A real notification through the same path `zerohour remind` uses. It
+                // returns as soon as the notification daemon has taken it.
+                form.message = Some(
+                    match NotifySend.send(
+                        zerohour_core::APP_NAME,
+                        "Test notification: your reminders will look like this.",
+                    ) {
+                        Ok(()) => ("Test sent.".to_string(), false),
+                        Err(reason) => (format!("Couldn't send it: {reason}"), true),
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -874,4 +925,34 @@ pub fn local_today() -> NaiveDate {
 /// receives it as a parameter.
 pub fn local_now() -> NaiveDateTime {
     Local::now().naive_local()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// `n` opens the Reminders popup, and each change is in the database straight away,
+    /// without a separate "save".
+    #[test]
+    fn the_reminders_popup_saves_each_change_at_once() {
+        let db = Db::open_in_memory().unwrap();
+        // Skip the first-run icon question so keys reach the main screen.
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        let mut app = App::new(db, false, None).unwrap();
+        app.handle_key(press(KeyCode::Char('n')));
+        assert!(matches!(app.overlay, Overlay::Reminders(_)));
+        app.handle_key(press(KeyCode::Char(' '))); // Reminders on
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Right)); // Early: 5 min
+        let saved = ReminderSettings::load(&app.db).unwrap();
+        assert!(saved.enabled);
+        assert_eq!(saved.lead_minutes, 5);
+        app.handle_key(press(KeyCode::Esc));
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(ReminderSettings::load(&app.db).unwrap().enabled);
+    }
 }

@@ -90,6 +90,8 @@ pub enum Icon {
     SyncError,
     /// The sync server couldn't be reached.
     Offline,
+    /// Reminders (the `n` settings popup).
+    Reminder,
 }
 
 impl Icon {
@@ -116,6 +118,7 @@ impl Icon {
             Icon::Synced => ("\u{f0c2}", "✓", "ok"),     // nf-fa-cloud
             Icon::SyncError => ("\u{f06a}", "✗", "!!"),  // nf-fa-exclamation_circle
             Icon::Offline => ("\u{f127}", "○", "--"),    // nf-fa-chain_broken
+            Icon::Reminder => ("\u{f0f3}", "♪", "(!)"),  // nf-fa-bell
         }
     }
 
@@ -145,7 +148,7 @@ pub fn priority_icon(priority: crate::model::Priority) -> Icon {
 mod tests {
     use super::*;
 
-    const ALL_ICONS: [Icon; 14] = [
+    const ALL_ICONS: [Icon; 15] = [
         Icon::Task,
         Icon::Done,
         Icon::Event,
@@ -160,6 +163,7 @@ mod tests {
         Icon::Synced,
         Icon::SyncError,
         Icon::Offline,
+        Icon::Reminder,
     ];
 
     #[test]

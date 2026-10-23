@@ -24,6 +24,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Nerd Font icons** with Unicode and ASCII fallbacks.
 - **Title banner.** A big "zerohour" in the theme's colors with a countdown to your next event, on terminals 30+ rows tall (`b` hides it).
 - **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
+- **Desktop reminders.** `zerohour remind`, run every minute by a systemd user timer, pops up a notification when a task is due ("Fill Out Your Timesheet · Due 2:00 PM"). Off until you switch it on with `n`.
 - **Local-first.** Your data lives in a single SQLite file on your machine.
 - **Optional sync** between devices through your own CouchDB server. Off by default, and left out of the build unless you ask for it.
 
@@ -105,6 +106,7 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | `Tab` / `s` | Switch to the stats screen |
 | `t` | Pick a theme |
 | `i` | Cycle icon mode (Nerd Font / Unicode / ASCII) |
+| `n` | Reminders: on/off, early reminder, day time, overdue list, test notification |
 | `?` | Help |
 | `q` | Quit |
 | `r` | Sync now (sync builds only) |
@@ -143,9 +145,67 @@ Options:
 
 Your data is stored in `~/.local/share/zerohour/zerohour.db`.
 
-**Upgrading:** new versions update the database automatically and keep your data.
+**Upgrading:** new versions update the database automatically and keep your data
+(schema version 4 adds a small table for desktop reminders).
 Going back is limited: once you've used a weekday repeat, an older version of zerohour can't open that database
 (it reports "bad data" instead of guessing). Keep a copy of the file before upgrading if you might go back.
+
+## Desktop reminders
+
+`zerohour remind` shows the reminders that are due right now as desktop notifications (through
+`notify-send`), each one once, and exits. A systemd user timer runs it every minute. It never opens
+the app, so it's fine while zerohour is open in a terminal.
+
+**What gets a reminder** (the same rules as the Android app): a task with a due time, at that time,
+plus an earlier reminder if you set one; a repeating task on each of its days while it's still open;
+a task due on a day without a time, at the day time (9:00 AM unless changed); and, if switched on, a
+daily list of overdue tasks.
+
+### Setting it up
+
+1. Install zerohour (`cargo install --path tui`) and press `n` in the app. Switch **Reminders** on and
+   try **Send a test notification**. The settings are for this computer only: they are never synced,
+   and the phone has its own.
+2. Print the two unit files and save them (nothing is installed for you):
+
+   ```sh
+   mkdir -p ~/.config/systemd/user
+   zerohour remind --print-unit service > ~/.config/systemd/user/zerohour-remind.service
+   zerohour remind --print-unit timer   > ~/.config/systemd/user/zerohour-remind.timer
+   systemctl --user daemon-reload
+   systemctl --user enable --now zerohour-remind.timer
+   ```
+
+   `zerohour remind --print-units` shows both at once. With `--db <path>`, the service uses that file.
+3. Check it: `zerohour remind --dry-run` lists what would be shown now and what's planned for the next
+   24 hours, without showing or recording anything. `systemctl --user list-timers zerohour-remind.timer`
+   shows the next run, and `journalctl --user -u zerohour-remind` shows each reminder it showed.
+
+To stop: `systemctl --user disable --now zerohour-remind.timer`.
+
+### How it behaves
+
+- **Each reminder once.** What was shown is remembered in the database (a table that's never synced),
+  so the next run doesn't show it again.
+- **A few minutes late is fine, days late is not.** A run catches up on reminders from the last 15
+  minutes (the timer was late, the desktop was still starting). Anything older is skipped: after the
+  computer was asleep or off, you don't get a flood of old reminders.
+- **No desktop session, no problem.** If there is no notification service (logged out, at a text
+  console), the run does nothing and tries again a minute later, as long as the reminder is less
+  than 15 minutes old.
+- Notifications stay until you dismiss them (or whatever your notification daemon does with them).
+  There's no "Done" button yet; complete the task in the app.
+
+### If notifications never appear
+
+`zerohour remind --dry-run` should list the reminder as "would show". If it does but nothing pops up,
+the systemd user manager probably doesn't know your desktop's D-Bus address. Run
+`systemctl --user show-environment | grep DBUS`; if that prints nothing, add this to your
+compositor's startup (for Hyprland, in `hyprland.conf`) and log in again:
+
+```sh
+exec-once = dbus-update-activation-environment --systemd DBUS_SESSION_BUS_ADDRESS WAYLAND_DISPLAY
+```
 
 ## Sync (optional)
 
@@ -230,7 +290,7 @@ The next sync compares everything again, without creating duplicates. Changing t
 - [x] Core logic and terminal UI
 - [x] Optional sync between devices (self-hosted CouchDB)
 - [ ] Native Android app sharing the same Rust core
-- [ ] Notifications and reminders
+- [x] Desktop reminders (`zerohour remind` with a systemd user timer)
 
 ## Development
 

@@ -6,8 +6,17 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
-- **Reminder planning in core** (used by the Android app; the terminal app's reminder command comes
-  later): tasks with a due time are reminded at that time, plus an optional earlier reminder;
+- **Desktop reminders**: `zerohour remind` shows the reminders due now as desktop notifications
+  (`notify-send`), each one once, and exits; a systemd user timer runs it every minute
+  (`zerohour remind --print-units` prints the unit files; nothing is installed for you). It catches
+  up on the last 15 minutes but skips anything older, so waking the computer never floods you, and
+  tries again when no notification service is running. `--dry-run` shows what would be sent and
+  what's next. `n` in the app opens the Reminders settings (on/off, early reminder, day time,
+  overdue list) and sends a test notification. Off until switched on; settings stay on this
+  computer. Database schema version 4 adds the never-synced `reminders_sent` table; existing data
+  is unchanged.
+
+- **Reminder planning in core** (used by the Android app and `zerohour remind`): tasks with a due time are reminded at that time, plus an optional earlier reminder;
   repeating ones on each scheduled day while still open; tasks due on a day without a time at a
   set time of day (09:00 by default); an optional daily list of overdue tasks. Off until switched
   on, set per device and never synced. No database change.

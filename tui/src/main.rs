@@ -1,7 +1,8 @@
 //! zerohour — a terminal to-do list and countdown timer.
 //!
 //! This file is the program's entry point. It:
-//! 1. reads command-line flags (`--db <path>`, `--demo`),
+//! 1. reads command-line flags (`--db <path>`, `--demo`) and, for `zerohour remind`, hands
+//!    over to [`run_remind`] (which never touches the terminal),
 //! 2. opens the database (with a friendly message if that fails — before touching the terminal),
 //! 3. switches the terminal into "TUI mode" (raw mode + alternate screen),
 //! 4. runs the main loop: draw → wait for a key → update state → repeat,
@@ -13,17 +14,21 @@
 
 mod app;
 mod input;
+mod notify;
+mod remind;
 #[cfg(feature = "sync")]
 mod sync;
 mod ui;
+mod units;
 
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Stdout, stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use chrono::Local;
-use clap::Parser;
+use anyhow::{Context, Result, bail};
+use chrono::{Local, TimeDelta, Utc};
+use clap::{Parser, Subcommand};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -44,20 +49,66 @@ use crate::app::{App, local_now};
 #[command(version, about = "A terminal to-do list and countdown timer.")]
 struct Args {
     /// Use this database file instead of the default one (handy for testing).
-    #[arg(long, value_name = "PATH")]
+    // `global = true`: also accepted after a subcommand (`zerohour remind --db x.db`).
+    #[arg(long, value_name = "PATH", global = true)]
     db: Option<PathBuf>,
 
     /// Start with sample data so you can see the layout. Nothing is saved
     /// (unless combined with --db, which seeds that file).
     #[arg(long)]
     demo: bool,
+
+    /// What to do instead of opening the app (`None` = open the app).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// The subcommands. Each variant becomes one (`Remind` -> `zerohour remind`), and its doc
+/// comment becomes the `--help` text.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Show the reminders that are due now as desktop notifications, then exit. Meant to run
+    /// every minute from a systemd user timer.
+    Remind(RemindArgs),
+}
+
+/// Flags for `zerohour remind`.
+#[derive(clap::Args, Debug)]
+struct RemindArgs {
+    /// Only print what would be shown now and what is planned next; show and record nothing.
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Print the systemd user service and timer that run this every minute (nothing is
+    /// installed; save them under ~/.config/systemd/user/ yourself).
+    #[arg(long, conflicts_with_all = ["dry_run", "print_unit"])]
+    print_units: bool,
+
+    /// Print just one of the two unit files, e.g. to redirect it into place.
+    #[arg(long, value_name = "UNIT", conflicts_with = "dry_run")]
+    print_unit: Option<UnitFile>,
+}
+
+/// Which unit file `--print-unit` prints. `ValueEnum` lets clap accept the lowercase names
+/// (`service`, `timer`) and list them in `--help`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum UnitFile {
+    /// zerohour-remind.service
+    Service,
+    /// zerohour-remind.timer
+    Timer,
 }
 
 /// The real `main`. Returning `ExitCode` lets us print our own friendly error message and exit
 /// with status 1, instead of Rust's default debug-style error output.
 fn main() -> ExitCode {
     let args = Args::parse();
-    match run(args) {
+    // `zerohour remind` runs on its own and never opens the app; no subcommand opens the app.
+    let result = match &args.command {
+        Some(Command::Remind(remind)) => run_remind(&args, remind),
+        None => run(args),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // `{:#}` prints the error plus its "context" chain on one line, e.g.
@@ -98,12 +149,7 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
         return Ok((db, None));
     }
 
-    let path = match &args.db {
-        Some(path) => path.clone(),
-        None => default_db_path().context(
-            "couldn't find your home folder to store data; pass --db <path> to choose a file",
-        )?,
-    };
+    let path = db_path(args)?;
     // The DbError message already names the file and the problem.
     let db = Db::open(&path)?;
     if args.demo {
@@ -111,6 +157,112 @@ fn open_database(args: &Args) -> Result<(Db, Option<PathBuf>)> {
         return Ok((db, None));
     }
     Ok((db, Some(path)))
+}
+
+/// The database file to use: `--db`, or the default location.
+fn db_path(args: &Args) -> Result<PathBuf> {
+    match &args.db {
+        Some(path) => Ok(path.clone()),
+        None => default_db_path().context(
+            "couldn't find your home folder to store data; pass --db <path> to choose a file",
+        ),
+    }
+}
+
+/// `zerohour remind`: shows the reminders due now (see `remind.rs`), or with `--dry-run`
+/// prints them. Never sets up the terminal, never syncs, and exits quickly, so it is safe to
+/// run while the app is open.
+///
+/// Exits with success when the notifications couldn't be shown (no D-Bus session, no
+/// notification daemon): that just means nobody is at this desktop, and the next run tries
+/// again. Only a database or flag problem is an error.
+fn run_remind(args: &Args, remind: &RemindArgs) -> Result<()> {
+    if args.demo {
+        bail!("`remind` works on a real database; it can't be combined with --demo");
+    }
+    // Printing the unit files never opens (or creates, or upgrades) the database.
+    if remind.print_units || remind.print_unit.is_some() {
+        let exe = std::env::current_exe().context("couldn't find the zerohour binary's path")?;
+        let db = args.db.as_deref();
+        let text = match remind.print_unit {
+            Some(UnitFile::Service) => units::service(&exe, db),
+            Some(UnitFile::Timer) => units::timer(),
+            None => units::both(&exe, db),
+        };
+        print!("{text}");
+        return Ok(());
+    }
+    let path = db_path(args)?;
+    let db = Db::open(&path)?;
+    // Keep the lock until this function returns (`_lock` is dropped, and unlocked, then).
+    let Some(_lock) = lock_beside(&path)? else {
+        eprintln!("{APP_NAME}: another `{APP_NAME} remind` is running; skipping this one");
+        return Ok(());
+    };
+
+    // The two local times the window is built from (see `remind::window`): now, and the
+    // real moment GRACE_MINUTES ago, each as shown on this computer's clock.
+    let now = Utc::now();
+    let local_now = now.with_timezone(&Local).naive_local();
+    let local_grace_ago = (now - TimeDelta::minutes(remind::GRACE_MINUTES))
+        .with_timezone(&Local)
+        .naive_local();
+
+    if remind.dry_run {
+        println!(
+            "{}",
+            remind::preview(&db, local_now, local_grace_ago)?.text()
+        );
+        return Ok(());
+    }
+
+    let outcome = remind::run_once(
+        &db,
+        &mut notify::NotifySend,
+        local_now,
+        local_grace_ago,
+        now,
+    )?;
+    // One line per notification, for `journalctl --user -u zerohour-remind`. A quiet run
+    // (the usual case) prints nothing.
+    for reminder in &outcome.sent {
+        println!("shown: {}: {}", reminder.title, reminder.body);
+    }
+    for (reminder, reason) in &outcome.failed {
+        eprintln!(
+            "{APP_NAME}: couldn't show \"{}\" ({reason}); trying again on the next run",
+            reminder.title
+        );
+    }
+    Ok(())
+}
+
+/// Takes the `zerohour remind` lock: a file next to the database (`zerohour.db` ->
+/// `zerohour.db.remind-lock`) that only one run at a time can hold. Without it, a run started
+/// by hand at the same moment as the timer's could show a reminder twice, since each would
+/// check "already shown?" before the other recorded it.
+///
+/// Returns `None` when another run holds the lock. The operating system releases the lock
+/// when the file is closed, even if the process crashes, so a stale lock can't block later
+/// runs. The file itself stays (it's empty) and is reused.
+fn lock_beside(db_path: &Path) -> Result<Option<File>> {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push(".remind-lock");
+    let lock_path = PathBuf::from(name);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("couldn't open the lock file {}", lock_path.display()))?;
+    // `try_lock` never waits: it either gets the lock now or says someone else has it.
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("couldn't lock {}", lock_path.display()))
+        }
+    }
 }
 
 /// The main loop: draw, wait up to a second for input, handle it, repeat until quit.
@@ -200,6 +352,7 @@ mod tests {
         let args = Args {
             db: None,
             demo: true,
+            command: None,
         };
         let (db, path) = open_database(&args).unwrap();
         assert!(path.is_none());
@@ -213,6 +366,7 @@ mod tests {
         let args = Args {
             db: Some(file.clone()),
             demo: true,
+            command: None,
         };
         let (_db, path) = open_database(&args).unwrap();
         assert!(path.is_none());
@@ -242,6 +396,91 @@ mod tests {
         let expected = stats::compute(&completions, &items, app.now, &Local);
         assert_eq!(app.stats.total_all, expected.total_all);
         assert_eq!(app.stats.by_priority, expected.by_priority);
+    }
+
+    /// `--db` is accepted before and after `remind`, and `--demo` is refused with it.
+    #[test]
+    fn remind_takes_db_either_side_and_refuses_demo() {
+        for argv in [
+            ["zerohour", "remind", "--db", "x.db"],
+            ["zerohour", "--db", "x.db", "remind"],
+        ] {
+            let args = Args::try_parse_from(argv).unwrap();
+            assert_eq!(args.db.as_deref(), Some(Path::new("x.db")));
+            assert!(matches!(args.command, Some(Command::Remind(_))));
+        }
+        let args = Args::try_parse_from(["zerohour", "--demo", "remind", "--dry-run"]).unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        assert!(remind.dry_run);
+        assert!(run_remind(&args, remind).is_err());
+    }
+
+    /// The unit flags parse, exclude `--dry-run`, and print without creating a database.
+    #[test]
+    fn printing_units_parses_and_never_touches_a_database() {
+        let args = Args::try_parse_from(["zerohour", "remind", "--print-unit", "timer"]).unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        assert_eq!(remind.print_unit, Some(UnitFile::Timer));
+        assert!(
+            Args::try_parse_from(["zerohour", "remind", "--print-units", "--dry-run"]).is_err()
+        );
+        assert!(Args::try_parse_from(["zerohour", "remind", "--print-unit", "socket"]).is_err());
+
+        let dir = std::env::temp_dir().join(format!("zerohour-units-test-{}", uuid_like()));
+        let file = dir.join("z.db");
+        let args = Args::try_parse_from([
+            "zerohour",
+            "remind",
+            "--print-units",
+            "--db",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        run_remind(&args, remind).unwrap();
+        assert!(!dir.exists(), "printing units must not create the database");
+    }
+
+    /// Only one `remind` run at a time holds the lock; it's free again once dropped.
+    #[test]
+    fn the_remind_lock_is_held_by_one_run_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("zerohour-lock-test-{}", uuid_like()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("z.db");
+        let first = lock_beside(&db).unwrap();
+        assert!(first.is_some());
+        assert!(dir.join("z.db.remind-lock").exists());
+        assert!(lock_beside(&db).unwrap().is_none(), "second run must skip");
+        drop(first);
+        assert!(lock_beside(&db).unwrap().is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A dry run on a fresh database file prints and records nothing, and upgrades it.
+    #[test]
+    fn a_dry_run_on_a_new_file_works() {
+        let dir = std::env::temp_dir().join(format!("zerohour-remind-test-{}", uuid_like()));
+        let file = dir.join("z.db");
+        let args = Args::try_parse_from([
+            "zerohour",
+            "remind",
+            "--dry-run",
+            "--db",
+            file.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Some(Command::Remind(remind)) = &args.command else {
+            panic!("expected remind");
+        };
+        run_remind(&args, remind).unwrap();
+        assert_eq!(Db::open(&file).unwrap().schema_version().unwrap(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A unique-enough suffix for a temp file name (process id + nanoseconds).
