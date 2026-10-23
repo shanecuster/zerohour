@@ -12,13 +12,22 @@
 //! (including what to do on the night the clocks change) is the app's job, done at scheduling
 //! time with the device's current time zone.
 //!
+//! **What is reminded** (see [`plan`]):
+//! - a task with a due date and time: at its due time, plus `lead_minutes` earlier if set;
+//! - nothing that is completed or deleted, and no events.
+//!
+//! Only reminders in the future are returned. A device that was off at a reminder's time
+//! never gets it replayed later: the plan simply starts from "now".
+//!
 //! **The settings** live in the database's `settings` table under the `reminders.*` keys in
 //! [`settings_keys`](crate::db::settings_keys). That table is per device and never synced, so
 //! each device decides for itself whether and when to remind.
 
-use chrono::NaiveTime;
+use chrono::{NaiveDateTime, NaiveTime, TimeDelta};
 
+use crate::clock::{TimeFormat, format_time};
 use crate::db::{Db, DbError, settings_keys};
+use crate::model::{Item, Kind};
 
 /// The largest allowed lead time: one day, in minutes.
 pub const MAX_LEAD_MINUTES: u32 = 24 * 60;
@@ -210,4 +219,284 @@ mod tests {
             .unwrap();
         assert_eq!(ReminderSettings::load(&db).unwrap().lead_minutes, 0);
     }
+}
+
+/// Tests for the planner, with fixed local times so they never depend on the clock.
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+    use crate::model::{Priority, RepeatRule};
+    use chrono::{NaiveDate, Utc};
+
+    /// A date.
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    /// A time of day.
+    fn t(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    /// A local date and time.
+    fn at(y: i32, mo: u32, day: u32, h: u32, mi: u32) -> NaiveDateTime {
+        d(y, mo, day).and_time(t(h, mi))
+    }
+
+    /// An open task with this title, due date and optional time.
+    fn task(title: &str, date: Option<NaiveDate>, time: Option<NaiveTime>) -> Item {
+        let mut item = Item::new(Kind::Task, title, Utc::now());
+        item.priority = Priority::Medium;
+        item.date = date;
+        item.due_time = time;
+        item
+    }
+
+    /// Reminders switched on, with the given lead time.
+    fn on(lead_minutes: u32) -> ReminderSettings {
+        ReminderSettings {
+            enabled: true,
+            lead_minutes,
+            ..ReminderSettings::default()
+        }
+    }
+
+    /// The plan for the 48 hours after `now`, in 12-hour times.
+    fn plan48(items: &[Item], now: NaiveDateTime, settings: &ReminderSettings) -> Vec<Reminder> {
+        plan(
+            items,
+            now,
+            now + TimeDelta::hours(48),
+            settings,
+            TimeFormat::Hour12,
+        )
+    }
+
+    /// Just the (kind, time) of each planned reminder, for compact assertions.
+    fn times(plan: &[Reminder]) -> Vec<(ReminderKind, NaiveDateTime)> {
+        plan.iter().map(|r| (r.kind, r.fire_at)).collect()
+    }
+
+    // 2026-10-22 is a Thursday.
+
+    #[test]
+    fn a_timed_task_is_reminded_at_its_due_time() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let plan = plan48(&items, at(2026, 10, 22, 9, 0), &on(0));
+        assert_eq!(times(&plan), [(ReminderKind::Due, at(2026, 10, 22, 14, 0))]);
+        assert_eq!(plan[0].title, "Call the bank");
+        assert_eq!(plan[0].body, "Due 2:00 PM");
+        assert_eq!(plan[0].item_id, items[0].id);
+    }
+
+    #[test]
+    fn a_lead_time_adds_an_earlier_reminder() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let plan = plan48(&items, at(2026, 10, 22, 9, 0), &on(15));
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Lead, at(2026, 10, 22, 13, 45)),
+                (ReminderKind::Due, at(2026, 10, 22, 14, 0)),
+            ]
+        );
+        assert_eq!(plan[0].body, "Due in 15 min (2:00 PM)");
+    }
+
+    #[test]
+    fn a_lead_time_can_cross_midnight() {
+        let items = [task("Night shift", Some(d(2026, 10, 23)), Some(t(0, 10)))];
+        let plan = plan48(&items, at(2026, 10, 22, 20, 0), &on(30));
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Lead, at(2026, 10, 22, 23, 40)),
+                (ReminderKind::Due, at(2026, 10, 23, 0, 10)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_passed_lead_time_leaves_only_the_due_reminder() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let plan = plan48(&items, at(2026, 10, 22, 13, 50), &on(15));
+        assert_eq!(times(&plan), [(ReminderKind::Due, at(2026, 10, 22, 14, 0))]);
+    }
+
+    #[test]
+    fn a_time_already_passed_today_is_not_reminded() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(8, 0)))];
+        assert!(plan48(&items, at(2026, 10, 22, 9, 0), &on(0)).is_empty());
+        // Exactly "now" counts as passed, so nothing fires twice.
+        assert!(plan48(&items, at(2026, 10, 22, 8, 0), &on(0)).is_empty());
+    }
+
+    #[test]
+    fn nothing_beyond_the_window() {
+        let items = [task("Later", Some(d(2026, 10, 30)), Some(t(14, 0)))];
+        assert!(plan48(&items, at(2026, 10, 22, 9, 0), &on(0)).is_empty());
+    }
+
+    #[test]
+    fn completed_deleted_and_events_are_never_reminded() {
+        let now = at(2026, 10, 22, 9, 0);
+        let mut done = task("Done", Some(d(2026, 10, 22)), Some(t(14, 0)));
+        done.completed_at = Some(Utc::now());
+        let mut gone = task("Deleted", Some(d(2026, 10, 22)), Some(t(14, 0)));
+        gone.deleted = true;
+        let mut event = Item::new(Kind::Event, "Concert", Utc::now());
+        event.date = Some(d(2026, 10, 22));
+        event.repeat = RepeatRule::None;
+        assert!(plan48(&[done, gone, event], now, &on(15)).is_empty());
+    }
+
+    #[test]
+    fn with_reminders_switched_off_the_plan_is_empty() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let off = ReminderSettings::default();
+        assert!(plan48(&items, at(2026, 10, 22, 9, 0), &off).is_empty());
+    }
+
+    #[test]
+    fn twenty_four_hour_texts_and_long_leads() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let now = at(2026, 10, 22, 9, 0);
+        let until = now + TimeDelta::hours(48);
+        let plan = plan(&items, now, until, &on(90), TimeFormat::Hour24);
+        assert_eq!(plan[0].body, "Due in 1 h 30 min (14:00)");
+        assert_eq!(plan[1].body, "Due 14:00");
+        let plan = plan48(&items, now, &on(60));
+        assert_eq!(plan[0].body, "Due in 1 h (2:00 PM)");
+    }
+
+    #[test]
+    fn the_key_names_item_kind_and_time() {
+        let items = [task("Call the bank", Some(d(2026, 10, 22)), Some(t(14, 0)))];
+        let plan = plan48(&items, at(2026, 10, 22, 9, 0), &on(0));
+        assert_eq!(
+            plan[0].key(),
+            format!("{}|Due|2026-10-22T14:00", items[0].id)
+        );
+    }
+}
+
+// ---- the planner -----------------------------------------------------------------------
+
+/// Why a reminder fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ReminderKind {
+    /// At a timed task's due time.
+    Due,
+    /// `lead_minutes` before a timed task's due time.
+    Lead,
+}
+
+/// One planned reminder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder {
+    /// The task it is about.
+    pub item_id: String,
+    /// Why it fires.
+    pub kind: ReminderKind,
+    /// When, as local wall-clock time (see the module docs).
+    pub fire_at: NaiveDateTime,
+    /// The notification's title: the task's title.
+    pub title: String,
+    /// The notification's text, e.g. "Due 2:00 PM".
+    pub body: String,
+}
+
+impl Reminder {
+    /// A text that names this reminder and stays the same every time it is planned: the item,
+    /// the kind and the time. Apps use it to schedule each reminder exactly once (planning
+    /// again replaces the alarm with the same key instead of adding a second one), and to find
+    /// the alarms to cancel when a reminder is no longer planned.
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{:?}|{}",
+            self.item_id,
+            self.kind,
+            self.fire_at.format("%Y-%m-%dT%H:%M")
+        )
+    }
+}
+
+/// Plans every reminder that fires after `now` and no later than `until` (both local wall-clock
+/// times), sorted by time.
+///
+/// - `items`: all items (completed, deleted and events are skipped here).
+/// - `settings`: the reminder settings; with the master switch off, the plan is empty.
+/// - `time_format`: 12- or 24-hour, for the texts ("Due 2:00 PM" / "Due 14:00").
+///
+/// Reminders at or before `now` are never returned, so nothing missed is replayed.
+pub fn plan(
+    items: &[Item],
+    now: NaiveDateTime,
+    until: NaiveDateTime,
+    settings: &ReminderSettings,
+    time_format: TimeFormat,
+) -> Vec<Reminder> {
+    let mut reminders = Vec::new();
+    if !settings.enabled {
+        return reminders;
+    }
+    // `TimeDelta` is a length of time; `try_minutes` returns `None` only for absurdly large
+    // values, which `lead_minutes` (at most a day) never is.
+    let lead = TimeDelta::try_minutes(i64::from(settings.lead_minutes)).unwrap_or_default();
+    // Only something strictly after `now` and not after `until` goes in the plan.
+    let in_window = |at: NaiveDateTime| at > now && at <= until;
+
+    for item in items.iter().filter(|i| is_open_task(i)) {
+        // `let ... else`: continue with this item only if it has BOTH a date and a time.
+        let (Some(date), Some(time)) = (item.date, item.due_time) else {
+            continue;
+        };
+        let due = date.and_time(time);
+        if in_window(due) {
+            reminders.push(Reminder {
+                item_id: item.id.clone(),
+                kind: ReminderKind::Due,
+                fire_at: due,
+                title: item.title.clone(),
+                body: due_text(time, time_format),
+            });
+        }
+        // The earlier reminder, if a lead time is set. It can fall on the previous day
+        // (a task due at 00:10 with a 30-minute lead is reminded at 23:40 the day before).
+        if settings.lead_minutes > 0 && in_window(due - lead) {
+            reminders.push(Reminder {
+                item_id: item.id.clone(),
+                kind: ReminderKind::Lead,
+                fire_at: due - lead,
+                title: item.title.clone(),
+                body: lead_text(settings.lead_minutes, time, time_format),
+            });
+        }
+    }
+
+    // Earliest first; ties in a fixed order so the plan is always the same for the same input.
+    reminders.sort_by(|a, b| (a.fire_at, a.kind, &a.item_id).cmp(&(b.fire_at, b.kind, &b.item_id)));
+    reminders
+}
+
+/// True for a task that is still open and not deleted: the only things that are reminded.
+fn is_open_task(item: &Item) -> bool {
+    item.kind == Kind::Task && !item.deleted && !item.is_completed()
+}
+
+/// "Due 2:00 PM" / "Due 14:00".
+fn due_text(time: NaiveTime, format: TimeFormat) -> String {
+    format!("Due {}", format_time(time, format))
+}
+
+/// "Due in 15 min (2:00 PM)", "Due in 1 h (2:00 PM)", "Due in 1 h 30 min (2:00 PM)".
+fn lead_text(lead_minutes: u32, time: NaiveTime, format: TimeFormat) -> String {
+    let (hours, minutes) = (lead_minutes / 60, lead_minutes % 60);
+    // `match` on a tuple of two numbers: whichever pattern fits first wins.
+    let lead = match (hours, minutes) {
+        (0, m) => format!("{m} min"),
+        (h, 0) => format!("{h} h"),
+        (h, m) => format!("{h} h {m} min"),
+    };
+    format!("Due in {lead} ({})", format_time(time, format))
 }
