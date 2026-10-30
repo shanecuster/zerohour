@@ -213,8 +213,9 @@ pub fn repeat_text(item: &Item, mode: IconMode) -> String {
 /// The "due in 3d" text for a task, and which color slot to draw it in.
 ///
 /// `narrow` gives the short forms ("3d", "tmrw") used under 60 columns and on the phone.
-/// Tasks with a due time get the timed forms (see [`timed_due_label`]); a task without a date
-/// gets an empty label.
+/// Tasks with a due time get the timed forms (see [`timed_due_label`]) from their due day on;
+/// once that day is over they read like untimed ones ("! 1d overdue"), since a task is overdue
+/// by the day, not the hour (see [`is_overdue`]). A task without a date gets an empty label.
 pub fn due_label(
     task: &Item,
     now: NaiveDateTime,
@@ -229,8 +230,13 @@ pub fn due_label(
     };
     let today = now.date();
     let days = days_until(due, today);
-    if let Some(time) = task.due_time {
-        return timed_due_label(due.and_time(time), days, now, narrow, mode, time_format);
+    // A due time only changes the text up to the end of the due day (`days >= 0`). After
+    // that, fall through to the untimed forms below. (`if let ... && ...` is a "let chain":
+    // the pattern must match AND the condition must hold.)
+    if let Some(time) = task.due_time
+        && days >= 0
+    {
+        return timed_due_label(due.and_time(time), days, now, narrow, time_format);
     }
     let overdue = Icon::Overdue.get(mode);
     // Match on (days, narrow) together; guards (`if d > 0`) refine an arm further.
@@ -252,33 +258,37 @@ pub fn due_label(
     Label::plain(text, slot)
 }
 
-/// The due text for a task with a due time, e.g. "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
-/// "in 3d · 2:00 PM", or "! overdue 2h". Narrow mode keeps just "3h" (today), "2PM"
-/// (tomorrow), "3d" or "!2h".
+/// The due text for a task with a due time, due today or later (`days >= 0`; earlier days use
+/// the untimed forms): "today 2:00 PM · in 3h", "today 2:00 PM" once that time has come,
+/// "tomorrow 9:30 AM", or "in 3d · 2:00 PM". Narrow mode keeps just "3h" (today, still ahead),
+/// "today" (today, time come), "2PM" (tomorrow) or "3d".
+///
+/// A time that has come today is never shown as late: no danger color, no overdue marker, no
+/// "in 0h". The task is still on time until midnight.
 fn timed_due_label(
     due: NaiveDateTime,
     days: i64,
     now: NaiveDateTime,
     narrow: bool,
-    mode: IconMode,
     time_format: TimeFormat,
 ) -> Label {
-    let overdue_icon = Icon::Overdue.get(mode);
-    let (relative, overdue) = relative_text(due, now);
+    let (relative, _) = relative_text(due, now);
     let time = format_time(due.time(), time_format);
-    let text = match (overdue, days, narrow) {
-        (true, _, false) => format!("{overdue_icon} overdue {relative}"),
-        (true, _, true) => format!("{overdue_icon}{relative}"),
-        (false, 0, false) => format!("today {time} · in {relative}"),
-        (false, 0, true) => relative,
-        (false, 1, false) => format!("tomorrow {time}"),
-        (false, 1, true) => format_time_short(due.time(), time_format),
-        (false, d, false) => format!("in {d}d · {time}"),
-        (false, d, true) => format!("{d}d"),
+    // From the due minute itself (14:00:00) the countdown is over. Just before it, the
+    // countdown still runs, rounded down: "in 1m" at 13:59:00, "in 0m" from 13:59:01.
+    let time_has_come = now >= due;
+    let text = match (days, time_has_come, narrow) {
+        (0, true, false) => format!("today {time}"),
+        (0, true, true) => "today".to_string(),
+        (0, false, false) => format!("today {time} · in {relative}"),
+        (0, false, true) => relative,
+        (1, _, false) => format!("tomorrow {time}"),
+        (1, _, true) => format_time_short(due.time(), time_format),
+        (d, _, false) => format!("in {d}d · {time}"),
+        (d, _, true) => format!("{d}d"),
     };
-    let slot = match (overdue, days) {
-        (true, _) => Slot::Danger,
-        (false, 0 | 1) => Slot::Warn,
+    let slot = match days {
+        0 | 1 => Slot::Warn,
         _ => Slot::Muted,
     };
     Label::plain(text, slot)
@@ -471,7 +481,9 @@ mod tests {
             (0, (12, 0), "today 12:00 PM · in 11h", "11h", Slot::Warn),
             (1, (12, 0), "tomorrow 12:00 PM", "12PM", Slot::Warn),
             (3, (12, 0), "in 3d · 12:00 PM", "3d", Slot::Muted),
-            (-1, (1, 30), "! overdue 23h", "!23h", Slot::Danger),
+            // Due yesterday: overdue by the day, so the untimed forms.
+            (-1, (1, 30), "! 1d overdue", "!1d", Slot::Danger),
+            (-3, (23, 0), "! 3d overdue", "!3d", Slot::Danger),
         ];
         for (days, time, wide, narrow, slot) in cases {
             let t = task("t", Some(days), Some(time), Priority::Low);
@@ -484,6 +496,166 @@ mod tests {
                 Label::plain(narrow, slot)
             );
         }
+    }
+
+    #[test]
+    fn a_timed_task_whose_time_has_come_today_is_not_late() {
+        // A task due today (Oct 9) at 2:00 PM, looked at through the day and into Oct 10.
+        let mode = IconMode::Unicode;
+        let mut t = task("t", Some(0), Some((14, 0)), Priority::Low);
+        let day = now().date();
+        let at = |h, m, s| day.and_hms_opt(h, m, s).unwrap();
+        let next_midnight = (day + TimeDelta::days(1)).and_hms_opt(0, 0, 0).unwrap();
+        // (moment, wide 12h, wide 24h, narrow, slot). Narrow is the same in 12h and 24h.
+        let cases = [
+            (
+                at(11, 0, 0),
+                "today 2:00 PM · in 3h",
+                "today 14:00 · in 3h",
+                "3h",
+                Slot::Warn,
+            ),
+            // The final minute still counts down (rounded down, so "1m" at 13:59:00)...
+            (
+                at(13, 59, 0),
+                "today 2:00 PM · in 1m",
+                "today 14:00 · in 1m",
+                "1m",
+                Slot::Warn,
+            ),
+            (
+                at(13, 59, 1),
+                "today 2:00 PM · in 0m",
+                "today 14:00 · in 0m",
+                "0m",
+                Slot::Warn,
+            ),
+            (
+                at(13, 59, 59),
+                "today 2:00 PM · in 0m",
+                "today 14:00 · in 0m",
+                "0m",
+                Slot::Warn,
+            ),
+            // ...and from 2:00 PM on, just the time, in the same due-today color.
+            (
+                at(14, 0, 0),
+                "today 2:00 PM",
+                "today 14:00",
+                "today",
+                Slot::Warn,
+            ),
+            (
+                at(17, 0, 0),
+                "today 2:00 PM",
+                "today 14:00",
+                "today",
+                Slot::Warn,
+            ),
+            (
+                at(23, 59, 59),
+                "today 2:00 PM",
+                "today 14:00",
+                "today",
+                Slot::Warn,
+            ),
+            // Midnight: the day is over, so it's overdue.
+            (
+                next_midnight,
+                "! 1d overdue",
+                "! 1d overdue",
+                "!1d",
+                Slot::Danger,
+            ),
+        ];
+        for (moment, wide12, wide24, narrow, slot) in cases {
+            let label = |narrow, f| due_label(&t, moment, narrow, mode, f);
+            assert_eq!(
+                label(false, TimeFormat::Hour12),
+                Label::plain(wide12, slot),
+                "at {moment}"
+            );
+            assert_eq!(
+                label(false, TimeFormat::Hour24),
+                Label::plain(wide24, slot),
+                "at {moment}"
+            );
+            for f in [TimeFormat::Hour12, TimeFormat::Hour24] {
+                assert_eq!(label(true, f), Label::plain(narrow, slot), "at {moment}");
+            }
+            // The title turns red only once it's overdue, at midnight.
+            let title = if moment < next_midnight {
+                Slot::Fg
+            } else {
+                Slot::Danger
+            };
+            assert_eq!(task_title_slot(&t, moment), title, "at {moment}");
+        }
+
+        // The edges of the day: due at 11:59 PM and at 12:00 AM.
+        t.due_time = NaiveTime::from_hms_opt(23, 59, 0);
+        let label = |moment| due_label(&t, moment, false, mode, TimeFormat::Hour12);
+        assert_eq!(label(at(23, 59, 0)).text, "today 11:59 PM");
+        assert_eq!(label(next_midnight).text, "! 1d overdue");
+        t.due_time = NaiveTime::from_hms_opt(0, 0, 0);
+        let label = |moment| due_label(&t, moment, false, mode, TimeFormat::Hour12);
+        assert_eq!(
+            label(at(0, 0, 0)),
+            Label::plain("today 12:00 AM", Slot::Warn)
+        );
+        assert_eq!(label(at(23, 59, 0)).text, "today 12:00 AM");
+        assert_eq!(label(next_midnight).text, "! 1d overdue");
+    }
+
+    #[test]
+    fn timed_labels_on_the_nights_the_clocks_change() {
+        // Wall-clock times, no zone: the US 2026 change nights read like any other day.
+        let mode = IconMode::Unicode;
+        let f = TimeFormat::Hour12;
+        let mut t = task("t", None, Some((2, 30)), Priority::Low);
+        let wide = |t: &Item, moment| due_label(t, moment, false, mode, f).text;
+
+        // Spring forward, Sun Mar 8: due at 2:30 AM, a time the clock skips.
+        let spring = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        t.date = Some(spring);
+        // At 1:59 the countdown is by the clock face (31 minutes; really one, since 2:00 is
+        // skipped). That's the known "in 3h can be off by an hour" on these nights.
+        assert_eq!(
+            wide(&t, spring.and_hms_opt(1, 59, 0).unwrap()),
+            "today 2:30 AM · in 31m"
+        );
+        // The clock jumps from 1:59 to 3:00: the time has come, and it's not late.
+        assert_eq!(
+            wide(&t, spring.and_hms_opt(3, 0, 0).unwrap()),
+            "today 2:30 AM"
+        );
+        assert_eq!(
+            wide(&t, spring.and_hms_opt(23, 59, 0).unwrap()),
+            "today 2:30 AM"
+        );
+        let monday = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        assert_eq!(
+            wide(&t, monday.and_hms_opt(0, 0, 0).unwrap()),
+            "! 1d overdue"
+        );
+
+        // Fall back, Sun Nov 1: due at 1:30 AM, a time the clock shows twice.
+        let fall = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        t.date = Some(fall);
+        t.due_time = NaiveTime::from_hms_opt(1, 30, 0);
+        assert_eq!(
+            wide(&t, fall.and_hms_opt(1, 30, 0).unwrap()),
+            "today 1:30 AM"
+        );
+        assert_eq!(
+            wide(&t, fall.and_hms_opt(23, 59, 0).unwrap()),
+            "today 1:30 AM"
+        );
+        let monday = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        assert_eq!(
+            wide(&t, monday.and_hms_opt(0, 0, 0).unwrap()),
+            "! 1d overdue"
+        );
     }
 
     #[test]
