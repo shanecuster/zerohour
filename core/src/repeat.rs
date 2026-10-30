@@ -232,18 +232,19 @@ pub fn event_is_visible(item: &Item, today: NaiveDate) -> bool {
 
 /// True if `item` is an open task that is past due at local time `now`.
 ///
-/// - With a due time: overdue once `now` is past the due date + time.
-/// - Without one: overdue from the day after the due date (the whole due day counts as on
-///   time), exactly as before due times existed.
+/// A task is overdue from the day *after* its due date: the whole due day counts as on time,
+/// with or without a due time. A task due at 2:00 PM is not late at 2:30 PM; it turns overdue
+/// at midnight, like a task with no time. (The due time still matters for reminders, which
+/// fire at it, and for the "in 3h" countdown; it just doesn't make a task late.)
+///
+/// `now` is a full date-time so callers don't need to know this rule only looks at the date.
 pub fn is_overdue(item: &Item, now: NaiveDateTime) -> bool {
     if item.kind != Kind::Task || item.is_completed() {
         return false;
     }
-    match (item.date, item.due_time) {
-        (Some(date), Some(time)) => date.and_time(time) < now,
-        (Some(date), None) => date < now.date(),
-        (None, _) => false,
-    }
+    // `Option::is_some_and` is true only for `Some(date)` where the closure says yes; a task
+    // without a date (`None`) is never overdue.
+    item.date.is_some_and(|date| date < now.date())
 }
 
 /// Parses a date the user typed into the add form.
@@ -588,17 +589,71 @@ mod tests {
         assert!(!is_overdue(&t, now), "completed tasks are never overdue");
     }
 
-    #[test]
-    fn timed_tasks_are_overdue_after_their_time() {
-        let today = d(2026, 10, 8);
+    /// A task due on `date` at `h:m`.
+    fn timed_task(date: NaiveDate, h: u32, m: u32) -> Item {
         let mut t = Item::new(Kind::Task, "standup", Utc::now());
-        t.date = Some(today);
-        t.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        t.date = Some(date);
+        t.due_time = NaiveTime::from_hms_opt(h, m, 0);
+        t
+    }
+
+    #[test]
+    fn timed_tasks_are_overdue_only_after_their_day() {
+        // Due Thursday at 2 PM: on time all Thursday, even after 2 PM; overdue from midnight.
+        let today = d(2026, 10, 8);
+        let t = timed_task(today, 14, 0);
         let at = |h, m| today.and_hms_opt(h, m, 0).unwrap();
         assert!(!is_overdue(&t, at(13, 59)));
         assert!(!is_overdue(&t, at(14, 0)), "exactly on time is not late");
-        assert!(is_overdue(&t, at(14, 1)));
+        assert!(
+            !is_overdue(&t, at(14, 1)),
+            "the time passing doesn't make it late"
+        );
+        assert!(!is_overdue(&t, at(23, 59)), "still its due day");
+        assert!(is_overdue(&t, d(2026, 10, 9).and_hms_opt(0, 0, 0).unwrap()));
         assert_eq!(due_datetime(&t), Some(at(14, 0)));
+    }
+
+    #[test]
+    fn timed_tasks_at_the_edges_of_the_day() {
+        let today = d(2026, 10, 8);
+        let tomorrow = d(2026, 10, 9);
+        let at = |day: NaiveDate, h, m| day.and_hms_opt(h, m, 0).unwrap();
+
+        // Due at 11:59 PM: on time at 11:59 PM, overdue one minute later (the next day).
+        let last_minute = timed_task(today, 23, 59);
+        assert!(!is_overdue(&last_minute, at(today, 23, 59)));
+        assert!(is_overdue(&last_minute, at(tomorrow, 0, 0)));
+
+        // Due at 12:00 AM: the time is passed for the whole day, but it's only overdue once
+        // the day is over.
+        let midnight = timed_task(today, 0, 0);
+        assert!(!is_overdue(&midnight, at(today, 0, 0)));
+        assert!(!is_overdue(&midnight, at(today, 23, 59)));
+        assert!(is_overdue(&midnight, at(tomorrow, 0, 0)));
+    }
+
+    #[test]
+    fn timed_tasks_on_the_nights_the_clocks_change() {
+        // Times here are wall-clock times without a zone, so a daylight-saving change can't
+        // move "the end of the day". These use the US dates in 2026.
+        let at = |day: NaiveDate, h, m| day.and_hms_opt(h, m, 0).unwrap();
+
+        // Spring forward, Sun Mar 8: 2:30 AM never shows on the clock. A task due then is not
+        // late once the clock jumps to 3:00 AM, nor late that evening; overdue on Monday.
+        let spring = d(2026, 3, 8);
+        let gap = timed_task(spring, 2, 30);
+        assert!(!is_overdue(&gap, at(spring, 3, 0)));
+        assert!(!is_overdue(&gap, at(spring, 23, 59)));
+        assert!(is_overdue(&gap, at(d(2026, 3, 9), 0, 0)));
+
+        // Fall back, Sun Nov 1: 1:30 AM happens twice. Not late at either one, nor that
+        // evening; overdue on Monday.
+        let fall = d(2026, 11, 1);
+        let twice = timed_task(fall, 1, 30);
+        assert!(!is_overdue(&twice, at(fall, 1, 30)));
+        assert!(!is_overdue(&twice, at(fall, 23, 59)));
+        assert!(is_overdue(&twice, at(d(2026, 11, 2), 0, 0)));
     }
 
     /// Mon–Thu, the example rule from the design.

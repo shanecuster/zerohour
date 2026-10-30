@@ -24,7 +24,9 @@
 //!   "Due today". Only its open instance: once that day is over, an untimed task is simply
 //!   overdue (see the digest below);
 //! - with the overdue digest switched on (off by default): once a day at `day_time`, one
-//!   reminder listing the tasks that are overdue at that moment ("2 overdue tasks"), if any;
+//!   reminder listing the tasks that are overdue at that moment ("2 overdue tasks"), if any.
+//!   Overdue means the due *day* is over: a task due at 8:00 today whose time has passed is
+//!   not in today's digest (its own 8:00 reminder already came), only in tomorrow's;
 //! - nothing that is completed or deleted, and no events.
 //!
 //! Only reminders in the future are returned. A device that was off at a reminder's time
@@ -569,12 +571,13 @@ mod plan_tests {
             .filter(|r| r.kind == ReminderKind::Digest)
             .collect();
         // The 48 hours from Thursday 07:00 end on Saturday 07:00, before that day's 09:00:
-        // so today at 9:00 (the 8:00 report is overdue by then) and tomorrow at 9:00, when
-        // the 18:00 task is overdue too.
+        // so today at 9:00 and tomorrow at 9:00. Today's lists only the bill: the 8:00 report
+        // has passed its time but is due today, which isn't overdue. Tomorrow's lists all
+        // three, since both of Thursday's tasks are a day late by then.
         assert_eq!(digests.len(), 2);
         assert_eq!(digests[0].fire_at, at(2026, 10, 22, 9, 0));
-        assert_eq!(digests[0].title, "2 overdue tasks");
-        assert!(digests[0].body.contains("Pay bill") && digests[0].body.contains("Send report"));
+        assert_eq!(digests[0].title, "1 overdue task");
+        assert!(digests[0].body.contains("Pay bill") && !digests[0].body.contains("Send report"));
         assert_eq!(digests[1].title, "3 overdue tasks");
         assert_eq!(digests[0].item_id, None);
         assert!(digests[0].key().starts_with("digest|Digest|"));

@@ -1092,6 +1092,33 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_task_done_after_its_time_on_its_day_is_on_time() {
+        let mut db = Db::open_in_memory().unwrap();
+        // Two copies of a task due Thursday at 2 PM.
+        let mut same_day = Item::new(Kind::Task, "call the bank", now());
+        same_day.date = Some(d(2026, 10, 8));
+        same_day.due_time = NaiveTime::from_hms_opt(14, 0, 0);
+        let mut next_day = same_day.clone();
+        next_day.id = new_id();
+        db.insert_item(&same_day).unwrap();
+        db.insert_item(&next_day).unwrap();
+
+        // Done at 2:30 PM that day: half an hour after the time, but still on time.
+        let half_past_two = d(2026, 10, 8).and_hms_opt(14, 30, 0).unwrap();
+        db.complete_task(&same_day.id, half_past_two, now())
+            .unwrap();
+        // Done at midnight, as Friday starts: late.
+        let midnight = d(2026, 10, 9).and_hms_opt(0, 0, 0).unwrap();
+        db.complete_task(&next_day.id, midnight, now()).unwrap();
+
+        let log = db.list_completions().unwrap();
+        // `find` returns the first entry for each task (an `Option`, so `unwrap` in a test).
+        let flag = |id: &str| log.iter().find(|c| c.item_id == id).unwrap().was_overdue;
+        assert!(!flag(&same_day.id));
+        assert!(flag(&next_day.id));
+    }
+
+    #[test]
     fn completing_a_repeating_task_creates_next_instance() {
         let mut db = Db::open_in_memory().unwrap();
         let mut task = Item::new(Kind::Task, "water plants", now());
