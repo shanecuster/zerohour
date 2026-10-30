@@ -16,7 +16,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Tasks and events in one view.** Tasks on top, events underneath, each with its own color and icon.
 - **Countdowns that repeat.** Yearly, monthly, weekly, daily, every N days/weeks/months, or on chosen weekdays (weekdays, Mon–Thu, or any days you pick).
 - **Repeating tasks.** Completing one creates the next instance with the next due date.
-- **Due times.** Give a task a time ("2pm") and it shows "today 2:00 PM · in 3h", turning overdue the minute it passes. 12- or 24-hour clock.
+- **Due times.** Give a task a time ("2pm") and it shows "today 2:00 PM · in 3h", then "today 2:00 PM" once that time comes. It's only overdue when the day is over. 12- or 24-hour clock.
 - **Calendar picker** for dates (Ctrl+D or F2), with the keyboard or a mouse click. Typing dates still works.
 - **Priorities and notes** on every item.
 - **Statistics.** Completions per week, streaks, overdue count, and more, with a bar chart.
@@ -131,7 +131,7 @@ A mouse click on a day picks it, and the scroll wheel changes the month.
 
 - A **due time** is optional and needs a due date. Type `2pm`, `2:30 pm`, `14:30`, or `noon`.
   It's stored as local wall-clock time, so 2 PM means 2 PM wherever you are (also on a synced device in another time zone).
-  A task with a time is overdue once that time passes; without one, the whole day counts as on time.
+  The whole due day counts as on time, with or without a time: a task due at 2 PM and done at 2:30 PM is on time, and it only turns overdue (red, "! 1d overdue") at midnight. The time drives the countdown and reminders; it isn't a deadline.
 - **Repeat on weekdays**: choose *weekdays*, *Mon–Thu*, or *pick days* and tick the days you want.
   A start date that isn't one of those days moves forward to the next one when you save (the dialog tells you), and an empty date is filled in.
 - When you complete a repeating task, the next one is due at the **first scheduled time after both its old due time and now**.

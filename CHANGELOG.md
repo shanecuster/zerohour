@@ -34,7 +34,8 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
   `b` switches it off and on (saved as `banner`, on by default).
 
 - **Due times** on tasks (optional, local wall-clock time): "today 2:00 PM · in 3h", "tomorrow 9:30 AM",
-  "! overdue 2h". Overdue the minute the time passes. 12-hour by default; `T` switches to 24-hour.
+  "today 2:00 PM" once the time has come. Overdue only once the due day is over, like a task without a
+  time. 12-hour by default; `T` switches to 24-hour.
   Database schema version 3 adds the column; existing data is unchanged.
 - **Weekday repeats**: repeat on chosen days, with presets (weekdays, Mon–Thu) and day checkboxes in the
   add/edit dialog. Unscheduled start dates move forward on save; empty dates are filled in. Works for events too.
@@ -58,6 +59,13 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Changed
 
+- A task with a due time is no longer late when its time passes: it turns overdue at midnight, when
+  its due day ends, like a task without a time. After the time it reads "today 2:00 PM" (narrow:
+  "today") in the normal due-today color, and from the next day "! 1d overdue". This applies to the
+  red title, the Overdue count, the on-time rate of new completions, and the overdue digest. The
+  reminder at the due time is unchanged. Completions already logged keep the on-time or late flag
+  they were given, so a timed task finished late on its due day by an older build still counts as
+  late. No database or sync change.
 - Completing a repeating task gives the next instance and the completion entry IDs derived from
   the completed task. Nothing visible changes; it lets two devices that complete the same task
   merge instead of duplicating it.
