@@ -84,8 +84,9 @@ pub fn week_start(date: NaiveDate) -> NaiveDate {
 ///
 /// - `completions`: the whole completion log (`Db::list_completions`).
 /// - `items`: all non-deleted items (`Db::list_items`), used for the overdue count.
-/// - `now`: the user's local date and time (the date drives the weekly/monthly totals and
-///   streaks; the time matters for the overdue count, since tasks can have a due time).
+/// - `now`: the user's local date and time. Only its date matters here: it drives the
+///   weekly/monthly totals, the streaks and the overdue count (a task is overdue once its due
+///   *day* is over, whatever its due time; see [`is_overdue`]).
 /// - `tz`: the user's time zone, used to decide which *local* day a completion happened on.
 ///   Completions are stored in UTC; finishing a task at 11pm in Denver is already "tomorrow" in
 ///   UTC, and it should count for today.
@@ -385,8 +386,20 @@ mod tests {
         past_event.date = Some(d(2026, 10, 1));
         let mut deleted = overdue.clone();
         deleted.deleted = true;
+        // Due this morning at 8: its time has passed at noon, but its day hasn't, so it
+        // doesn't count.
+        let mut passed_this_morning = Item::new(Kind::Task, "this morning", now);
+        passed_this_morning.date = Some(today());
+        passed_this_morning.due_time = chrono::NaiveTime::from_hms_opt(8, 0, 0);
 
-        let items = [overdue, due_today, done, past_event, deleted];
+        let items = [
+            overdue,
+            due_today,
+            done,
+            past_event,
+            deleted,
+            passed_this_morning,
+        ];
         assert_eq!(compute(&[], &items, noon(), &Utc).overdue_count, 1);
     }
 }

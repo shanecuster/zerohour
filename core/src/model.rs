@@ -424,7 +424,10 @@ pub struct Completion {
     pub title_snapshot: String,
     /// The task's priority at the time it was completed.
     pub priority_snapshot: Priority,
-    /// Whether the task was past its due date when completed.
+    /// Whether the task was past its due date when completed: finished on a later day than
+    /// its due date (see `repeat::is_overdue`). Decided once, when it is completed, and never
+    /// recomputed, so entries logged by older builds (which counted a timed task as late once
+    /// its time had passed) keep the flag they were given.
     pub was_overdue: bool,
 }
 

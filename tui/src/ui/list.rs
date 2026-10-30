@@ -485,7 +485,8 @@ mod column_tests {
     type SampleTask = (&'static str, Option<i64>, Option<(u32, u32)>, Priority);
 
     /// An app with timed and untimed tasks covering the longest due texts:
-    /// "today 12:00 PM · in 11h", "tomorrow 12:00 PM", "! overdue 23h", "in 3d · 12:00 PM",
+    /// "today 12:00 PM · in 11h", "tomorrow 12:00 PM", "in 3d · 12:00 PM", "today 12:15 AM"
+    /// (its time has come, but it's not late), "! 1d overdue" (a timed task due yesterday),
     /// plus untimed ones ("due in 3d", "! 2d overdue") and one without a date.
     fn app_with_tasks(format: TimeFormat) -> App {
         let db = Db::open_in_memory().unwrap();
@@ -493,8 +494,9 @@ mod column_tests {
         db.set_setting(settings_keys::TIME_FORMAT, format.as_str())
             .unwrap();
         let today = now().date();
-        let tasks: [SampleTask; 7] = [
+        let tasks: [SampleTask; 8] = [
             ("noon today", Some(0), Some((12, 0)), Priority::Medium),
+            ("just past midnight", Some(0), Some((0, 15)), Priority::Low),
             ("noon tomorrow", Some(1), Some((12, 0)), Priority::Low),
             ("late last night", Some(-1), Some((1, 30)), Priority::High),
             ("later this week", Some(3), Some((12, 0)), Priority::Medium),
@@ -601,8 +603,9 @@ mod column_tests {
         for expected in [
             "today 12:00 PM · in 11h",
             "tomorrow 12:00 PM",
-            "! overdue 23h",
             "in 3d · 12:00 PM",
+            "today 12:15 AM",
+            "! 1d overdue",
             "due in 3d",
             "! 2d overdue",
         ] {

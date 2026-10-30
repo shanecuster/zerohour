@@ -609,3 +609,42 @@ time to type one, `Enter` on the test button, `Esc` close; every change is saved
 - **Title:** Stop zerohour desktop reminders
   **Command:** `systemctl --user disable --now zerohour-remind.timer` (or switch them off with `n`)
   **When:** on a computer that shouldn't remind any more.
+
+---
+
+## Due today is not late (done 2026-10-30)
+
+Branch `feature/due-today-not-late`. A task with a due time (say 2:00 PM) no longer turns overdue
+when that time passes. Like a task without a time, it's on time for its whole due day and turns
+overdue at midnight. Reminders at the due time are unchanged.
+
+### What changed
+
+| Where | What it does now |
+|---|---|
+| `core/src/repeat.rs` | `is_overdue`: one rule for every task, overdue once the due date is before today. The due time is ignored. |
+| `core/src/view.rs` | `due_label`: after the time on its due day, "today 2:00 PM" / "today 14:00" (narrow: "today") in `Warn`, the normal due-today color, with no marker. From the next day, a timed task uses the untimed forms: "! 1d overdue" / "!1d" in `Danger`. Before the time, the countdown is as before ("in 1m" at 13:59:00, "in 0m" from 13:59:01, "today 2:00 PM" from 14:00:00). |
+| Follows from `is_overdue` | The red title, the stats Overdue count, `was_overdue` on new completions (so the on-time rate), and the overdue digest (a task due at 8:00 today is in tomorrow's digest, not today's). |
+| Unchanged | Sorting (priority, date, time, title), the reminder planner's due-time and early reminders, the next-instance rule for repeating tasks, the demo data, sync documents. |
+
+**Tests:** 131 in core and 84 in the TUI without sync; 181 and 92 with sync. New ones use fixed times:
+2 PM, 11:59 PM, 12:00 AM, and both 2026 daylight-saving nights (Mar 8, Nov 1).
+
+### Decisions made while building (worth knowing)
+
+- **Stored completions are left alone.** No migration and no backfill. `was_overdue` is decided once,
+  at completion. Older builds marked a timed task done after its time (but on its due day) as late,
+  so those entries still count as late in the on-time rate. Only completions from now on use the
+  new rule. A backfill wouldn't sync anyway: completions are append-only.
+- **Mixed builds disagree until all are updated.** A device still on an older build shows the task in
+  red after its time and logs a late completion. Nothing in the sync format changed (no `v` bump).
+- **Android** needs a re-pin of core and a rebuild, with no FFI or Kotlin changes (the FFI calls
+  `due_label`, `task_title_slot`, `stats::compute`, the planner and `complete_task`, which carry the
+  new rule). The current pin predates migration 4, so the re-pin also adds the empty
+  `reminders_sent` table to the phone's database.
+
+### Save to your personal notes
+
+- **Title:** Check the "due today is not late" rule
+  **Command:** `cargo test -p zerohour-core overdue` and `cargo test -p zerohour-core view::`
+  **When:** after touching `repeat::is_overdue` or the due labels in `core/src/view.rs`.
