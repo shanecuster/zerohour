@@ -126,8 +126,8 @@ pub struct App {
     db: Db,
     /// Today's local date. Refreshed each tick so the countdowns roll over at midnight.
     pub today: NaiveDate,
-    /// The local date and time, refreshed every tick. Tasks with a due time turn overdue the
-    /// minute it passes, without waiting for a key press.
+    /// The local date and time, refreshed every tick, so a due time's "in 3h" counts down and
+    /// switches to "today 2:00 PM" the minute it comes, without waiting for a key press.
     pub now: NaiveDateTime,
     /// 12-hour ("2:00 PM", the default) or 24-hour ("14:00") times; `T` switches.
     pub time_format: TimeFormat,
@@ -278,8 +278,10 @@ impl App {
     /// over. With sync, also picks up results from the background worker.
     pub fn tick(&mut self) {
         let now = local_now();
-        // Reload when the minute changes (the overdue count in the stats can change as due
-        // times pass) and, of course, at midnight.
+        // Reload when the minute changes and, of course, at midnight, when tasks due
+        // yesterday turn overdue and repeating events roll over. (Due times passing no longer
+        // change anything that's loaded: the due texts are worked out from `now` at each
+        // draw. The once-a-minute reload is kept as a cheap refresh of the stats.)
         let changed = now.date() != self.today || now.minute() != self.now.minute();
         self.now = now;
         if changed {

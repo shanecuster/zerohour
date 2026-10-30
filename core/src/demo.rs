@@ -275,7 +275,9 @@ fn report_time() -> NaiveTime {
 }
 
 /// The next Mon–Thu day the weekly report is due: today if today is Mon–Thu and it's not yet
-/// 2:00 PM, otherwise the next Mon–Thu. This keeps the report from showing up as overdue.
+/// 2:00 PM, otherwise the next Mon–Thu. This keeps the report's countdown ahead ("in 3h")
+/// rather than showing a time that has already come. (It wouldn't be overdue either way: a
+/// task is only late once its due day is over.)
 fn next_report_day(now: NaiveDateTime) -> NaiveDate {
     let today = now.date();
     let from = if now.time() < report_time() {

@@ -1,5 +1,5 @@
 //! Times of day: parsing what the user types ("2pm", "14:30"), showing a time in the user's
-//! 12- or 24-hour style, and short "in 3h" / "overdue 45m" texts.
+//! 12- or 24-hour style, and short "in 3h" countdown texts.
 //!
 //! Like the date code, nothing here reads the clock: "now" is always a parameter. Times are
 //! *naive local* times (`NaiveTime` / `NaiveDateTime`): wall-clock values with no time zone.
@@ -117,14 +117,15 @@ pub fn parse_time_input(input: &str) -> Result<Option<NaiveTime>, String> {
         .ok_or_else(bad)
 }
 
-/// A short countdown from `now` to `due`: "in 45m", "in 3h", "in 2d"; or "45m", "3h", "2d"
-/// overdue when `due` has passed. Returns (text, is_overdue).
+/// A short distance between `now` and `due`: "45m", "3h", "2d" (the caller adds "in").
+/// Returns (text, has `due` passed?). When `due` has passed, the text is how long ago.
 ///
-/// Units round *down* (2h 59m shows "2h"), and anything under a minute away counts as "in 0m",
-/// so a task never reads "overdue" before its time.
+/// Units round *down* (2h 59m shows "2h"), and anything under a minute away counts as "0m".
+/// The main screen only uses the text for times still ahead; a time that has passed doesn't
+/// make a task late (that's decided by the day, in `repeat::is_overdue`).
 pub fn relative_text(due: NaiveDateTime, now: NaiveDateTime) -> (String, bool) {
     let minutes = (due - now).num_minutes();
-    let overdue = due < now;
+    let passed = due < now;
     let amount = minutes.unsigned_abs();
     let text = if amount < 60 {
         format!("{amount}m")
@@ -133,7 +134,7 @@ pub fn relative_text(due: NaiveDateTime, now: NaiveDateTime) -> (String, bool) {
     } else {
         format!("{}d", amount / (24 * 60))
     };
-    (text, overdue)
+    (text, passed)
 }
 
 #[cfg(test)]
