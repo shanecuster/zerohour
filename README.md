@@ -14,7 +14,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 ## Features
 
 - **Tasks and events in one view.** Tasks on top, events underneath, each with its own color and icon.
-- **Countdowns that repeat.** Yearly, monthly, weekly, daily, every N days/weeks/months, or on chosen weekdays (weekdays, Mon–Thu, or any days you pick).
+- **Countdowns that repeat.** Yearly, monthly, weekly, daily, every N days/weeks/months, on chosen weekdays (weekdays, Mon–Thu, or any days you pick), or on the Nth weekday of a month (Thanksgiving is the 4th Thursday of November; also "the 1st Friday of every month").
 - **Repeating tasks.** Completing one creates the next instance with the next due date.
 - **Due times.** Give a task a time ("2pm") and it shows "today 2:00 PM · in 3h", then "today 2:00 PM" once that time comes. It's only overdue when the day is over. 12- or 24-hour clock.
 - **Calendar picker** for dates (Ctrl+D or F2), with the keyboard or a mouse click. Typing dates still works.
@@ -117,7 +117,7 @@ In the add/edit dialog:
 | Key | Action |
 |---|---|
 | `Tab` / `↑` `↓` | Move between fields |
-| `←` `→` | Change a choice (priority, repeat); move between days in the day checkboxes |
+| `←` `→` | Change a choice (priority, repeat, and the nth weekday's rows); move between days in the day checkboxes |
 | `Space` | Toggle a checkbox or a day |
 | `Ctrl+D` / `F2` | Open the calendar on the date field |
 | `Enter` | Save |
@@ -127,13 +127,19 @@ In the calendar: arrows or `h` `j` `k` `l` move by day/week, `PgUp` / `PgDn` by 
 `w` switches the first day of the week (Sunday or Monday), `Enter` picks, `Esc` closes.
 A mouse click on a day picks it, and the scroll wheel changes the month.
 
-### Due times and weekday repeats
+### Due times, weekday and nth-weekday repeats
 
 - A **due time** is optional and needs a due date. Type `2pm`, `2:30 pm`, `14:30`, or `noon`.
   It's stored as local wall-clock time, so 2 PM means 2 PM wherever you are (also on a synced device in another time zone).
   The whole due day counts as on time, with or without a time: a task due at 2 PM and done at 2:30 PM is on time, and it only turns overdue (red, "! 1d overdue") at midnight. The time drives the countdown and reminders; it isn't a deadline.
 - **Repeat on weekdays**: choose *weekdays*, *Mon–Thu*, or *pick days* and tick the days you want.
   A start date that isn't one of those days moves forward to the next one when you save (the dialog tells you), and an empty date is filled in.
+- **Repeat on the Nth weekday of a month**: choose *nth weekday*, then set *On the* (1st, 2nd, 3rd, 4th or last),
+  *Weekday*, and *Month* (one month for once a year, or *every month*). The next two dates show under the rows.
+  If the date field already holds a full date (like `2026-11-26`), the rows start from it: 4th Thu of Nov.
+  There's no "5th" (only some months have one); *last* covers it, so the last Monday of May is May 25 in 2026 and May 31 in 2027.
+  As with weekday repeats, a start date that isn't on the rule moves forward when you save, and an empty date is filled in.
+  The list shows them as "↻ 4th Thu of Nov" or "↻ every 1st Fri".
 - When you complete a repeating task, the next one is due at the **first scheduled time after both its old due time and now**.
   A Mon–Thu 2 PM task completed on Thursday is next due Monday at 2 PM.
   Done late? Missed days are not added; you get the next upcoming one (still today, if today's time hasn't passed yet).
@@ -147,7 +153,7 @@ Your data is stored in `~/.local/share/zerohour/zerohour.db`.
 
 **Upgrading:** new versions update the database automatically and keep your data
 (schema version 4 adds a small table for desktop reminders).
-Going back is limited: once you've used a weekday repeat, an older version of zerohour can't open that database
+Going back is limited: once you've used a weekday or nth-weekday repeat, an older version of zerohour can't open that database
 (it reports "bad data" instead of guessing). Keep a copy of the file before upgrading if you might go back.
 
 ## Desktop reminders
@@ -264,8 +270,10 @@ itself is encrypted (Tailscale, WireGuard, a VPN).
 - A completed task stays completed, even if another device edited it later.
 - Completing the same repeating task on two offline devices creates one next instance, not two.
 
-Items with a due time or a weekday repeat are stored on the server in a newer format (`v: 2`).
-A device running an older zerohour skips just those items and shows "update zerohour"; everything else keeps syncing.
+Items with a due time or a weekday repeat are stored on the server in a newer format (`v: 2`), and items with an
+nth-weekday repeat in the format after that (`v: 3`).
+A device running an older zerohour skips just those items and shows "N synced item(s) need a newer zerohour"; everything else keeps syncing.
+After updating that device, an item it skipped arrives the next time it's edited, or right away after *Reset sync state*.
 Update every device to use these features everywhere.
 
 ### Where the password is kept

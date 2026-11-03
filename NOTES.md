@@ -648,3 +648,74 @@ overdue at midnight. Reminders at the due time are unchanged.
 - **Title:** Check the "due today is not late" rule
   **Command:** `cargo test -p zerohour-core overdue` and `cargo test -p zerohour-core view::`
   **When:** after touching `repeat::is_overdue` or the due labels in `core/src/view.rs`.
+
+---
+
+## Nth-weekday repeats (done 2026-11-03)
+
+Branch `feature/nth-weekday`. A repeat rule for "the Nth weekday of a month", for tasks and events:
+Thanksgiving (4th Thursday of November), Memorial Day (last Monday of May), Labor Day (1st Monday of
+September), Mother's Day (2nd Sunday of May), or "the 1st Friday of every month".
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/model.rs` | `Ordinal` (1st to 4th, or last) and `RepeatRule::NthWeekday { nth, weekday, month }` (`month: None` = every month). Stored as `nth:4:thu:nov` or `nth:1:fri:monthly` in the existing `repeat` column. Labels: "4th Thu of Nov", "every 1st Fri". |
+| `core/src/repeat.rs` | `nth_weekday_in` (the date of the Nth weekday in one month) and the branch in `first_on_or_after`, so `next_occurrence`, `next_task_date`, `next_instance_date`, event countdowns and the reminder planner all handle the rule. `scheduled_on_or_after` moves a start date onto the rule. |
+| `core/src/sync/doc.rs` | `DOC_VERSION` is 3. Items with an Nth-weekday repeat are written as `v: 3`; all others keep `v: 1` or `v: 2`. |
+| `core/src/form.rs` | The "nth weekday" choice (after yearly; "pick days" stays last) with three rows: On the / Weekday / Month. Plus one way to handle every field: `FormInput::step_choice(field, forward)`, `Field::is_choice()`, `FormInput::field_value(field)`, and `FormInput::preview(field, today, time_format)`. |
+| `tui/src/ui/add.rs` | Uses those for every choice field and preview, so the new rows need no terminal-only code. |
+
+**Tests:** 152 in core and 88 in the TUI without sync; 204 and 96 with sync. All use fixed dates:
+Thanksgiving 2026 to 2030, the last Monday of May (the 4th in 2026, the 5th in 2027 and 2028), no
+5th Friday in Feb 2026, Feb 29 2028 as the last Tuesday of February, month and year-end rollover,
+tasks done early, on time and late, both 2026 clock-change Sundays, every rule string round-tripping,
+and the form flow through the keys.
+
+### Decisions made while building (worth knowing)
+
+- **No "5th".** The 1st to 4th exist in every month (even February has 4 of each weekday); a 5th
+  only in some. "Last" is the 5th when there is one, else the 4th.
+- **Every matching date is an occurrence**, like weekday sets: no anchor to drift from. Completing a
+  task (early, on time or late) gives the first occurrence after both its old due date and now, so
+  Thanksgiving done a week early is next due next year's Thanksgiving.
+- **Start dates move forward** on save, like weekday repeats: Nov 19 2026 (the 3rd Thursday) saves as
+  Nov 26; an empty date becomes the next occurrence. The date preview says so.
+- **The rows fill in from a full date only.** Picking "nth weekday" with `2026-11-26` in the date field
+  gives 4th / Thu / Nov (days 29 to 31 give "last"). A short form like `11/26` or `fri` depends on
+  today's date, which `step_choice(field, forward)` doesn't get, so the rows keep their values (a
+  blank form starts at "every 1st Mon").
+- **Weekdays cycle Monday first** in the Weekday row (core has no week-start setting). It wraps, so
+  only the starting point differs from the day checkboxes.
+- **Previews keep each date in one piece**: the dates use non-breaking spaces, so a narrow screen
+  wraps between dates ("→ Thu Nov 26 2026," / "Thu Nov 25 2027") instead of inside one.
+- **Sync is `v: 3`, not `v: 2`.** A build that knows v2 would accept a v2 document, fail on the unknown
+  `nth:` repeat and drop it as broken, without a word. As v3 it is skipped as newer, with "N synced
+  item(s) need a newer zerohour; update this device." After updating, the item arrives when it's next
+  edited, or right away after *Reset sync state*.
+- **Older builds and the database.** No migration. An older zerohour opened on a database that holds
+  an `nth:` rule refuses it ("bad data"), the same as for weekday rules. That only matters when going
+  back to an older version.
+- **`--demo` is unchanged.**
+
+### Android
+
+Re-pin core, then mirror the new fields in `zerohour-ffi/src/form.rs` (its matches on core's `Field`
+are exhaustive) and add them to the choice branch in `FormScreen.kt`. With the new core methods, the
+FFI's `step_choice` and `view()` can call core for every field instead of matching each one.
+
+### Save to your personal notes
+
+- **Title:** Add Thanksgiving (or any "Nth weekday" holiday) to zerohour
+  **Command:** `a` → Event → title → Date `2026-11-26` → Repeat `→` to "nth weekday" (rows fill in
+  as 4th / Thu / Nov) → `Enter`
+  **When:** holidays that fall on a weekday rather than a fixed date. Memorial Day: last / Mon / May.
+
+- **Title:** A task on the first Friday of every month
+  **Command:** `a` → Task → title → Repeat "nth weekday" → On the `1st`, Weekday `Fri`, Month `every month` → `Enter`
+  **When:** monthly routines tied to a weekday (leave the date empty: it fills in the next one).
+
+- **Title:** Check the Nth-weekday rule
+  **Command:** `cargo test -p zerohour-core nth` and `cargo test -p zerohour nth_weekday`
+  **When:** after touching `repeat.rs`, the rule's strings in `model.rs`, or the form rows.

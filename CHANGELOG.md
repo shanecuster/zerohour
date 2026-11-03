@@ -6,6 +6,15 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Nth-weekday repeats**: "the 4th Thursday of November" (Thanksgiving), "the last Monday of May",
+  or "the 1st Friday of every month", for tasks and events. Choose *nth weekday* in the add/edit
+  dialog, then the ordinal (1st to 4th, or last), weekday and month (or every month); the next two
+  dates show underneath. A full date already in the date field fills the rows in. Unscheduled start
+  dates move forward on save and empty dates are filled in, as with weekday repeats. Listed as
+  "↻ 4th Thu of Nov" / "↻ every 1st Fri". Stored as `nth:4:thu:nov` / `nth:1:fri:monthly` in the
+  existing column (no database change). Synced as document `v: 3`, so older builds skip just those
+  items with the "need a newer zerohour" note; all other items keep their format.
+
 - **Desktop reminders**: `zerohour remind` shows the reminders due now as desktop notifications
   (`notify-send`), each one once, and exits; a systemd user timer runs it every minute
   (`zerohour remind --print-units` prints the unit files; nothing is installed for you). It catches
