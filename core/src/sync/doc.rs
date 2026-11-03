@@ -28,6 +28,11 @@
 //!   else stays `v: 1`, so devices that haven't updated yet keep syncing all other items. An
 //!   older device also can't overwrite a v2 document: it never recorded that version's
 //!   `_rev`, so CouchDB rejects its write as a conflict.
+//! - `v: 3`: adds Nth-weekday repeats (`"repeat": "nth:4:thu:nov"`, `"nth:1:fri:monthly"`).
+//!   A build that knows v2 would accept a v2 document, fail on the unknown repeat and drop it
+//!   silently as broken; as v3, it skips it as *newer* and says "update zerohour" instead.
+//!   Again only the items that use the rule are written as v3; everything else keeps the
+//!   version it had (1 or 2), so the other items still sync with older devices.
 //!
 //! Deletions use our own `"deleted": true`, not CouchDB's `_deleted`: a CouchDB deletion
 //! ("tombstone") throws away every field, including the `updated_at` that conflict
@@ -39,11 +44,20 @@ use crate::db::{date_from_db, date_to_db, time_from_db, time_to_db, ts_from_db, 
 use crate::model::{Completion, Item, Kind, Priority, RepeatRule};
 
 /// The newest document format this build understands (and writes, when an item needs it).
-pub const DOC_VERSION: u64 = 2;
+pub const DOC_VERSION: u64 = 3;
 
-/// The format version an item needs: 2 if it uses a feature older builds can't represent
-/// (a due time or a weekday-set repeat), otherwise 1.
+/// The format version an item needs: the lowest one that can represent it, so older builds
+/// keep syncing everything they can read.
+///
+/// - 3: an Nth-weekday repeat (whatever else it has).
+/// - 2: a due time or a weekday-set repeat.
+/// - 1: everything else.
 pub fn item_doc_version(item: &Item) -> u64 {
+    // `matches!(value, pattern)` is true if the value fits the pattern; `{ .. }` ignores
+    // the fields.
+    if matches!(item.repeat, RepeatRule::NthWeekday { .. }) {
+        return 3;
+    }
     let weekday_repeat = matches!(item.repeat, RepeatRule::Weekdays(_));
     if item.due_time.is_some() || weekday_repeat {
         2
@@ -207,8 +221,14 @@ pub fn completion_from_doc(doc: &Value) -> Result<Completion, DocProblem> {
 
 /// Rejects documents written in a newer format than [`DOC_VERSION`].
 fn check_version(doc: &Value) -> Result<(), DocProblem> {
+    check_version_up_to(doc, DOC_VERSION)
+}
+
+/// Rejects documents written in a newer format than `newest`. Split out of [`check_version`]
+/// so tests can ask what an older build (one whose newest is 2, say) does with a document.
+fn check_version_up_to(doc: &Value, newest: u64) -> Result<(), DocProblem> {
     match doc.get("v").and_then(Value::as_u64) {
-        Some(v) if v > DOC_VERSION => Err(DocProblem::NewerVersion(v)),
+        Some(v) if v > newest => Err(DocProblem::NewerVersion(v)),
         Some(_) => Ok(()),
         None => Err(invalid("missing format version 'v'")),
     }
@@ -307,6 +327,53 @@ mod tests {
     }
 
     #[test]
+    fn nth_weekday_repeats_are_version_3_and_nothing_else_is() {
+        use crate::model::Ordinal;
+        use chrono::{Month, Weekday};
+        let mut item = sample_item();
+        item.repeat = RepeatRule::NthWeekday {
+            nth: Ordinal::Fourth,
+            weekday: Weekday::Thu,
+            month: Some(Month::November),
+        };
+        let doc = item_to_doc(&item, None);
+        assert_eq!(doc["v"], 3);
+        assert_eq!(doc["repeat"], "nth:4:thu:nov");
+        assert_eq!(item_from_doc(&doc).unwrap(), item);
+        // With a due time as well: still 3 (and the time comes back).
+        item.due_time = chrono::NaiveTime::from_hms_opt(14, 0, 0);
+        let doc = item_to_doc(&item, None);
+        assert_eq!(doc["v"], 3);
+        assert_eq!(item_from_doc(&doc).unwrap(), item);
+        // Every other rule keeps the version it had before.
+        item.due_time = None;
+        item.repeat = RepeatRule::Yearly;
+        assert_eq!(item_to_doc(&item, None)["v"], 1);
+        item.repeat = RepeatRule::Weekdays(crate::model::DaySet::MON_THU);
+        assert_eq!(item_to_doc(&item, None)["v"], 2);
+    }
+
+    #[test]
+    fn a_build_that_only_knows_v2_skips_nth_weekday_documents_as_newer() {
+        let mut item = sample_item();
+        item.repeat = RepeatRule::NthWeekday {
+            nth: crate::model::Ordinal::First,
+            weekday: chrono::Weekday::Fri,
+            month: None,
+        };
+        let doc = item_to_doc(&item, None);
+        // NewerVersion is what makes the engine count it in `skipped_newer`, which the app
+        // shows as "N synced item(s) need a newer zerohour" (not dropped as broken).
+        assert_eq!(
+            check_version_up_to(&doc, 2),
+            Err(DocProblem::NewerVersion(3))
+        );
+        // A v2 document is still fine for that build.
+        item.repeat = RepeatRule::Weekdays(crate::model::DaySet::MON_THU);
+        assert_eq!(check_version_up_to(&item_to_doc(&item, None), 2), Ok(()));
+    }
+
+    #[test]
     fn a_build_that_only_knows_v1_skips_v2_documents() {
         // What an older build's check does with a v2 document: NewerVersion, i.e. skip it and
         // show "update zerohour". Simulated by asking for a version above ours.
@@ -353,8 +420,11 @@ mod tests {
     #[test]
     fn newer_format_and_bad_fields_are_reported() {
         let mut doc = item_to_doc(&sample_item(), None);
-        doc["v"] = json!(3);
-        assert_eq!(item_from_doc(&doc), Err(DocProblem::NewerVersion(3)));
+        doc["v"] = json!(DOC_VERSION + 1);
+        assert_eq!(
+            item_from_doc(&doc),
+            Err(DocProblem::NewerVersion(DOC_VERSION + 1))
+        );
 
         let mut doc = item_to_doc(&sample_item(), None);
         doc["priority"] = json!("urgent");
