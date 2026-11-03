@@ -14,10 +14,15 @@
 //! The one rule without a fixed step is **weekday sets** (e.g. Mon–Thu): occurrences are
 //! simply every date on one of those days, so there's no anchor to drift from. The next
 //! occurrence is found by looking at most 7 days ahead.
+//!
+//! **Nth weekdays** (the 4th Thursday of November, the 1st Friday of every month) work the same
+//! way: every date that matches the rule is an occurrence, whatever the anchor. The next one is
+//! in the target's month (or the rule's month in the target's year), or else the month (or
+//! year) after.
 
-use chrono::{Datelike, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Weekday};
+use chrono::{Datelike, Month, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeDelta, Weekday};
 
-use crate::model::{Item, Kind, RepeatRule, Unit};
+use crate::model::{Item, Kind, Ordinal, RepeatRule, Unit};
 
 /// The size of one repeat step, normalized to either "some days" or "some months".
 ///
@@ -30,10 +35,11 @@ enum Step {
 }
 
 /// Turns a repeat rule into its step size, or `None` if the rule doesn't repeat by a fixed
-/// step (no repeat at all, or a weekday set, which [`first_on_or_after`] handles first).
+/// step (no repeat at all, a weekday set, or an Nth weekday of a month, which
+/// [`first_on_or_after`] handles first).
 fn step_of(rule: RepeatRule) -> Option<Step> {
     match rule {
-        RepeatRule::None | RepeatRule::Weekdays(_) => None,
+        RepeatRule::None | RepeatRule::Weekdays(_) | RepeatRule::NthWeekday { .. } => None,
         RepeatRule::Daily => Some(Step::Days(1)),
         RepeatRule::Weekly => Some(Step::Days(7)),
         RepeatRule::Monthly => Some(Step::Months(1)),
@@ -68,6 +74,67 @@ fn add_days(date: NaiveDate, days: i64) -> NaiveDate {
         .unwrap_or(NaiveDate::MAX)
 }
 
+/// The date of the `nth` `weekday` in a month, e.g. the 4th Thursday of November 2026
+/// (Nov 26). `None` only for an impossible year or month.
+///
+/// The 1st to 4th always exist (every month has at least 28 days, so 4 of each weekday);
+/// "last" is the 5th when the month has one, else the 4th.
+fn nth_weekday_in(year: i32, month: u32, nth: Ordinal, weekday: Weekday) -> Option<NaiveDate> {
+    let n = match nth {
+        Ordinal::First => 1,
+        Ordinal::Second => 2,
+        Ordinal::Third => 3,
+        Ordinal::Fourth => 4,
+        Ordinal::Last => {
+            // Start on the month's last day (the day before the 1st of the next month) and
+            // step back to the weekday: at most 6 steps.
+            let first = NaiveDate::from_ymd_opt(year, month, 1)?;
+            let mut day = first.checked_add_months(Months::new(1))?.pred_opt()?;
+            while day.weekday() != weekday {
+                day = day.pred_opt()?;
+            }
+            return Some(day);
+        }
+    };
+    // chrono finds "the nth such weekday of the month" for us (n = 1..=5; `None` if the
+    // month has no such day, which can't happen for 1..=4).
+    NaiveDate::from_weekday_of_month_opt(year, month, weekday, n)
+}
+
+/// The first date on or after `target` that is the `nth` `weekday` of `month` (yearly), or of
+/// any month (`month = None`). Saturates at chrono's max date instead of panicking.
+fn nth_weekday_on_or_after(
+    nth: Ordinal,
+    weekday: Weekday,
+    month: Option<Month>,
+    target: NaiveDate,
+) -> NaiveDate {
+    // The (year, month) pairs to try, in order: this one, then the next. One of the two is
+    // always on or after the target: the next month's (or year's) date is past the target's
+    // whole month (or year).
+    let tries = match month {
+        Some(month) => {
+            let m = month.number_from_month();
+            [(target.year(), m), (target.year().saturating_add(1), m)]
+        }
+        None => {
+            let (y, m) = (target.year(), target.month());
+            // December rolls into January of the next year.
+            let next = if m == 12 {
+                (y.saturating_add(1), 1)
+            } else {
+                (y, m + 1)
+            };
+            [(y, m), next]
+        }
+    };
+    // `find_map` runs the closure on each pair and stops at the first `Some`.
+    tries
+        .into_iter()
+        .find_map(|(y, m)| nth_weekday_in(y, m, nth, weekday).filter(|date| *date >= target))
+        .unwrap_or(NaiveDate::MAX)
+}
+
 /// The first occurrence of `rule`, starting from `anchor`, that falls on or after `target`.
 ///
 /// Occurrences are `anchor`, `anchor + 1 step`, `anchor + 2 steps`, ... If the anchor itself is
@@ -81,6 +148,16 @@ fn first_on_or_after(rule: RepeatRule, anchor: NaiveDate, target: NaiveDate) -> 
     // saved; if one ever appears, it behaves like "doesn't repeat".)
     if let RepeatRule::Weekdays(days) = rule {
         return days.first_on_or_after(target).unwrap_or(anchor);
+    }
+    // Nth weekdays: the first matching date on or after the target (see the module docs).
+    // `{ nth, weekday, month }` in a pattern pulls the three fields out by name.
+    if let RepeatRule::NthWeekday {
+        nth,
+        weekday,
+        month,
+    } = rule
+    {
+        return nth_weekday_on_or_after(nth, weekday, month, target);
     }
     // `let ... else` : bind the value if the pattern matches, otherwise run the `else` block
     // (which must leave the function). Here: no step means "doesn't repeat".
@@ -191,14 +268,20 @@ pub fn due_datetime(item: &Item) -> Option<NaiveDateTime> {
     Some(item.date?.and_time(item.due_time?))
 }
 
-/// For weekday-set rules: the first scheduled day on or after `date` (a Saturday start for a
-/// Mon–Thu rule becomes the following Monday). Every other rule returns `date` unchanged.
+/// For rules that only land on certain days: the first scheduled day on or after `date`.
+/// A Saturday start for a Mon–Thu rule becomes the following Monday; Nov 19 2026 for "4th Thu
+/// of Nov" becomes Nov 26. Every other rule returns `date` unchanged.
 ///
 /// The add/edit form uses this to move an unscheduled start date forward when saving (and to
 /// preview that), and to fill in a missing date.
 pub fn scheduled_on_or_after(rule: RepeatRule, date: NaiveDate) -> NaiveDate {
     match rule {
         RepeatRule::Weekdays(days) => days.first_on_or_after(date).unwrap_or(date),
+        RepeatRule::NthWeekday {
+            nth,
+            weekday,
+            month,
+        } => nth_weekday_on_or_after(nth, weekday, month, date),
         _ => date,
     }
 }
@@ -747,6 +830,287 @@ mod tests {
             d(2026, 10, 10),
             "other rules are untouched"
         );
+    }
+
+    // ---- Nth weekdays --------------------------------------------------------------------
+
+    /// Shorthand for an Nth-weekday rule (`month` 1..=12, or 0 for every month).
+    fn nth(ordinal: Ordinal, weekday: Weekday, month: u8) -> RepeatRule {
+        RepeatRule::NthWeekday {
+            nth: ordinal,
+            weekday,
+            month: Month::try_from(month).ok(),
+        }
+    }
+
+    /// The 4th Thursday of November, yearly.
+    fn thanksgiving() -> RepeatRule {
+        nth(Ordinal::Fourth, Weekday::Thu, 11)
+    }
+
+    #[test]
+    fn thanksgiving_lands_on_the_right_date_2026_to_2030() {
+        let anchor = d(2026, 11, 26);
+        let expected = [
+            d(2026, 11, 26),
+            d(2027, 11, 25),
+            d(2028, 11, 23),
+            d(2029, 11, 22),
+            d(2030, 11, 28),
+        ];
+        for date in expected {
+            // Counted from New Year's Day, and on the day itself: that year's.
+            assert_eq!(
+                next_occurrence(thanksgiving(), anchor, d(date.year(), 1, 1)),
+                date
+            );
+            assert_eq!(next_occurrence(thanksgiving(), anchor, date), date);
+            assert_eq!(date.weekday(), Weekday::Thu);
+        }
+        // The day after, it rolls to next year's: Nov 27 2026 -> Nov 25 2027, 363 days.
+        let next = next_occurrence(thanksgiving(), anchor, d(2026, 11, 27));
+        assert_eq!(next, d(2027, 11, 25));
+        assert_eq!(days_until(next, d(2026, 11, 27)), 363);
+        // Still right from a very old anchor (computed directly, no stepping through years).
+        assert_eq!(
+            next_occurrence(thanksgiving(), d(1990, 11, 22), d(2030, 1, 1)),
+            d(2030, 11, 28)
+        );
+    }
+
+    #[test]
+    fn last_monday_of_may_is_the_4th_or_the_5th() {
+        let memorial_day = nth(Ordinal::Last, Weekday::Mon, 5);
+        let anchor = d(2026, 5, 25);
+        // 2026: May 25 (the 4th Monday). 2027: May 31 (the 5th). 2028: May 29 (the 5th).
+        for date in [d(2026, 5, 25), d(2027, 5, 31), d(2028, 5, 29)] {
+            assert_eq!(
+                next_occurrence(memorial_day, anchor, d(date.year(), 1, 1)),
+                date
+            );
+        }
+        // "4th Monday" is not the same rule: May 24 2027, a week before.
+        assert_eq!(
+            next_occurrence(nth(Ordinal::Fourth, Weekday::Mon, 5), anchor, d(2027, 1, 1)),
+            d(2027, 5, 24)
+        );
+    }
+
+    #[test]
+    fn other_holidays() {
+        // Labor Day: 1st Monday of September.
+        let labor_day = nth(Ordinal::First, Weekday::Mon, 9);
+        assert_eq!(
+            next_occurrence(labor_day, d(2026, 9, 7), d(2026, 9, 8)),
+            d(2027, 9, 6)
+        );
+        // Mother's Day: 2nd Sunday of May.
+        let mothers_day = nth(Ordinal::Second, Weekday::Sun, 5);
+        assert_eq!(
+            next_occurrence(mothers_day, d(2026, 5, 10), d(2027, 1, 1)),
+            d(2027, 5, 9)
+        );
+        assert_eq!(
+            next_occurrence(mothers_day, d(2026, 5, 10), d(2028, 1, 1)),
+            d(2028, 5, 14)
+        );
+    }
+
+    #[test]
+    fn a_5th_weekday_exists_only_in_some_months_so_last_is_used_instead() {
+        // October 2026 has five Fridays (2, 9, 16, 23, 30); February 2026 has four (it's
+        // exactly 28 days and starts on a Sunday). chrono has no 5th Friday in February...
+        assert_eq!(
+            NaiveDate::from_weekday_of_month_opt(2026, 2, Weekday::Fri, 5),
+            None
+        );
+        // ...which is why the rule has no 5th: "last" picks the 5th or the 4th.
+        assert_eq!(
+            nth_weekday_in(2026, 10, Ordinal::Last, Weekday::Fri),
+            Some(d(2026, 10, 30))
+        );
+        assert_eq!(
+            nth_weekday_in(2026, 2, Ordinal::Last, Weekday::Fri),
+            Some(d(2026, 2, 27))
+        );
+        // The 1st to 4th exist in every month of a few years, including both kinds of Feb.
+        for year in 2026..=2029 {
+            for month in 1..=12 {
+                for weekday in [Weekday::Mon, Weekday::Thu, Weekday::Sun] {
+                    for ordinal in Ordinal::ALL {
+                        let date = nth_weekday_in(year, month, ordinal, weekday);
+                        assert!(
+                            date.is_some_and(
+                                |date| date.weekday() == weekday && date.month() == month
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn february_and_leap_years() {
+        // Feb 2028 (leap) starts on a Tuesday: its last Tuesday is Feb 29.
+        let last_tue_of_feb = nth(Ordinal::Last, Weekday::Tue, 2);
+        assert_eq!(
+            next_occurrence(last_tue_of_feb, d(2027, 2, 23), d(2028, 1, 1)),
+            d(2028, 2, 29)
+        );
+        // The year after, Feb 2029 ends on a Wednesday: last Tuesday is Feb 27.
+        assert_eq!(
+            next_occurrence(last_tue_of_feb, d(2027, 2, 23), d(2028, 3, 1)),
+            d(2029, 2, 27)
+        );
+        // Feb 2026 is exactly four weeks from a Sunday: its 4th and last Sunday agree.
+        assert_eq!(
+            nth_weekday_in(2026, 2, Ordinal::Fourth, Weekday::Sun),
+            nth_weekday_in(2026, 2, Ordinal::Last, Weekday::Sun)
+        );
+    }
+
+    #[test]
+    fn every_month_rolls_over_months_and_the_year_end() {
+        let first_friday = nth(Ordinal::First, Weekday::Fri, 0);
+        let anchor = d(2026, 11, 6);
+        assert_eq!(
+            next_occurrence(first_friday, anchor, d(2026, 11, 3)),
+            anchor
+        );
+        assert_eq!(
+            next_occurrence(first_friday, anchor, d(2026, 11, 7)),
+            d(2026, 12, 4)
+        );
+        // After December's, January's: Jan 1 2027 is a Friday (New Year's Day).
+        assert_eq!(
+            next_occurrence(first_friday, anchor, d(2026, 12, 5)),
+            d(2027, 1, 1)
+        );
+        // Last Friday of December 2026 is Christmas; the day after, January's.
+        let last_friday = nth(Ordinal::Last, Weekday::Fri, 0);
+        assert_eq!(
+            next_occurrence(last_friday, anchor, d(2026, 12, 26)),
+            d(2027, 1, 29)
+        );
+        // A yearly December rule rolls into next December across the year end.
+        let first_sun_dec = nth(Ordinal::First, Weekday::Sun, 12);
+        assert_eq!(
+            next_occurrence(first_sun_dec, d(2026, 12, 6), d(2026, 12, 31)),
+            d(2027, 12, 5)
+        );
+    }
+
+    #[test]
+    fn nth_weekday_tasks_done_early_on_time_or_late() {
+        let due = d(2026, 11, 26);
+        // On the day, early (a week before) or late (Monday after): next year's.
+        for today in [due, d(2026, 11, 19), d(2026, 11, 30)] {
+            assert_eq!(
+                next_task_date(thanksgiving(), Some(due), today),
+                Some(d(2027, 11, 25)),
+                "done {today}"
+            );
+        }
+        // Every month, done late in the next month: the first one after today (no backlog).
+        let first_friday = nth(Ordinal::First, Weekday::Fri, 0);
+        assert_eq!(
+            next_task_date(first_friday, Some(d(2026, 11, 6)), d(2026, 12, 10)),
+            Some(d(2027, 1, 1))
+        );
+        // With a due time: due Nov 6 at 2 PM, done Dec 4 at 10 AM -> Dec 4's 2 PM is still
+        // ahead, so it's today; done at 3 PM -> January's.
+        let two_pm = NaiveTime::from_hms_opt(14, 0, 0);
+        let dec_4 = d(2026, 12, 4);
+        assert_eq!(
+            next_instance_date(
+                first_friday,
+                Some(d(2026, 11, 6)),
+                two_pm,
+                dec_4.and_hms_opt(10, 0, 0).unwrap()
+            ),
+            Some(dec_4)
+        );
+        assert_eq!(
+            next_instance_date(
+                first_friday,
+                Some(d(2026, 11, 6)),
+                two_pm,
+                dec_4.and_hms_opt(15, 0, 0).unwrap()
+            ),
+            Some(d(2027, 1, 1))
+        );
+    }
+
+    #[test]
+    fn nth_weekday_on_the_nights_the_clocks_change() {
+        // The 2nd Sunday of March and the 1st Sunday of November are the US clock-change
+        // days themselves (Mar 8 and Nov 1 in 2026). The math is on plain dates and times, so
+        // a time that never shows (2:30 AM in spring) or shows twice (1:30 AM in fall) is
+        // still a normal due time: done just after it, the next one is next year's.
+        let spring = nth(Ordinal::Second, Weekday::Sun, 3);
+        let fall = nth(Ordinal::First, Weekday::Sun, 11);
+        let at = |day: NaiveDate, h, m| day.and_hms_opt(h, m, 0).unwrap();
+        assert_eq!(
+            next_occurrence(spring, d(2026, 3, 8), d(2027, 1, 1)),
+            d(2027, 3, 14)
+        );
+        assert_eq!(
+            next_instance_date(
+                spring,
+                Some(d(2026, 3, 8)),
+                NaiveTime::from_hms_opt(2, 30, 0),
+                at(d(2026, 3, 8), 3, 0)
+            ),
+            Some(d(2027, 3, 14))
+        );
+        // Fall: done at 1:00 AM (early) or 2:00 AM (after either 1:30) counts as this one,
+        // so the next is the 1st Sunday of November 2027.
+        for (h, m) in [(1, 0), (2, 0)] {
+            assert_eq!(
+                next_instance_date(
+                    fall,
+                    Some(d(2026, 11, 1)),
+                    NaiveTime::from_hms_opt(1, 30, 0),
+                    at(d(2026, 11, 1), h, m)
+                ),
+                Some(d(2027, 11, 7)),
+                "done at {h}:{m:02}"
+            );
+        }
+    }
+
+    #[test]
+    fn unscheduled_start_dates_move_to_the_nth_weekday() {
+        // Nov 19 2026 is the 3rd Thursday: saves as the 4th, Nov 26.
+        assert_eq!(
+            scheduled_on_or_after(thanksgiving(), d(2026, 11, 19)),
+            d(2026, 11, 26)
+        );
+        assert_eq!(
+            scheduled_on_or_after(thanksgiving(), d(2026, 11, 26)),
+            d(2026, 11, 26)
+        );
+        // After this year's, next year's.
+        assert_eq!(
+            scheduled_on_or_after(thanksgiving(), d(2026, 11, 27)),
+            d(2027, 11, 25)
+        );
+        // Every month: Nov 3 2026 -> Fri Nov 6.
+        assert_eq!(
+            scheduled_on_or_after(nth(Ordinal::First, Weekday::Fri, 0), d(2026, 11, 3)),
+            d(2026, 11, 6)
+        );
+    }
+
+    #[test]
+    fn nth_weekday_events_count_down_and_stay_visible() {
+        let mut item = event(d(2026, 11, 26), thanksgiving());
+        assert_eq!(event_target(&item, d(2026, 11, 3)), Some(d(2026, 11, 26)));
+        assert_eq!(event_target(&item, d(2026, 11, 27)), Some(d(2027, 11, 25)));
+        assert!(event_is_visible(&item, d(2026, 11, 27)));
+        item.repeat = RepeatRule::None;
+        assert!(!event_is_visible(&item, d(2026, 11, 27)), "one-off hides");
     }
 
     #[test]
