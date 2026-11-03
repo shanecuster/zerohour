@@ -630,6 +630,63 @@ mod column_tests {
     }
 
     #[test]
+    fn nth_weekday_labels_fit_the_repeat_column() {
+        use chrono::{Month, Weekday};
+        use zerohour_core::model::{Ordinal, RepeatRule};
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        // The longest yearly and monthly labels, plus Thanksgiving. A long title makes the
+        // title column take every column it can, so the repeat column gets only its own 17.
+        let rules = [
+            (Ordinal::Last, Weekday::Mon, Some(Month::May)),
+            (Ordinal::Last, Weekday::Mon, None),
+            (Ordinal::Fourth, Weekday::Thu, Some(Month::November)),
+        ];
+        for (nth, weekday, month) in rules {
+            let mut item = Item::new(
+                Kind::Event,
+                "a very long event title ".repeat(6),
+                chrono::Utc::now(),
+            );
+            item.repeat = RepeatRule::NthWeekday {
+                nth,
+                weekday,
+                month,
+            };
+            item.date = Some(zerohour_core::repeat::scheduled_on_or_after(
+                item.repeat,
+                now().date(),
+            ));
+            db.insert_item(&item).unwrap();
+        }
+        let mut app = App::new(db, false, None).unwrap();
+        app.show_banner = false;
+        app.now = now();
+        app.today = now().date();
+        app.refresh().unwrap();
+        for width in [60, 80, 120] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    draw(frame, area, &mut app);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let screen: Vec<String> = (0..24)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            for label in ["↻ last Mon of May", "↻ every last Mon", "↻ 4th Thu of Nov"] {
+                assert!(
+                    screen.iter().any(|row| row.contains(label)),
+                    "at {width}: {label:?} is cut off:\n{}",
+                    screen.join("\n")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn narrow_mode_rows_still_line_up() {
         let mut app = app_with_tasks(TimeFormat::Hour12);
         let rows = task_rows(&mut app, 50);

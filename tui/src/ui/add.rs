@@ -8,6 +8,8 @@
 //! Repeat choices include weekday presets ("weekdays", "Mon–Thu") and "pick days"; those
 //! show a row of day checkboxes. A start date that isn't one of the chosen days moves forward
 //! to the next one on save (the date preview says so), and an empty date is filled in.
+//! "nth weekday" shows three choice rows (On the 4th / Weekday Thu / Month Nov) with the next
+//! two dates under them, and moves or fills in the date the same way.
 //!    - Event: title, date, repeat, keep-after-pass, notes
 //!
 //! Editing skips step 1 (an item's kind can't change) and starts with the fields pre-filled.
@@ -15,8 +17,9 @@
 //! The date field also has a month-grid picker (Ctrl+D or F2, see `calendar.rs`); typing a
 //! date still works.
 //!
-//! The form's values, which fields appear, the repeat choices, validation and the date/time
-//! previews live in core (`zerohour_core::form`), so the Android app's form behaves exactly
+//! The form's values, which fields appear, the repeat choices, stepping through a choice,
+//! validation and the previews live in core (`zerohour_core::form`), so the Android app's
+//! form behaves exactly
 //! the same. This file holds the terminal side: the dialog *state* on top of that ([`Form`]),
 //! its *key handling* ([`Form::handle_key`]), and its *drawing* ([`draw`]). The app only sees
 //! the result: [`FormOutcome::Save`] with a validated [`FormData`], or `Cancel`.
@@ -29,11 +32,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::clock::TimeFormat;
-use zerohour_core::form::{Field, FormData, FormInput, RepeatChoice};
+use zerohour_core::form::{Field, FormData, FormInput};
 use zerohour_core::icons::{Icon, IconMode};
-use zerohour_core::model::{Item, Kind, Priority, Unit};
+use zerohour_core::model::{Item, Kind};
 use zerohour_core::repeat::parse_date_input;
-use zerohour_core::theme::{Rgb, Theme};
+use zerohour_core::theme::Theme;
 
 use super::calendar::{self, Calendar, CalendarOutcome, GridArea};
 use super::{
@@ -282,44 +285,21 @@ impl Form {
         }
     }
 
-    /// Steps a choice field forward (`right = true`) or backward.
+    /// ←/→ on a field: steps a choice field forward (`right = true`) or backward, or moves
+    /// the cursor across the day checkboxes.
     fn cycle(&mut self, field: Field, right: bool) {
-        /// Moves an index one step around a list of length `len`, wrapping at both ends.
-        fn step(i: usize, len: usize, right: bool) -> usize {
-            if right {
-                (i + 1) % len
+        if field == Field::Days {
+            // The cursor is the terminal's own (Space toggles the day under it), wrapping
+            // around the 7 days.
+            self.day_cursor = if right {
+                (self.day_cursor + 1) % 7
             } else {
-                (i + len - 1) % len
-            }
-        }
-        match field {
-            Field::Priority => {
-                let i = Priority::ALL
-                    .iter()
-                    .position(|&p| p == self.input.priority)
-                    .unwrap_or(1);
-                self.input.priority = Priority::ALL[step(i, Priority::ALL.len(), right)];
-            }
-            Field::Repeat => {
-                let i = RepeatChoice::ALL
-                    .iter()
-                    .position(|&c| c == self.input.repeat)
-                    .unwrap_or(0);
-                // `set_repeat` also fills in a preset's days ("pick days" keeps what's there).
-                self.input
-                    .set_repeat(RepeatChoice::ALL[step(i, RepeatChoice::ALL.len(), right)]);
-            }
-            // On the day checkboxes, ←/→ move between days (Space toggles one).
-            Field::Days => self.day_cursor = step(self.day_cursor, 7, right),
-            Field::EveryUnit => {
-                let i = Unit::ALL
-                    .iter()
-                    .position(|&u| u == self.input.unit)
-                    .unwrap_or(0);
-                self.input.unit = Unit::ALL[step(i, Unit::ALL.len(), right)];
-            }
-            Field::KeepAfterPass => self.input.keep_after_pass = !self.input.keep_after_pass,
-            _ => {}
+                (self.day_cursor + 6) % 7
+            };
+        } else {
+            // Every choice field (and the "keep after" checkbox) is stepped by core, so the
+            // order and wrapping match the phone. Text fields ignore it.
+            self.input.step_choice(field, right);
         }
     }
 
@@ -456,16 +436,17 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
             ),
             Span::styled(value, Style::new().fg(color(theme.fg))),
         ]));
-        // Right under the date and time: how the typed text was understood, wrapped under
-        // the value column (14 = "› " + label + " ").
-        let preview = match field {
-            Field::Date => Some(date_preview(form, theme, today)),
-            Field::Time => Some(time_preview(form, theme)),
-            _ => None,
-        };
-        if let Some((text, slot)) = preview {
-            let style = Style::new().fg(color(slot));
-            lines.extend(wrapped_lines(&text, text_width, 14, style));
+        // Right under the date, the time and the Nth weekday's month: how the input was
+        // understood (words and color slot from core), wrapped under the value column
+        // (14 = "› " + label + " ").
+        if let Some((text, slot)) = form.input.preview(*field, today, form.prefs.time_format) {
+            let style = Style::new().fg(color(theme.slot(slot)));
+            lines.extend(wrapped_lines(
+                &format!("{PREVIEW_INDENT}{text}"),
+                text_width,
+                14,
+                style,
+            ));
         }
     }
     lines.push(Line::default());
@@ -502,9 +483,11 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
             s.to_string()
         }
     };
+    // Choice fields: core's text for the value ("Medium", "4th", "every month").
+    if field.is_choice() {
+        return choice(&form.input.field_value(field));
+    }
     match field {
-        Field::Priority => choice(form.input.priority.label()),
-        Field::Repeat => choice(form.input.repeat.label()),
         Field::Days => {
             // "[x]Mo [x]Tu [ ]We ..."; the day under the cursor shows as "‹x›Mo" when focused.
             form.day_order()
@@ -527,7 +510,6 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
                 .collect::<Vec<_>>()
                 .join(" ")
         }
-        Field::EveryUnit => choice(form.input.unit.as_str()),
         Field::KeepAfterPass => {
             let box_ = if form.input.keep_after_pass {
                 "[x]"
@@ -557,20 +539,6 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
     }
 }
 
-/// The line under the date field, indented to the value column: the understood date, or how
-/// to type one. The words and color slot come from core; returned as (text, color) for the
-/// caller to wrap.
-fn date_preview(form: &Form, theme: &Theme, today: NaiveDate) -> (String, Rgb) {
-    let (text, slot) = form.input.date_preview(today);
-    (format!("{PREVIEW_INDENT}{text}"), theme.slot(slot))
-}
-
-/// The line under the time field: the understood time, or how to type one (words from core).
-fn time_preview(form: &Form, theme: &Theme) -> (String, Rgb) {
-    let (text, slot) = form.input.time_preview(form.prefs.time_format);
-    (format!("{PREVIEW_INDENT}{text}"), theme.slot(slot))
-}
-
 /// Previews start under the value column: "› " + an 11-wide label + " " = 14 columns.
 const PREVIEW_INDENT: &str = "              ";
 
@@ -588,7 +556,8 @@ fn hint_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use chrono::NaiveTime;
-    use zerohour_core::model::{DaySet, RepeatRule};
+    use zerohour_core::form::RepeatChoice;
+    use zerohour_core::model::{DaySet, Priority, RepeatRule, Unit};
 
     fn today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 10, 8).unwrap()
@@ -913,6 +882,108 @@ mod tests {
         );
         form.input.repeat = RepeatChoice::Custom;
         assert_dialog_shows(&form, &["Every", "Unit"]);
+    }
+
+    /// An event form with Thanksgiving picked through the keys: the date typed first, then
+    /// Repeat stepped forward to "nth weekday" (none → daily → weekdays → Mon–Thu → weekly →
+    /// monthly → yearly → nth weekday: 7 steps).
+    fn thanksgiving_form() -> Form {
+        let mut form = task_form();
+        form.input.kind = Kind::Event;
+        form.input.title = "Thanksgiving".into();
+        focus_on(&mut form, Field::Date);
+        type_text(&mut form, "2026-11-26");
+        focus_on(&mut form, Field::Repeat);
+        for _ in 0..7 {
+            form.handle_key(key(KeyCode::Right), today());
+        }
+        form
+    }
+
+    #[test]
+    fn nth_weekday_through_the_keys() {
+        let mut form = thanksgiving_form();
+        assert_eq!(form.input.repeat, RepeatChoice::NthWeekday);
+        // Filled in from the date: 4th Thu of Nov.
+        let data = form.input.validate(today()).unwrap();
+        assert_eq!(data.repeat.to_db_string(), "nth:4:thu:nov");
+        assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 11, 26));
+        // ← / → on the three rows step them (core's order).
+        focus_on(&mut form, Field::Ordinal);
+        form.handle_key(key(KeyCode::Right), today()); // 4th -> last
+        focus_on(&mut form, Field::Weekday);
+        form.handle_key(key(KeyCode::Left), today()); // Thu -> Wed
+        focus_on(&mut form, Field::Month);
+        form.handle_key(key(KeyCode::Right), today()); // Nov -> Dec
+        let data = form.input.validate(today()).unwrap();
+        assert_eq!(data.repeat.to_db_string(), "nth:last:wed:dec");
+        // Nov 26 isn't the last Wednesday of December: moves to Dec 30 2026.
+        assert_eq!(data.date, NaiveDate::from_ymd_opt(2026, 12, 30));
+        // Every month: one more step after December.
+        form.handle_key(key(KeyCode::Right), today());
+        assert_eq!(form.input.field_value(Field::Month), "every month");
+        // Enter saves.
+        assert!(matches!(
+            form.handle_key(key(KeyCode::Enter), today()),
+            FormOutcome::Save(_)
+        ));
+    }
+
+    #[test]
+    fn nth_weekday_rows_and_preview_are_never_cut_off() {
+        let mut form = thanksgiving_form();
+        focus_on(&mut form, Field::Ordinal);
+        assert_dialog_shows(
+            &form,
+            &[
+                "Repeat nth weekday",
+                "On the ‹ 4th ›",
+                "Weekday Thu",
+                "Month Nov",
+                // The screen text turns non-breaking spaces into normal ones.
+                "→ Thu Nov 26 2026, Thu Nov 25 2027",
+                "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
+            ],
+        );
+        // A date that isn't on the rule.
+        form.input.date_text = "2026-11-19".into();
+        assert_dialog_shows(
+            &form,
+            &["→ Nov 19 isn't a repeat day: saves as Thu Nov 26 2026"],
+        );
+    }
+
+    #[test]
+    fn nth_weekday_preview_wraps_between_dates_only() {
+        use crate::ui::test_support::normalize;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use zerohour_core::theme::THEMES;
+        // At 40 columns the two dates don't fit on one line. Each row is checked on its own
+        // (the shared helper joins rows, which would hide a date split across two).
+        let form = thanksgiving_form();
+        let (width, height) = (40, 50);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, &form, &THEMES[0], IconMode::Unicode, today());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..height)
+            .map(|y| {
+                normalize(
+                    &(0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>(),
+                )
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|row| row == "→ Thu Nov 26 2026,"),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|row| row == "Thu Nov 25 2027"), "{rows:#?}");
     }
 
     #[test]
