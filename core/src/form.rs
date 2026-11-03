@@ -230,6 +230,9 @@ impl FormInput {
                 input.days = days;
                 RepeatChoice::for_days(days)
             }
+            // Temporary: the form has no Nth-weekday choice yet (it comes in the next form
+            // commit), and nothing can create such a rule before then.
+            RepeatRule::NthWeekday { .. } => RepeatChoice::None,
         };
         input
     }

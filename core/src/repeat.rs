@@ -30,10 +30,11 @@ enum Step {
 }
 
 /// Turns a repeat rule into its step size, or `None` if the rule doesn't repeat by a fixed
-/// step (no repeat at all, or a weekday set, which [`first_on_or_after`] handles first).
+/// step (no repeat at all, a weekday set, or an Nth weekday of a month, which
+/// [`first_on_or_after`] handles first).
 fn step_of(rule: RepeatRule) -> Option<Step> {
     match rule {
-        RepeatRule::None | RepeatRule::Weekdays(_) => None,
+        RepeatRule::None | RepeatRule::Weekdays(_) | RepeatRule::NthWeekday { .. } => None,
         RepeatRule::Daily => Some(Step::Days(1)),
         RepeatRule::Weekly => Some(Step::Days(7)),
         RepeatRule::Monthly => Some(Step::Months(1)),

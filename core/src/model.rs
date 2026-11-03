@@ -8,7 +8,7 @@
 //! newest edit can win a conflict), and a `deleted` flag instead of really deleting rows (so a
 //! deletion can be sent to other devices).
 
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeDelta, Utc, Weekday};
+use chrono::{DateTime, Datelike, Month, NaiveDate, NaiveTime, TimeDelta, Utc, Weekday};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -243,6 +243,106 @@ impl DaySet {
     }
 }
 
+/// Which one of a weekday in a month, for the "Nth weekday" rule: the 1st to 4th, or the last.
+///
+/// There's no "5th" on purpose. Every month has at least 28 days, so every weekday appears at
+/// least 4 times and the 1st to 4th always exist. A 5th only exists in some months; "last"
+/// covers what people usually mean by it (the last Monday of May is sometimes the 4th,
+/// sometimes the 5th).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Ordinal {
+    First,
+    Second,
+    Third,
+    Fourth,
+    Last,
+}
+
+impl Ordinal {
+    /// All ordinals, in the order the form cycles through them.
+    pub const ALL: [Ordinal; 5] = [
+        Ordinal::First,
+        Ordinal::Second,
+        Ordinal::Third,
+        Ordinal::Fourth,
+        Ordinal::Last,
+    ];
+
+    /// The text stored in the database ("1" to "4", or "last").
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ordinal::First => "1",
+            Ordinal::Second => "2",
+            Ordinal::Third => "3",
+            Ordinal::Fourth => "4",
+            Ordinal::Last => "last",
+        }
+    }
+
+    /// The text shown to the user ("1st", "2nd", "3rd", "4th", "last").
+    pub fn label(self) -> &'static str {
+        match self {
+            Ordinal::First => "1st",
+            Ordinal::Second => "2nd",
+            Ordinal::Third => "3rd",
+            Ordinal::Fourth => "4th",
+            Ordinal::Last => "last",
+        }
+    }
+
+    /// Reads an ordinal back from its database text. `None` for anything else, including
+    /// "0" and "5" (see the type's docs for why there's no 5th).
+    pub fn parse(s: &str) -> Option<Ordinal> {
+        match s {
+            "1" => Some(Ordinal::First),
+            "2" => Some(Ordinal::Second),
+            "3" => Some(Ordinal::Third),
+            "4" => Some(Ordinal::Fourth),
+            "last" => Some(Ordinal::Last),
+            _ => None,
+        }
+    }
+}
+
+/// Short lowercase month names used in the stored text ("nth:4:thu:nov"), January first.
+const MONTH_DB_NAMES: [&str; 12] = [
+    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+];
+/// Month names used in labels ("4th Thu of Nov"), January first.
+const MONTH_LABEL_NAMES: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The short label for a month, "Nov". Shared with the form, which shows the same names.
+pub fn month_label(month: Month) -> &'static str {
+    // `number_from_month` is 1 for January ... 12 for December, so subtract 1 for the index.
+    MONTH_LABEL_NAMES[month.number_from_month() as usize - 1]
+}
+
+/// The short label for a weekday, "Thu". Shared with the form.
+pub fn weekday_label(day: Weekday) -> &'static str {
+    LABEL_NAMES[day.num_days_from_monday() as usize]
+}
+
+/// The database name for a weekday ("thu"), the same names the weekday-set rule uses.
+fn weekday_db_name(day: Weekday) -> &'static str {
+    DB_NAMES[day.num_days_from_monday() as usize]
+}
+
+/// Reads a weekday back from its database name ("thu"). `None` for unknown text.
+fn weekday_from_db_name(name: &str) -> Option<Weekday> {
+    let index = DB_NAMES.iter().position(|n| *n == name)?;
+    Some(WEEK[index])
+}
+
+/// Reads a month back from its database name ("nov"). `None` for unknown text.
+fn month_from_db_name(name: &str) -> Option<Month> {
+    let index = MONTH_DB_NAMES.iter().position(|n| *n == name)?;
+    // `Month::try_from(u8)` takes 1..=12; the index is 0..=11, so it can't fail here, but
+    // `.ok()` keeps this panic-free anyway.
+    Month::try_from(index as u8 + 1).ok()
+}
+
 /// How (and whether) an item repeats.
 ///
 /// Variants can carry data: `EveryN { n, unit }` holds a number and a unit, e.g.
@@ -260,6 +360,16 @@ pub enum RepeatRule {
     },
     /// On chosen days of the week, e.g. Mon–Thu. Never empty.
     Weekdays(DaySet),
+    /// The Nth weekday of a month, e.g. the 4th Thursday of November (Thanksgiving) or the
+    /// 1st Friday of every month.
+    NthWeekday {
+        /// Which one: 1st to 4th, or the last.
+        nth: Ordinal,
+        /// Which day of the week.
+        weekday: Weekday,
+        /// `Some(month)` repeats once a year in that month; `None` repeats every month.
+        month: Option<Month>,
+    },
 }
 
 impl RepeatRule {
@@ -281,7 +391,39 @@ impl RepeatRule {
             // `format!` builds a String, like printf. `{n}` inserts the variable `n`.
             RepeatRule::EveryN { n, unit } => format!("every:{n}:{}", unit.as_str()),
             RepeatRule::Weekdays(days) => days.to_db_string(),
+            // "nth:4:thu:nov" (yearly) or "nth:1:fri:monthly" (every month).
+            RepeatRule::NthWeekday {
+                nth,
+                weekday,
+                month,
+            } => {
+                // `map_or(default, f)`: `f(value)` for `Some(value)`, else the default.
+                let month = month.map_or("monthly", |m| {
+                    MONTH_DB_NAMES[m.number_from_month() as usize - 1]
+                });
+                format!("nth:{}:{}:{month}", nth.as_str(), weekday_db_name(weekday))
+            }
         }
+    }
+
+    /// Decodes the part after `"nth:"`: exactly three pieces, ordinal, weekday and month
+    /// (or "monthly"). `None` for anything else.
+    fn parse_nth(rest: &str) -> Option<RepeatRule> {
+        let mut parts = rest.split(':');
+        let nth = Ordinal::parse(parts.next()?)?;
+        let weekday = weekday_from_db_name(parts.next()?)?;
+        let month = match parts.next()? {
+            "monthly" => None,
+            name => Some(month_from_db_name(name)?),
+        };
+        if parts.next().is_some() {
+            return None; // Extra junk after the month.
+        }
+        Some(RepeatRule::NthWeekday {
+            nth,
+            weekday,
+            month,
+        })
     }
 
     /// Decodes a rule from its database string. Returns `None` if the text is not recognized.
@@ -297,6 +439,9 @@ impl RepeatRule {
                 .strip_prefix("days:")
                 .and_then(DaySet::parse_list)
                 .map(RepeatRule::Weekdays),
+            other if other.starts_with("nth:") => {
+                other.strip_prefix("nth:").and_then(RepeatRule::parse_nth)
+            }
             other => {
                 // Expect exactly three pieces: "every", a number, a unit.
                 let mut parts = other.split(':');
@@ -330,6 +475,24 @@ impl RepeatRule {
             },
             RepeatRule::EveryN { n, unit } => format!("every {n} {}", unit.as_str()),
             RepeatRule::Weekdays(days) => days.label(),
+            // Yearly: "4th Thu of Nov". Every month: "every 1st Fri". Both fit the 17-column
+            // repeat column in the events list with the "↻ " in front (the longest is
+            // "last Mon of May", 15 + 2).
+            RepeatRule::NthWeekday {
+                nth,
+                weekday,
+                month: Some(month),
+            } => format!(
+                "{} {} of {}",
+                nth.label(),
+                weekday_label(weekday),
+                month_label(month)
+            ),
+            RepeatRule::NthWeekday {
+                nth,
+                weekday,
+                month: None,
+            } => format!("every {} {}", nth.label(), weekday_label(weekday)),
         }
     }
 }
@@ -528,6 +691,79 @@ mod tests {
         }
         assert_eq!(RepeatRule::parse("days:"), None, "empty set");
         assert_eq!(RepeatRule::parse("days:mon,funday"), None);
+    }
+
+    /// Shorthand for an Nth-weekday rule in tests.
+    fn nth(nth: Ordinal, weekday: Weekday, month: Option<Month>) -> RepeatRule {
+        RepeatRule::NthWeekday {
+            nth,
+            weekday,
+            month,
+        }
+    }
+
+    #[test]
+    fn nth_weekday_rules_round_trip_through_db_strings() {
+        let thanksgiving = nth(Ordinal::Fourth, Weekday::Thu, Some(Month::November));
+        assert_eq!(thanksgiving.to_db_string(), "nth:4:thu:nov");
+        let first_friday = nth(Ordinal::First, Weekday::Fri, None);
+        assert_eq!(first_friday.to_db_string(), "nth:1:fri:monthly");
+        assert_eq!(
+            nth(Ordinal::Last, Weekday::Mon, Some(Month::May)).to_db_string(),
+            "nth:last:mon:may"
+        );
+        // Every ordinal × weekday × month (and "monthly") comes back unchanged.
+        let months = (1..=12u8).map(|m| Month::try_from(m).ok());
+        for month in months.chain([None]) {
+            for ordinal in Ordinal::ALL {
+                for weekday in WEEK {
+                    let rule = nth(ordinal, weekday, month);
+                    assert_eq!(RepeatRule::parse(&rule.to_db_string()), Some(rule));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nth_weekday_parse_rejects_bad_strings() {
+        for bad in [
+            "nth:5:thu:nov",       // no 5th
+            "nth:0:thu:nov",       // no 0th
+            "nth:4:thursday:nov",  // unknown weekday name
+            "nth:4:thu:november",  // unknown month name
+            "nth:4:thu:yearly",    // "monthly" is the only non-month word
+            "nth:4:thu",           // missing month
+            "nth:4:thu:nov:extra", // extra part
+            "nth:first:thu:nov",   // ordinals are digits or "last"
+            "nth:",
+        ] {
+            assert_eq!(RepeatRule::parse(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn nth_weekday_labels() {
+        assert_eq!(
+            nth(Ordinal::Fourth, Weekday::Thu, Some(Month::November)).label(),
+            "4th Thu of Nov"
+        );
+        assert_eq!(
+            nth(Ordinal::Last, Weekday::Mon, Some(Month::May)).label(),
+            "last Mon of May"
+        );
+        assert_eq!(
+            nth(Ordinal::Second, Weekday::Sun, Some(Month::May)).label(),
+            "2nd Sun of May"
+        );
+        assert_eq!(
+            nth(Ordinal::First, Weekday::Fri, None).label(),
+            "every 1st Fri"
+        );
+        assert_eq!(
+            nth(Ordinal::Third, Weekday::Wed, None).label(),
+            "every 3rd Wed"
+        );
+        assert!(nth(Ordinal::First, Weekday::Fri, None).is_repeating());
     }
 
     #[test]
