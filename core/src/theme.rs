@@ -72,13 +72,14 @@ pub struct Theme {
     pub selection: Rgb,
     /// The Tasks section color. Must differ clearly from `event`.
     pub task: Rgb,
-    /// The Events section color. Must differ clearly from `task`.
+    /// The Events section color. Must differ clearly from `task` and from `danger` (overdue
+    /// and high priority), so a red-ish Events color is never mistaken for a warning.
     pub event: Rgb,
     /// Good things: done, on time, streaks.
     pub ok: Rgb,
     /// Attention: due soon, medium priority.
     pub warn: Rgb,
-    /// Problems: overdue, high priority, delete confirmations.
+    /// Problems: overdue, high priority, delete confirmations. Must differ clearly from `event`.
     pub danger: Rgb,
 }
 
@@ -100,7 +101,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xe69875),
         selection: Rgb::hex(0x475258),
         task: Rgb::hex(0x7fbbb3),
-        event: Rgb::hex(0xd699b6),
+        event: Rgb::hex(0xf5b5a8), // soft red (light salmon), clearly apart from danger
         ok: Rgb::hex(0xa7c080),
         warn: Rgb::hex(0xdbbc7f),
         danger: Rgb::hex(0xe67e80),
@@ -116,7 +117,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xffb86c),
         selection: Rgb::hex(0x44475a),
         task: Rgb::hex(0x8be9fd),
-        event: Rgb::hex(0xff79c6),
+        event: Rgb::hex(0xe08585), // soft red (dusty red), clearly apart from danger
         ok: Rgb::hex(0x50fa7b),
         warn: Rgb::hex(0xf1fa8c),
         danger: Rgb::hex(0xff5555),
@@ -132,7 +133,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xfabd2f), // yellow: Gruvbox's accent is already orange
         selection: Rgb::hex(0x504945),
         task: Rgb::hex(0x83a598),
-        event: Rgb::hex(0xd3869b),
+        event: Rgb::hex(0xe7867a), // soft red (faded coral), clearly apart from danger
         ok: Rgb::hex(0xb8bb26),
         warn: Rgb::hex(0xfabd2f),
         danger: Rgb::hex(0xfb4934),
@@ -148,7 +149,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xfab387),
         selection: Rgb::hex(0x45475a),
         task: Rgb::hex(0x89b4fa),
-        event: Rgb::hex(0xf5c2e7),
+        event: Rgb::hex(0xf2cdcd), // soft red (flamingo), clearly apart from danger
         ok: Rgb::hex(0xa6e3a1),
         warn: Rgb::hex(0xf9e2af),
         danger: Rgb::hex(0xf38ba8),
@@ -164,7 +165,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xd08770),
         selection: Rgb::hex(0x434c5e),
         task: Rgb::hex(0x88c0d0),
-        event: Rgb::hex(0xb48ead),
+        event: Rgb::hex(0xd8a0a0), // soft red (dusty rose-red), clearly apart from danger
         ok: Rgb::hex(0xa3be8c),
         warn: Rgb::hex(0xebcb8b),
         danger: Rgb::hex(0xbf616a),
@@ -180,7 +181,7 @@ pub const THEMES: &[Theme] = &[
         banner_end: Rgb::hex(0xcb4b16),
         selection: Rgb::hex(0x073642),
         task: Rgb::hex(0x2aa198),
-        event: Rgb::hex(0xd33682),
+        event: Rgb::hex(0xef7a6a), // soft red (light coral), clearly apart from danger
         ok: Rgb::hex(0x859900),
         warn: Rgb::hex(0xb58900),
         danger: Rgb::hex(0xdc322f),
@@ -344,6 +345,19 @@ mod tests {
             assert!(
                 distance(t.task, t.event) > 100,
                 "{}: task and event colors are too similar",
+                t.name
+            );
+        }
+    }
+
+    #[test]
+    fn event_and_danger_colors_are_clearly_different_in_every_theme() {
+        // Most themes use a soft red for Events; it must never read as the danger red used for
+        // overdue tasks and high priority.
+        for t in THEMES {
+            assert!(
+                distance(t.event, t.danger) > 100,
+                "{}: event and danger colors are too similar",
                 t.name
             );
         }
