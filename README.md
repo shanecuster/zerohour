@@ -22,7 +22,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 - **Statistics.** Completions per week, streaks, overdue count, and more, with a bar chart.
 - **Themes.** Everforest, Dracula, Gruvbox, Catppuccin, Nord, Solarized, Tokyo Night, with a live-preview picker.
 - **Nerd Font icons** with Unicode and ASCII fallbacks.
-- **Title banner.** A big "zerohour" in the theme's colors with a countdown to your next event, on terminals 30+ rows tall (`b` hides it).
+- **Title banner.** A big "zerohour" fading from the theme's accent color to its orange, with a countdown to your next event, on terminals 30+ rows tall (`b` hides it).
 - **Narrow mode** for small terminal windows, and a 50/50 or fit-to-content layout for the Tasks and Events boxes.
 - **Desktop reminders.** `zerohour remind`, run every minute by a systemd user timer, pops up a notification when a task is due ("Fill Out Your Timesheet · Due 2:00 PM"). Off until you switch it on with `n`.
 - **Local-first.** Your data lives in a single SQLite file on your machine.

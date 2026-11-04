@@ -37,7 +37,7 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
   Still in-memory unless combined with `--db`, and never synced.
 
 - **Title banner**: a big "zerohour" at the top of the main screen, in a gradient from the theme's
-  accent color to its event color, with a tagline counting down to the next event ("7 days to
+  accent color to its orange (yellow in Gruvbox, whose accent is orange), with a tagline counting down to the next event ("7 days to
   Your Birthday", "Launch day is today!", or the date when there's none). Half-block letters, or
   plain ASCII in ASCII icon mode. Shows on terminals at least 30 rows tall, not in narrow mode;
   `b` switches it off and on (saved as `banner`, on by default).
@@ -68,6 +68,10 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Changed
 
+- **Events colors**: the Events section (its box, markers and countdowns more than a week away) is
+  no longer pink. Everforest, Dracula, Gruvbox, Catppuccin, Nord and Solarized use a soft red that
+  stays clearly apart from the red of overdue tasks and High priority; Tokyo Night keeps its
+  lavender. The title banner now has its own end color, so it no longer follows the Events color.
 - A task with a due time is no longer late when its time passes: it turns overdue at midnight, when
   its due day ends, like a task without a time. After the time it reads "today 2:00 PM" (narrow:
   "today") in the normal due-today color, and from the next day "! 1d overdue". This applies to the

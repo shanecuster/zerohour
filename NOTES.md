@@ -298,15 +298,16 @@ hard-coded as text lines, no figlet library), plus a tagline.
 |---|---|
 | `core/src/banner.rs` | The letters, in two fonts: a 3-row half-block design (`▀ ▄ █`, 31 columns) for Nerd/Unicode icon modes, and figlet's `smslant` (4 rows, 37 columns, plain ASCII) for ASCII mode. |
 | `core/src/theme.rs` | `Rgb::lerp`: mixes two theme colors, for gradients. |
-| `tui/src/ui/banner.rs` | When to show it (`fits`), the accent→event gradient, and the tagline. |
+| `tui/src/ui/banner.rs` | When to show it (`fits`), the accent→banner_end gradient, and the tagline. |
 | `tui/src/ui/list.rs` | Puts the banner above the Tasks box; the 50/50 split shares what's left. |
 
 ### Rules worth knowing
 
 - **Shows only when** the terminal is at least 30 rows tall, not in narrow mode (60+ columns),
   and `b` hasn't switched it off. Then it costs 4 rows (5 in ASCII mode), tagline included.
-- **Colors** are a left-to-right gradient from the theme's `accent` slot to its `event` slot,
-  so every theme has its own, and nothing is hard-coded.
+- **Colors** are a left-to-right gradient from the theme's `accent` slot to its `banner_end` slot
+  (until 2026-11-03 it ended in `event`; see "Orange banner, soft red Events" below), so every
+  theme has its own, and nothing is hard-coded.
 - **Tagline:** the soonest visible upcoming event: "X is today!", "1 day to X", "N days to X";
   today's date if there's none. Hidden events and passed ones (`p`) are skipped.
 - The `zerohour` title in the top border stays.
@@ -719,3 +720,47 @@ FFI's `step_choice` and `view()` can call core for every field instead of matchi
 - **Title:** Check the Nth-weekday rule
   **Command:** `cargo test -p zerohour-core nth` and `cargo test -p zerohour nth_weekday`
   **When:** after touching `repeat.rs`, the rule's strings in `model.rs`, or the form rows.
+
+---
+
+## Orange banner, soft red Events (done 2026-11-03)
+
+Branch `feature/orange-palette`. The banner fades to orange, and the Events section is no longer
+pink. No migration, no sync change: themes are code, not data.
+
+### What changed
+
+| Where | What it does |
+|---|---|
+| `core/src/theme.rs` | A new slot, `banner_end` (`Slot::BannerEnd`): the right end of the banner's gradient. Each theme's orange, except Gruvbox (its accent is already orange), which ends in its yellow `#fabd2f`. |
+| `core/src/theme.rs` | New Events colors: a soft red in six themes (Everforest `#f5b5a8`, Dracula `#e08585`, Gruvbox `#e7867a`, Catppuccin `#f2cdcd`, Nord `#d8a0a0`, Solarized `#ef7a6a`); Tokyo Night keeps its lavender `#bb9af7`. |
+| `core/src/theme.rs` tests | Event vs danger must score over 100 (like task vs event); the banner's two ends over 60. |
+| `tui/src/ui/banner.rs` | The gradient goes from `accent` to `banner_end`. |
+
+### Rules worth knowing
+
+- **Why a separate slot:** the banner used to end in the Events color, so making Events red would
+  have made the banner red. Now the two are independent.
+- **"Clearly different"** in the theme tests is the sum of the red, green and blue differences.
+  Over 100 for task vs event and event vs danger. The old Everforest (97) and Solarized (96) Events
+  colors were too close to danger by that measure.
+- **The banner-ends test uses 60**, not 100: it only guards against a flat banner, and Gruvbox's
+  orange to yellow scores 87.
+- The danger slot is unchanged, so overdue tasks and High priority look the same as before.
+
+### Android
+
+After re-pinning core, the FFI's banner (`zerohour-ffi/src/screen.rs`, which works out each
+column's color) should fade to `banner_end` instead of `event`, with its gradient test updated;
+the theme export can add `banner_end` if the app wants it. The new Events colors arrive with the
+re-pin on their own.
+
+### Save to your personal notes
+
+- **Title:** Compare zerohour themes side by side
+  **Command:** `./target/debug/zerohour --demo`, then `t` and move through the list
+  **When:** checking a palette change; the demo has overdue, High-priority and event rows.
+
+- **Title:** Run only the theme tests
+  **Command:** `cargo test -p zerohour-core theme`
+  **When:** after changing any color in `core/src/theme.rs`.
