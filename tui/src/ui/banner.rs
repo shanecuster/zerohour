@@ -6,7 +6,7 @@
 //! draws the tagline (whose words come from `zerohour_core::view`, shared with Android).
 //!
 //! **Colors** come only from theme slots: each column of the letters gets a color part of the
-//! way from the `accent` slot (left edge) to the `event` slot (right edge), computed with
+//! way from the `accent` slot (left edge) to the `banner_end` slot (right edge), computed with
 //! `Rgb::lerp`. So every theme gets its own gradient, and nothing is hard-coded.
 
 use ratatui::Frame;
@@ -87,13 +87,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The gradient color for one column of the letters: the theme's `accent` slot at the left
-/// edge (column 0), its `event` slot at the right edge (column `width - 1`), and evenly mixed
-/// in between.
+/// edge (column 0), its `banner_end` slot at the right edge (column `width - 1`), and evenly
+/// mixed in between.
 fn column_color(theme: &Theme, column: usize, width: usize) -> Rgb {
     // How far across the banner this column is: 0.0 at the left, 1.0 at the right.
     // (`width.max(2) - 1` is never 0, so this never divides by zero.)
     let t = column as f32 / (width.max(2) - 1) as f32;
-    theme.accent.lerp(theme.event, t)
+    theme.accent.lerp(theme.banner_end, t)
 }
 
 #[cfg(test)]
@@ -130,14 +130,19 @@ mod tests {
     }
 
     #[test]
-    fn gradient_runs_from_the_accent_slot_to_the_event_slot() {
+    fn gradient_runs_from_the_accent_slot_to_the_banner_end_slot() {
         use zerohour_core::theme::THEMES;
         for theme in THEMES.iter() {
             assert_eq!(column_color(theme, 0, 31), theme.accent, "{}", theme.name);
-            assert_eq!(column_color(theme, 30, 31), theme.event, "{}", theme.name);
+            assert_eq!(
+                column_color(theme, 30, 31),
+                theme.banner_end,
+                "{}",
+                theme.name
+            );
             assert_eq!(
                 column_color(theme, 15, 31),
-                theme.accent.lerp(theme.event, 0.5)
+                theme.accent.lerp(theme.banner_end, 0.5)
             );
         }
     }
