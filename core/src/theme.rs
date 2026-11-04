@@ -33,8 +33,8 @@ impl Rgb {
     /// The color a fraction `t` of the way from `self` to `other`: `t = 0.0` gives `self`,
     /// `1.0` gives `other`, `0.5` the midpoint. Values outside 0..=1 are clamped.
     ///
-    /// Used for gradients (the title banner fades from the `accent` slot to the `event` slot),
-    /// so in-between colors always come from the theme instead of being hard-coded.
+    /// Used for gradients (the title banner fades from the `accent` slot to the `banner_end`
+    /// slot), so in-between colors always come from the theme instead of being hard-coded.
     pub fn lerp(self, other: Rgb, t: f32) -> Rgb {
         let t = t.clamp(0.0, 1.0);
         // Mix one channel: start + (end - start) * t, rounded back to a whole 0-255 value.
@@ -61,8 +61,13 @@ pub struct Theme {
     pub muted: Rgb,
     /// Box borders.
     pub border: Rgb,
-    /// Highlights: the header, key hints, focused form field.
+    /// Highlights: the header, key hints, focused form field. Also the left end of the title
+    /// banner's gradient.
     pub accent: Rgb,
+    /// The right end of the title banner's gradient (the theme's orange, or yellow where the
+    /// accent is already orange). A slot of its own, so the banner never depends on the
+    /// section colors.
+    pub banner_end: Rgb,
     /// Background of the selected row.
     pub selection: Rgb,
     /// The Tasks section color. Must differ clearly from `event`.
@@ -92,6 +97,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x859289),
         border: Rgb::hex(0x56635f),
         accent: Rgb::hex(0xa7c080),
+        banner_end: Rgb::hex(0xe69875),
         selection: Rgb::hex(0x475258),
         task: Rgb::hex(0x7fbbb3),
         event: Rgb::hex(0xd699b6),
@@ -107,6 +113,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x6272a4),
         border: Rgb::hex(0x6272a4),
         accent: Rgb::hex(0xbd93f9),
+        banner_end: Rgb::hex(0xffb86c),
         selection: Rgb::hex(0x44475a),
         task: Rgb::hex(0x8be9fd),
         event: Rgb::hex(0xff79c6),
@@ -122,6 +129,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x928374),
         border: Rgb::hex(0x665c54),
         accent: Rgb::hex(0xfe8019),
+        banner_end: Rgb::hex(0xfabd2f), // yellow: Gruvbox's accent is already orange
         selection: Rgb::hex(0x504945),
         task: Rgb::hex(0x83a598),
         event: Rgb::hex(0xd3869b),
@@ -137,6 +145,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x7f849c),
         border: Rgb::hex(0x585b70),
         accent: Rgb::hex(0xcba6f7),
+        banner_end: Rgb::hex(0xfab387),
         selection: Rgb::hex(0x45475a),
         task: Rgb::hex(0x89b4fa),
         event: Rgb::hex(0xf5c2e7),
@@ -152,6 +161,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x7b88a1),
         border: Rgb::hex(0x4c566a),
         accent: Rgb::hex(0x81a1c1),
+        banner_end: Rgb::hex(0xd08770),
         selection: Rgb::hex(0x434c5e),
         task: Rgb::hex(0x88c0d0),
         event: Rgb::hex(0xb48ead),
@@ -167,6 +177,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x657b83),
         border: Rgb::hex(0x586e75),
         accent: Rgb::hex(0x268bd2),
+        banner_end: Rgb::hex(0xcb4b16),
         selection: Rgb::hex(0x073642),
         task: Rgb::hex(0x2aa198),
         event: Rgb::hex(0xd33682),
@@ -182,6 +193,7 @@ pub const THEMES: &[Theme] = &[
         muted: Rgb::hex(0x565f89),
         border: Rgb::hex(0x3b4261),
         accent: Rgb::hex(0x7aa2f7),
+        banner_end: Rgb::hex(0xff9e64),
         selection: Rgb::hex(0x283457),
         task: Rgb::hex(0x7dcfff),
         event: Rgb::hex(0xbb9af7),
@@ -216,6 +228,7 @@ pub enum Slot {
     Muted,
     Border,
     Accent,
+    BannerEnd,
     Selection,
     Task,
     Event,
@@ -226,12 +239,13 @@ pub enum Slot {
 
 impl Slot {
     /// Every slot, in the same order as the fields of [`Theme`] (handy for swatches and tests).
-    pub const ALL: [Slot; 11] = [
+    pub const ALL: [Slot; 12] = [
         Slot::Bg,
         Slot::Fg,
         Slot::Muted,
         Slot::Border,
         Slot::Accent,
+        Slot::BannerEnd,
         Slot::Selection,
         Slot::Task,
         Slot::Event,
@@ -252,6 +266,7 @@ impl Theme {
             Slot::Muted => self.muted,
             Slot::Border => self.border,
             Slot::Accent => self.accent,
+            Slot::BannerEnd => self.banner_end,
             Slot::Selection => self.selection,
             Slot::Task => self.task,
             Slot::Event => self.event,
@@ -335,6 +350,21 @@ mod tests {
     }
 
     #[test]
+    fn banner_gradient_ends_differ_in_every_theme() {
+        // Equal ends would draw the banner in one flat color (Gruvbox's accent is already
+        // orange, which is why its banner_end is yellow). 60 is lower than the section-color
+        // threshold: the ends only need to make a visible fade, and Gruvbox's orange-to-yellow
+        // (87) is the closest pair.
+        for t in THEMES {
+            assert!(
+                distance(t.accent, t.banner_end) > 60,
+                "{}: banner gradient ends are too similar",
+                t.name
+            );
+        }
+    }
+
+    #[test]
     fn text_stands_out_from_background_in_every_theme() {
         for t in THEMES {
             assert!(distance(t.fg, t.bg) > 200, "{}: fg too close to bg", t.name);
@@ -356,6 +386,7 @@ mod tests {
         assert_eq!(t.slot(Slot::Bg), t.bg);
         assert_eq!(t.slot(Slot::Task), t.task);
         assert_eq!(t.slot(Slot::Danger), t.danger);
+        assert_eq!(t.slot(Slot::BannerEnd), t.banner_end);
         // Every slot is listed once in ALL.
         let seen: std::collections::HashSet<Slot> = Slot::ALL.into_iter().collect();
         assert_eq!(seen.len(), Slot::ALL.len());
