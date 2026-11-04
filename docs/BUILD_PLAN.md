@@ -163,14 +163,16 @@ Stats functions take the data and `today` as inputs and return plain structs, so
 
 Code NEVER uses raw colors. It uses named slots:
 
-`bg`, `fg`, `muted`, `border`, `accent`, `selection`, `task`, `event`, `ok`, `warn`, `danger`
+`bg`, `fg`, `muted`, `border`, `accent`, `banner_end`, `selection`, `task`, `event`, `ok`, `warn`, `danger`
+
+(`banner_end` is the right end of the title banner's gradient, which starts at `accent`.)
 
 Each theme is a table filling those slots with RGB values. Built-in themes: **Everforest** (default, owner's favorite), Dracula, Gruvbox, Catppuccin (Mocha), Nord, Solarized (dark), Tokyo Night.
 
 - Theme choice is saved in the settings table and applied instantly when changed.
 - Keep palettes in one data structure in `core` so the Android app can reuse them.
 - Adding a theme later must mean adding ONE entry, nothing else.
-- Task section color and Event section color must be clearly different in every theme. Also use markers (`☐` for tasks, `◷` for events) so color is never the only distinction.
+- Task section color and Event section color must be clearly different in every theme, and the Event color clearly different from `danger` (overdue, high priority). Also use markers (`☐` for tasks, `◷` for events) so color is never the only distinction.
 
 ---
 
