@@ -131,7 +131,7 @@ pub struct App {
     pub now: NaiveDateTime,
     /// 12-hour ("2:00 PM", the default) or 24-hour ("14:00") times; `T` switches.
     pub time_format: TimeFormat,
-    /// Open tasks, sorted: highest priority first, then soonest due date.
+    /// Open tasks, sorted by core: next due first (overdue on top), then time, priority, age.
     pub tasks: Vec<Item>,
     /// Visible events, sorted by days remaining.
     pub events: Vec<EventRow>,

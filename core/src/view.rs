@@ -49,8 +49,13 @@ impl Label {
 /// The tasks to list: open (not completed) tasks only, sorted for the screen.
 ///
 /// Completed tasks stay in the database as history (and count in the stats), but aren't listed.
-/// Order: highest priority first; then soonest due date (no date last); on the same day, timed
-/// tasks first, earliest first; then by title, ignoring upper/lower case.
+///
+/// Order, so the next task due is at the top:
+/// 1. due date, soonest first, no date last. Overdue tasks need no rule of their own: they are
+///    exactly the tasks dated before today, so they come first, the longest overdue on top;
+/// 2. on the same day, timed tasks first, earliest first;
+/// 3. on the same date and time, highest priority first;
+/// 4. then the oldest task first (when it was created).
 pub fn open_tasks(items: &[Item]) -> Vec<Item> {
     let mut tasks: Vec<Item> = items
         .iter()
@@ -58,14 +63,13 @@ pub fn open_tasks(items: &[Item]) -> Vec<Item> {
         .cloned()
         .collect();
     // `sort_by` takes a function comparing two items. `then_with` only looks at the next rule
-    // when the previous one is a tie. Rust's sort is *stable*: items that compare equal keep
-    // the order they came in (the database's creation order).
+    // when the previous one is a tie. In the priority rule `b` and `a` are swapped on purpose:
+    // that reverses the order, so High (the largest) comes first.
     tasks.sort_by(|a, b| {
-        b.priority
-            .cmp(&a.priority)
-            .then_with(|| some_first(a.date, b.date))
+        some_first(a.date, b.date)
             .then_with(|| some_first(a.due_time, b.due_time))
-            .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+            .then_with(|| b.priority.cmp(&a.priority))
+            .then_with(|| a.created_at.cmp(&b.created_at))
     });
     tasks
 }
@@ -359,33 +363,78 @@ mod tests {
         tasks.iter().map(|t| t.title.as_str()).collect()
     }
 
+    /// `item` with its creation time set to `minute` minutes after a fixed moment, so tests can
+    /// say which of two tasks is older without depending on the clock.
+    fn created(mut item: Item, minute: i64) -> Item {
+        let base = NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        item.created_at = base + TimeDelta::minutes(minute);
+        item
+    }
+
     #[test]
-    fn tasks_sort_by_priority_then_date_then_time_then_title() {
-        let mut done = task("done", Some(0), None, Priority::High);
+    fn tasks_sort_by_date_then_time_then_priority_then_creation() {
+        let mut done = task("done", Some(-3), None, Priority::High);
         done.completed_at = Some(Utc::now());
         let items = vec![
-            task("low soon", Some(0), None, Priority::Low),
+            task("low no date", None, None, Priority::Low),
             task("high no date", None, None, Priority::High),
             task("high later", Some(5), None, Priority::High),
+            task("low untimed today", Some(0), None, Priority::Low),
             task("high untimed today", Some(0), None, Priority::High),
+            task("low 9am today", Some(0), Some((9, 0)), Priority::Low),
+            task("low 8am today", Some(0), Some((8, 0)), Priority::Low),
             task("high 9am today", Some(0), Some((9, 0)), Priority::High),
-            task("high 8am today", Some(0), Some((8, 0)), Priority::High),
-            task("B same", Some(2), None, Priority::Medium),
-            task("a same", Some(2), None, Priority::Medium),
+            task("low 1d overdue", Some(-1), None, Priority::Low),
+            task("high 1d overdue", Some(-1), None, Priority::High),
+            task("medium 4d overdue", Some(-4), None, Priority::Medium),
             done,
             event("not a task", 3, false),
         ];
         assert_eq!(
             titles(&open_tasks(&items)),
             [
-                "high 8am today",
+                // Overdue first, the longest overdue on top (no special rule: earliest date).
+                "medium 4d overdue",
+                "high 1d overdue",
+                "low 1d overdue",
+                // Today: timed tasks first by time; at the same time, High before Low.
+                "low 8am today",
                 "high 9am today",
+                "low 9am today",
+                // Then today's untimed tasks, by priority.
                 "high untimed today",
+                "low untimed today",
                 "high later",
+                // No date last, by priority.
                 "high no date",
-                "a same",
-                "B same",
-                "low soon",
+                "low no date",
+            ]
+        );
+    }
+
+    #[test]
+    fn tasks_with_the_same_date_time_and_priority_keep_the_oldest_first() {
+        // Listed newest first (and titled out of alphabetical order) on purpose, so neither
+        // the input order nor the title can be what puts them right.
+        let items = vec![
+            created(task("a newest", Some(2), None, Priority::Medium), 30),
+            created(task("c middle", Some(2), None, Priority::Medium), 20),
+            created(task("b oldest", Some(2), None, Priority::Medium), 10),
+            created(task("z undated newer", None, None, Priority::Low), 50),
+            created(task("y undated older", None, None, Priority::Low), 40),
+        ];
+        assert_eq!(
+            titles(&open_tasks(&items)),
+            [
+                "b oldest",
+                "c middle",
+                "a newest",
+                "y undated older",
+                "z undated newer"
             ]
         );
     }

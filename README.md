@@ -32,7 +32,7 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 
 ![The Tasks section: tasks with priority markers and due dates, an overdue task in red, a task due later today with a set time and the hours remaining, repeating tasks marked with a circular arrow, and a task with no date](docs/screenshots/tasks.png)
 
-*Tasks, sorted by priority (↑ high, ● medium, ↓ low) and then due date. An overdue task is marked ⚠ and shown in red; a task due later today shows its time and the hours remaining; a task due later in the week shows its time and the days remaining; repeating tasks are marked ↻. A task without a due date simply has no date.*
+*Tasks, the next one due at the top: overdue first, then by due date and time, then by priority (↑ high, ● medium, ↓ low), with undated tasks last. An overdue task is marked ⚠ and shown in red; a task due later today shows its time and the hours remaining; a task due later in the week shows its time and the days remaining; repeating tasks are marked ↻. A task without a due date simply has no date.*
 
 ![The Events section: events with their dates and day countdowns, some marked as repeating monthly or yearly](docs/screenshots/events.png)
 
