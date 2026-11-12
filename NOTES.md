@@ -764,3 +764,37 @@ re-pin on their own.
 - **Title:** Run only the theme tests
   **Command:** `cargo test -p zerohour-core theme`
   **When:** after changing any color in `core/src/theme.rs`.
+
+## Next due on top, blue low priority (done 2026-11-12)
+
+Branch `feature/sort-and-blue`. No migration, no sync change: the order and the colors are code,
+not data.
+
+### What changed
+
+| Where | What it does |
+|---|---|
+| `core/src/view.rs` `open_tasks` | New order: due date (no date last) → due time (timed first) → priority (High first) → `created_at` (oldest first). Overdue tasks are simply the earliest dates, so they need no rule of their own. |
+| `core/src/view.rs` `priority_slot` | Low is `Slot::Info` instead of `Slot::Muted`. |
+| `core/src/theme.rs` | A new slot, `info` (`Slot::Info`): each theme's blue. Everforest `#7fbbb3`, Dracula `#8be9fd` (cyan; Dracula has no blue), Gruvbox `#83a598`, Catppuccin `#89b4fa`, Nord `#81a1c1`, Solarized `#268bd2`, Tokyo Night `#7aa2f7`. |
+| `core/src/theme.rs` tests | Info vs warn and info vs danger must each score over 100. |
+| `tui/src/ui/stats.rs` | "By priority" asks `view::priority_slot` instead of naming its own slots. |
+
+### Rules worth knowing
+
+- **The title is no longer a tie-break.** Two tasks with the same date, time and priority are listed
+  oldest first, so a new task goes below the old ones instead of jumping in alphabetically.
+- The overdue digest (`reminders.rs`) uses `open_tasks`, so its body lists the longest overdue first.
+- In Nord, Solarized and Tokyo Night the blue is the same color as the accent: they have one blue.
+
+### Android
+
+After re-pinning core: `ColorSlot` gains `Info` and `ThemePalette` gains `info` in the FFI, plus the
+Kotlin colour lookup. The new order needs no Android code; the FFI test that expected the demo's
+first task to be High needs updating.
+
+### Save to your personal notes
+
+- **Title:** Run only the task-order tests
+  **Command:** `cargo test -p zerohour-core tasks_`
+  **When:** after changing how the task list is sorted.

@@ -68,6 +68,13 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Changed
 
+- **Task order**: the next task due is at the top. Overdue tasks come first (the longest overdue
+  on top), then by due date and time (on the same day, tasks with a time first), then by priority,
+  then the oldest first; tasks without a date are last. Previously priority came first. The
+  overdue reminder digest lists its tasks in the same order.
+- **Low priority is blue**: its marker and name use each theme's blue (Dracula's cyan) instead of
+  the muted gray, in the task list and in the Stats "By priority" line. High and Medium are
+  unchanged. Themes have a new `info` color for it.
 - **Events colors**: the Events section (its box, markers and countdowns more than a week away) is
   no longer pink. Everforest, Dracula, Gruvbox, Catppuccin, Nord and Solarized use a soft red that
   stays clearly apart from the red of overdue tasks and High priority; Tokyo Night keeps its
