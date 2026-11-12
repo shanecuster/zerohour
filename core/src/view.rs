@@ -195,13 +195,13 @@ pub fn task_title_slot(task: &Item, now: NaiveDateTime) -> Slot {
     }
 }
 
-/// The color slot for a priority (its icon and its name): High = danger, Medium = warn,
-/// Low = muted.
+/// The color slot for a priority (its icon and its name, in the list and in the stats):
+/// High = danger, Medium = warn, Low = info (the theme's blue).
 pub fn priority_slot(priority: Priority) -> Slot {
     match priority {
         Priority::High => Slot::Danger,
         Priority::Medium => Slot::Warn,
-        Priority::Low => Slot::Muted,
+        Priority::Low => Slot::Info,
     }
 }
 
@@ -756,6 +756,8 @@ mod tests {
         assert_eq!(task_title(&t, IconMode::Ascii), "Report ~");
         assert_eq!(repeat_text(&t, IconMode::Unicode), "↻ daily");
         assert_eq!(priority_slot(Priority::High), Slot::Danger);
+        assert_eq!(priority_slot(Priority::Medium), Slot::Warn);
+        assert_eq!(priority_slot(Priority::Low), Slot::Info);
         assert_eq!(
             task_title_slot(&task("x", Some(-1), None, Priority::Low), now()),
             Slot::Danger

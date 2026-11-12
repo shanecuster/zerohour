@@ -81,6 +81,10 @@ pub struct Theme {
     pub warn: Rgb,
     /// Problems: overdue, high priority, delete confirmations. Must differ clearly from `event`.
     pub danger: Rgb,
+    /// Calm information: low priority. The theme's own blue (Dracula, which has none, uses its
+    /// cyan). Must differ clearly from `warn` and `danger`, so a low-priority marker never
+    /// reads as medium or high.
+    pub info: Rgb,
 }
 
 /// The default theme's name (the owner's favorite).
@@ -105,6 +109,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0xa7c080),
         warn: Rgb::hex(0xdbbc7f),
         danger: Rgb::hex(0xe67e80),
+        info: Rgb::hex(0x7fbbb3), // blue
     },
     // https://draculatheme.com/contribute
     Theme {
@@ -121,6 +126,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0x50fa7b),
         warn: Rgb::hex(0xf1fa8c),
         danger: Rgb::hex(0xff5555),
+        info: Rgb::hex(0x8be9fd), // cyan: Dracula has no blue
     },
     // https://github.com/morhetz/gruvbox (dark)
     Theme {
@@ -137,6 +143,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0xb8bb26),
         warn: Rgb::hex(0xfabd2f),
         danger: Rgb::hex(0xfb4934),
+        info: Rgb::hex(0x83a598), // blue
     },
     // https://catppuccin.com/palette (Mocha flavor)
     Theme {
@@ -153,6 +160,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0xa6e3a1),
         warn: Rgb::hex(0xf9e2af),
         danger: Rgb::hex(0xf38ba8),
+        info: Rgb::hex(0x89b4fa), // blue
     },
     // https://www.nordtheme.com/docs/colors-and-palettes
     Theme {
@@ -169,6 +177,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0xa3be8c),
         warn: Rgb::hex(0xebcb8b),
         danger: Rgb::hex(0xbf616a),
+        info: Rgb::hex(0x81a1c1), // frost blue, the same as its accent
     },
     // https://ethanschoonover.com/solarized/ (dark)
     Theme {
@@ -185,6 +194,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0x859900),
         warn: Rgb::hex(0xb58900),
         danger: Rgb::hex(0xdc322f),
+        info: Rgb::hex(0x268bd2), // blue, the same as its accent
     },
     // https://github.com/folke/tokyonight.nvim (night)
     Theme {
@@ -201,6 +211,7 @@ pub const THEMES: &[Theme] = &[
         ok: Rgb::hex(0x9ece6a),
         warn: Rgb::hex(0xe0af68),
         danger: Rgb::hex(0xf7768e),
+        info: Rgb::hex(0x7aa2f7), // blue, the same as its accent
     },
 ];
 
@@ -236,11 +247,12 @@ pub enum Slot {
     Ok,
     Warn,
     Danger,
+    Info,
 }
 
 impl Slot {
     /// Every slot, in the same order as the fields of [`Theme`] (handy for swatches and tests).
-    pub const ALL: [Slot; 12] = [
+    pub const ALL: [Slot; 13] = [
         Slot::Bg,
         Slot::Fg,
         Slot::Muted,
@@ -253,6 +265,7 @@ impl Slot {
         Slot::Ok,
         Slot::Warn,
         Slot::Danger,
+        Slot::Info,
     ];
 }
 
@@ -274,6 +287,7 @@ impl Theme {
             Slot::Ok => self.ok,
             Slot::Warn => self.warn,
             Slot::Danger => self.danger,
+            Slot::Info => self.info,
         }
     }
 }
@@ -364,6 +378,24 @@ mod tests {
     }
 
     #[test]
+    fn info_differs_from_warn_and_danger_in_every_theme() {
+        // Info colors the low-priority marker; warn and danger color medium and high. The three
+        // must never be mistaken for one another.
+        for t in THEMES {
+            assert!(
+                distance(t.info, t.warn) > 100,
+                "{}: info and warn too similar",
+                t.name
+            );
+            assert!(
+                distance(t.info, t.danger) > 100,
+                "{}: info and danger too similar",
+                t.name
+            );
+        }
+    }
+
+    #[test]
     fn banner_gradient_ends_differ_in_every_theme() {
         // Equal ends would draw the banner in one flat color (Gruvbox's accent is already
         // orange, which is why its banner_end is yellow). 60 is lower than the section-color
@@ -401,6 +433,7 @@ mod tests {
         assert_eq!(t.slot(Slot::Task), t.task);
         assert_eq!(t.slot(Slot::Danger), t.danger);
         assert_eq!(t.slot(Slot::BannerEnd), t.banner_end);
+        assert_eq!(t.slot(Slot::Info), t.info);
         // Every slot is listed once in ALL.
         let seen: std::collections::HashSet<Slot> = Slot::ALL.into_iter().collect();
         assert_eq!(seen.len(), Slot::ALL.len());

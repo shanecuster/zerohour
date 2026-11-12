@@ -11,6 +11,7 @@ use ratatui::widgets::{Bar, BarChart, BarGroup, Block, BorderType, Paragraph};
 use zerohour_core::icons::{Icon, IconMode, priority_icon};
 use zerohour_core::model::Priority;
 use zerohour_core::theme::{Rgb, Theme};
+use zerohour_core::view;
 
 use super::{NARROW_WIDTH, color, screen_block};
 use crate::app::App;
@@ -182,11 +183,14 @@ fn draw_priorities(frame: &mut Frame, area: Rect, app: &App, mode: IconMode) {
         " By priority  ",
         Style::new().fg(color(theme.muted)),
     )];
-    for (priority, count, slot) in [
-        (Priority::High, p.high, theme.danger),
-        (Priority::Medium, p.medium, theme.warn),
-        (Priority::Low, p.low, theme.muted),
+    // Each priority's color comes from core (`view::priority_slot`), the same rule the task
+    // list uses, so the two can never disagree (Low is the theme's `info` blue).
+    for (priority, count) in [
+        (Priority::High, p.high),
+        (Priority::Medium, p.medium),
+        (Priority::Low, p.low),
     ] {
+        let slot = theme.slot(view::priority_slot(priority));
         spans.push(Span::styled(
             format!(
                 "{} {} ",

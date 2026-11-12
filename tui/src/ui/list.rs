@@ -364,7 +364,8 @@ fn selection_style(theme: &Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Color for a priority (core decides the slot: High = danger, Medium = warn, Low = muted).
+/// Color for a priority (core decides the slot: High = danger, Medium = warn, Low = info, the
+/// theme's blue).
 fn priority_color(priority: Priority, theme: &Theme) -> Color {
     color(theme.slot(view::priority_slot(priority)))
 }
