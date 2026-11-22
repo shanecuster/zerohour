@@ -868,3 +868,38 @@ event rows; Stop/Resume on the edit screen. The scheduler needs no change.
 - **Title:** Run only the range and reminder tests
   **Command:** `cargo test -p zerohour-core range` and `cargo test -p zerohour-core end_`
   **When:** after changing ranges, the planner or the end-date row.
+
+## Undo for Done and delete (done 2026-11-22)
+
+### What changed, in plain words
+
+Completing a task or deleting an item can now be taken back with `u`, as long as the status line
+still shows "· u undo" (until the next key) and the change hasn't synced yet. Undoing a Done reopens
+the task, removes its completion (so the stats are exactly as before) and removes the next instance
+a repeating task got. Core does the work (`Db::undo_complete`, `Db::undo_delete`), so the Android
+app gets the same rules.
+
+### Rules worth knowing
+
+- **Why only before a sync:** a delete and a completion are sticky in `sync::merge`, and completion
+  entries are add-only on the server. Once the server (or another device) has the change, taking it
+  back here would be undone by the next sync. Before that, nothing outside this database knows about
+  it, so undo can simply put things back: no new field, no migration, no sync-format change, and
+  older builds are unaffected.
+- **How core knows:** `sync_docs` (every database has it, with or without the sync feature) records
+  which version of each item sync last pushed or pulled. If that's the current, deleted or completed
+  version, or the completion entry or next instance is there at all, undo refuses: "Already synced".
+- **Changed since:** if the next instance was edited, completed or deleted, undo refuses rather than
+  throw that away.
+- **Restoring later** (a "Recently deleted" list that works after a sync) needs a sync-rule change and
+  is planned as its own release.
+
+### Save to your personal notes
+
+- **Title:** Undo a zerohour Done or delete
+  **Command:** `u` right after (while the status line says "· u undo")
+  **When:** you completed or deleted the wrong item. Works until the next key and only before a sync.
+
+- **Title:** Run only the undo tests
+  **Command:** `cargo test -p zerohour-core undo` and `cargo test -p zerohour u_`
+  **When:** after changing completion, delete or undo.

@@ -20,7 +20,7 @@ use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
 use zerohour_core::calendar::add_days;
 use zerohour_core::clock::TimeFormat;
-use zerohour_core::db::{Db, settings_keys};
+use zerohour_core::db::{Db, UndoOutcome, settings_keys};
 use zerohour_core::form::FormData;
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
@@ -122,6 +122,18 @@ pub struct Status {
     pub is_error: bool,
 }
 
+/// What `u` can take back: the last Done or delete, offered in the status line until the next
+/// key (see [`App::undo`]). Core decides whether it still can: only while the change hasn't
+/// synced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndoOffer {
+    /// A delete of the item with this id and title.
+    Delete { id: String, title: String },
+    /// A Done on the task with this id and title (for a repeating task, its next instance
+    /// goes too).
+    Complete { id: String, title: String },
+}
+
 /// The whole application state.
 pub struct App {
     /// Where everything is stored.
@@ -151,6 +163,9 @@ pub struct App {
     /// Statistics, recomputed on every refresh.
     pub stats: Stats,
     pub status: Option<Status>,
+    /// The Done or delete the status line offers to undo with `u`, if any. Cleared with the
+    /// status message, so it only lasts until the next key or message.
+    pub undo_offer: Option<UndoOffer>,
     /// Also show one-off events whose date has passed (toggled with `p`).
     pub show_passed: bool,
     /// Split 50/50 or fit-to-content (toggled with `v`, saved in settings).
@@ -223,6 +238,7 @@ impl App {
             icon_mode,
             stats: Stats::default(),
             status: None,
+            undo_offer: None,
             show_passed: false,
             layout,
             show_banner,
@@ -385,7 +401,8 @@ impl App {
                         self.overlay = Overlay::None;
                         self.db.delete_item(&id, Utc::now())?;
                         self.refresh()?;
-                        self.set_status(format!("Deleted \"{title}\""));
+                        self.set_status(format!("Deleted \"{title}\" · u undo"));
+                        self.undo_offer = Some(UndoOffer::Delete { id, title });
                     }
                     KeyCode::Char('n') | KeyCode::Esc => self.overlay = Overlay::None,
                     _ => {}
@@ -422,8 +439,15 @@ impl App {
 
         // No popup open: translate the key into an action for the current screen.
         if let Some(action) = main_action(key) {
-            self.status = None; // a new action clears the old message
-            self.handle_action(action)?;
+            // A new action clears the old message, and with it the offer to undo. `take()`
+            // moves the offer out (leaving `None`), so `u` can still use it.
+            let offer = self.undo_offer.take();
+            self.status = None;
+            if action == Action::Undo {
+                self.undo(offer)?;
+            } else {
+                self.handle_action(action)?;
+            }
         }
         Ok(())
     }
@@ -554,7 +578,8 @@ impl App {
             | Action::Theme
             | Action::CycleIcons
             | Action::Reminders
-            | Action::Help => {}
+            | Action::Help
+            | Action::Undo => {}
             #[cfg(feature = "sync")]
             Action::SyncSettings | Action::SyncNow => {}
         }
@@ -683,9 +708,46 @@ impl App {
                     due.push_str(&zerohour_core::clock::format_time(time, self.time_format));
                 }
                 self.select_id(&next.id);
-                self.set_status(format!("Done: \"{title}\". Next one due {due}"));
+                self.set_status(format!("Done: \"{title}\". Next one due {due} · u undo"));
             }
-            None => self.set_status(format!("Done: \"{title}\"")),
+            None => self.set_status(format!("Done: \"{title}\" · u undo")),
+        }
+        // Set after the message: `set_status` clears any older offer.
+        self.undo_offer = Some(UndoOffer::Complete { id, title });
+        Ok(())
+    }
+
+    /// The `u` key: takes back the Done or delete the status line offered (`offer`, moved out
+    /// of [`App::undo_offer`] by the key handler), through core's `undo_complete` /
+    /// `undo_delete`, and selects the item again. Core refuses once the change has synced
+    /// (sync would bring it back) or the item changed since; the status line says so and
+    /// nothing changes.
+    fn undo(&mut self, offer: Option<UndoOffer>) -> Result<()> {
+        let Some(offer) = offer else {
+            self.set_status("Nothing to undo");
+            return Ok(());
+        };
+        // Pattern matching on the offer gives each case's fields by name.
+        let (outcome, id, done) = match offer {
+            UndoOffer::Delete { id, title } => (
+                self.db.undo_delete(&id, Utc::now())?,
+                id,
+                format!("Restored \"{title}\""),
+            ),
+            UndoOffer::Complete { id, title } => (
+                self.db.undo_complete(&id, Utc::now())?,
+                id,
+                format!("Reopened \"{title}\""),
+            ),
+        };
+        self.refresh()?;
+        match outcome {
+            UndoOutcome::Undone => {
+                self.select_id(&id);
+                self.set_status(done);
+            }
+            UndoOutcome::AlreadySynced => self.set_status("Already synced: can't undo"),
+            UndoOutcome::ChangedSince => self.set_status("Changed since: nothing to undo"),
         }
         Ok(())
     }
@@ -948,7 +1010,9 @@ impl App {
     }
 
     /// Shows a normal status message. `impl Into<String>` accepts both `&str` and `String`.
+    /// A new message also ends any offer to undo (only the message on screen can offer one).
     fn set_status(&mut self, text: impl Into<String>) {
+        self.undo_offer = None;
         self.status = Some(Status {
             text: text.into(),
             is_error: false,
@@ -957,6 +1021,7 @@ impl App {
 
     /// Shows an error as a status message. `{:#}` prints the error with its causes.
     fn set_error(&mut self, error: impl Into<anyhow::Error>) {
+        self.undo_offer = None;
         self.status = Some(Status {
             text: format!("Error: {:#}", error.into()),
             is_error: true,
@@ -1082,5 +1147,73 @@ mod tests {
         app.handle_key(press(KeyCode::Esc));
         assert!(matches!(app.overlay, Overlay::None));
         assert!(ReminderSettings::load(&app.db).unwrap().enabled);
+    }
+
+    // ---- u: undo the last Done or delete ----------------------------------------------
+
+    /// An app with one weekly task ("water plants", due today) selected.
+    fn app_with_weekly_task() -> (App, String) {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        let mut task = Item::new(Kind::Task, "water plants", Utc::now());
+        task.date = Some(local_today());
+        task.repeat = zerohour_core::model::RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        let mut app = App::new(db, false, None).unwrap();
+        app.refresh().unwrap();
+        app.select_id(&task.id);
+        (app, task.id)
+    }
+
+    #[test]
+    fn u_undoes_a_done_including_the_next_instance_and_the_log() {
+        let (mut app, id) = app_with_weekly_task();
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert!(status(&app).ends_with(" · u undo"), "{}", status(&app));
+        assert_eq!(app.db.list_completions().unwrap().len(), 1);
+        assert_eq!(
+            app.db.list_items().unwrap().len(),
+            2,
+            "task and next instance"
+        );
+
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(status(&app), "Reopened \"water plants\"");
+        assert!(app.db.list_completions().unwrap().is_empty());
+        let items = app.db.list_items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].is_completed());
+        assert_eq!(app.selected_item().map(|i| i.id.clone()), Some(id));
+    }
+
+    #[test]
+    fn u_undoes_a_delete() {
+        let (mut app, id) = app_with_weekly_task();
+        app.handle_key(press(KeyCode::Char('d')));
+        app.handle_key(press(KeyCode::Char('y')));
+        assert_eq!(status(&app), "Deleted \"water plants\" · u undo");
+        assert!(app.tasks.is_empty());
+
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(status(&app), "Restored \"water plants\"");
+        assert!(!app.db.get_item(&id).unwrap().unwrap().deleted);
+        assert_eq!(app.tasks.len(), 1);
+    }
+
+    #[test]
+    fn the_offer_ends_with_the_next_key() {
+        let (mut app, _) = app_with_weekly_task();
+        app.handle_key(press(KeyCode::Char(' ')));
+        app.handle_key(press(KeyCode::Char('j'))); // any other action
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(status(&app), "Nothing to undo");
+        assert_eq!(app.db.list_completions().unwrap().len(), 1, "still done");
+    }
+
+    #[test]
+    fn u_with_nothing_done_says_so() {
+        let (mut app, _) = app_with_weekly_task();
+        app.handle_key(press(KeyCode::Char('u')));
+        assert_eq!(status(&app), "Nothing to undo");
     }
 }
