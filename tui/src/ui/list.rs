@@ -33,7 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell, Padding, Paragraph, Row, Table};
 use zerohour_core::icons::{Icon, priority_icon};
 use zerohour_core::model::Priority;
-use zerohour_core::theme::Theme;
+use zerohour_core::theme::{Slot, Theme};
 use zerohour_core::view::{self, EventRow, Label};
 
 use super::{NARROW_WIDTH, banner, color, screen_block, truncate, width_u16};
@@ -277,6 +277,23 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_
 
     let marker_w = width_u16(Icon::Event.get(mode));
     let mut fixed = vec![marker_w];
+    // The daily-reminder mark (bell / bell-slash) gets its own one-cell column, but only
+    // when some event has an end date (and so daily reminders), so a list without them
+    // looks exactly as before. `view::reminder_mark` decides the icon and color for both apps.
+    let marks: Vec<_> = app
+        .events
+        .iter()
+        .map(|row| view::reminder_mark(&row.item, app.today))
+        .collect();
+    let show_marks = marks.iter().any(Option::is_some);
+    if show_marks {
+        fixed.push(
+            width_u16(Icon::DailyReminder.get(mode))
+                .max(width_u16(Icon::RemindersStopped.get(mode))),
+        );
+    }
+    // The title column goes right after the marker (and the mark, if shown).
+    let title_index = fixed.len();
     if show_dates {
         fixed.push(DATE_WIDTH);
     }
@@ -289,19 +306,30 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_
     let rows: Vec<Row> = app
         .events
         .iter()
-        .map(|row: &EventRow| {
-            let countdown = view::countdown_label(row.days, narrow);
+        // `zip` walks two lists side by side: each row with its mark.
+        .zip(&marks)
+        .map(|(row, mark): (&EventRow, &Option<(Icon, Slot)>)| {
+            // "20 days", or "19 days left" / "last day!" while the event's range runs.
+            let countdown = view::event_label(row, narrow);
             let count_style = label_style(&countdown, theme);
-            let mut cells = vec![
-                Cell::from(Span::styled(
-                    Icon::Event.get(mode),
-                    Style::new().fg(color(theme.event)),
-                )),
-                Cell::from(Span::styled(
-                    truncate(&row.item.title, title_w),
-                    Style::new().fg(color(theme.fg)),
-                )),
-            ];
+            let mut cells = vec![Cell::from(Span::styled(
+                Icon::Event.get(mode),
+                Style::new().fg(color(theme.event)),
+            ))];
+            if show_marks {
+                // An empty cell for events without daily reminders keeps the columns aligned.
+                cells.push(match mark {
+                    Some((icon, slot)) => Cell::from(Span::styled(
+                        icon.get(mode),
+                        Style::new().fg(color(theme.slot(*slot))),
+                    )),
+                    None => Cell::from(""),
+                });
+            }
+            cells.push(Cell::from(Span::styled(
+                truncate(&row.item.title, title_w),
+                Style::new().fg(color(theme.fg)),
+            )));
             if show_dates {
                 cells.push(date_cell(row.target, app.today, theme));
             }
@@ -319,7 +347,7 @@ fn draw_events(frame: &mut Frame, area: Rect, app: &mut App, narrow: bool, show_
 
     let selected = app.selected.checked_sub(app.tasks.len());
     app.event_table.select(selected);
-    let table = Table::new(rows, constraints(&fixed, 1))
+    let table = Table::new(rows, constraints(&fixed, title_index))
         .block(block)
         .column_spacing(COLUMN_SPACING)
         .row_highlight_style(selection_style(theme));
@@ -539,6 +567,79 @@ mod column_tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// The Events box's rows as plain text, one string per event, at `width` columns.
+    fn event_lines(app: &mut App, width: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                draw(frame, area, app);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // Every event title is unique, so find each event's row by its title.
+        let rows: Vec<String> = (0..24)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        app.events
+            .iter()
+            .filter_map(|e| rows.iter().find(|r| r.contains(&e.item.title)).cloned())
+            .collect()
+    }
+
+    /// An app on Fri Oct 9 2026 with two one-off events: Halloween (in 22 days) and Concert
+    /// (in 5 days). With `ranged`, the Concert runs from 2 days ago through those 5 days (a
+    /// festival), stopped if `stopped`.
+    fn app_with_events(ranged: bool, stopped: bool) -> App {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        let today = now().date();
+        for (title, days) in [("Halloween", 22), ("Concert", 5)] {
+            let mut event = Item::new(Kind::Event, title, chrono::Utc::now());
+            event.date = Some(today + TimeDelta::days(days));
+            if title == "Concert" && ranged {
+                event.date = Some(today - TimeDelta::days(2));
+                event.end_date = Some(today + TimeDelta::days(days));
+                event.reminders_stopped_for = event.date.filter(|_| stopped);
+            }
+            db.insert_item(&event).unwrap();
+        }
+        let mut app = App::new(db, false, None).unwrap();
+        app.show_banner = false;
+        app.today = today;
+        app.refresh().unwrap();
+        app
+    }
+
+    #[test]
+    fn running_events_come_first_with_a_bell_and_days_left() {
+        // No end dates anywhere: no mark column (the layout is as before).
+        let before = event_lines(&mut app_with_events(false, false), 80);
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|r| !r.contains('♪') && !r.contains('⊘')));
+        assert!(before[0].contains("Concert") && before[0].contains("5 days"));
+
+        // The running Concert: first, the bright bell, "5 days left".
+        let mut app = app_with_events(true, false);
+        let lines = event_lines(&mut app, 80);
+        assert!(lines[0].contains("◷ ♪ Concert"), "{}", lines[0]);
+        assert!(lines[0].contains("5 days left"), "{}", lines[0]);
+        // The other event has an empty mark cell, so the titles still line up.
+        assert_eq!(
+            column_of_text(&lines[1], "Halloween"),
+            column_of_text(&lines[0], "Concert")
+        );
+
+        // Stopped: the bell-slash.
+        let lines = event_lines(&mut app_with_events(true, true), 80);
+        assert!(lines.iter().any(|r| r.contains("◷ ⊘ Concert")), "{lines:?}");
+    }
+
+    /// The character column where `text` starts in `line`.
+    fn column_of_text(line: &str, text: &str) -> usize {
+        line[..line.find(text).unwrap()].chars().count()
     }
 
     /// The screen column where `text` starts in `row`, if it's there in full.
