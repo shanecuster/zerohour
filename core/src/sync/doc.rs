@@ -33,26 +33,49 @@
 //!   silently as broken; as v3, it skips it as *newer* and says "update zerohour" instead.
 //!   Again only the items that use the rule are written as v3; everything else keeps the
 //!   version it had (1 or 2), so the other items still sync with older devices.
+//! - `v: 4`: used only by an unreleased test build of an earlier design (a "remind N days
+//!   before" window). This build still reads such a document, as a v3 one: its
+//!   `remind_days_before` field and its `reminders_stopped_for` (which meant something else
+//!   then) are ignored. Nothing writes v4 any more.
+//! - `v: 5`: adds ranges and daily reminders: `"end_date": "2026-12-24"` (an event's last day,
+//!   or the last day a repeating task repeats) and `"reminders_stopped_for": "2026-12-01"`
+//!   (the start of the event occurrence whose daily reminders were stopped), each written
+//!   only when set. The bump matters even though these are plain new fields: an older build
+//!   reading the item would ignore fields it doesn't know, and on its next edit write the
+//!   item back *without* them, silently wiping the range. As v5, older builds skip the item
+//!   instead. Only items that use either field are written as v5; it skips v4 so that a
+//!   stray v4 document can never be mistaken for the new format.
 //!
 //! Deletions use our own `"deleted": true`, not CouchDB's `_deleted`: a CouchDB deletion
 //! ("tombstone") throws away every field, including the `updated_at` that conflict
 //! resolution needs.
 
+use chrono::NaiveDate;
 use serde_json::{Value, json};
 
 use crate::db::{date_from_db, date_to_db, time_from_db, time_to_db, ts_from_db, ts_to_db};
 use crate::model::{Completion, Item, Kind, Priority, RepeatRule};
 
 /// The newest document format this build understands (and writes, when an item needs it).
-pub const DOC_VERSION: u64 = 3;
+pub const DOC_VERSION: u64 = 5;
+
+/// The version of the earlier, unreleased design (see the module docs): read, but its extra
+/// fields are ignored.
+const ABANDONED_V4: u64 = 4;
 
 /// The format version an item needs: the lowest one that can represent it, so older builds
 /// keep syncing everything they can read.
 ///
-/// - 3: an Nth-weekday repeat (whatever else it has).
+/// - 5: an end date or a stop marker (whatever else it has).
+/// - 3: an Nth-weekday repeat.
 /// - 2: a due time or a weekday-set repeat.
 /// - 1: everything else.
+///
+/// (4 is never written; see the module docs.)
 pub fn item_doc_version(item: &Item) -> u64 {
+    if item.end_date.is_some() || item.reminders_stopped_for.is_some() {
+        return 5;
+    }
     // `matches!(value, pattern)` is true if the value fits the pattern; `{ .. }` ignores
     // the fields.
     if matches!(item.repeat, RepeatRule::NthWeekday { .. }) {
@@ -127,6 +150,18 @@ pub fn item_to_doc(item: &Item, rev: Option<&str>) -> Value {
     if let (Some(time), Some(object)) = (item.due_time, doc.as_object_mut()) {
         object.insert("due_time".into(), Value::String(time_to_db(time)));
     }
+    // v5 fields, likewise only when set.
+    if let Some(object) = doc.as_object_mut() {
+        if let Some(end) = item.end_date {
+            object.insert("end_date".into(), Value::String(date_to_db(end)));
+        }
+        if let Some(start) = item.reminders_stopped_for {
+            object.insert(
+                "reminders_stopped_for".into(),
+                Value::String(date_to_db(start)),
+            );
+        }
+    }
     add_rev(&mut doc, rev);
     doc
 }
@@ -197,11 +232,21 @@ pub fn item_from_doc(doc: &Value) -> Result<Item, DocProblem> {
         created_at: timestamp(&text(doc, "created_at")?)?,
         updated_at: timestamp(&text(doc, "updated_at")?)?,
         deleted: flag(doc, "deleted")?,
-        // Not part of the document format yet (the next format version adds them): an item
-        // from the server arrives without an end date or a stop.
-        end_date: None,
-        reminders_stopped_for: None,
+        // Missing before v5, which means "no end" and "not stopped". In a v4 document (the
+        // abandoned design) they're ignored: `reminders_stopped_for` meant something else.
+        end_date: v5_date(doc, "end_date")?,
+        reminders_stopped_for: v5_date(doc, "reminders_stopped_for")?,
     })
+}
+
+/// An optional date field that only counts in a v5 (or later) document; see [`ABANDONED_V4`].
+fn v5_date(doc: &Value, field: &str) -> Result<Option<NaiveDate>, DocProblem> {
+    if doc.get("v").and_then(Value::as_u64) == Some(ABANDONED_V4) {
+        return Ok(None);
+    }
+    optional_text(doc, field)?
+        .map(|d| date_from_db(&d).map_err(|e| invalid(e.to_string())))
+        .transpose()
 }
 
 /// Reads a completion document. The `_id` must already be known to be a completion.
@@ -375,6 +420,89 @@ mod tests {
         // A v2 document is still fine for that build.
         item.repeat = RepeatRule::Weekdays(crate::model::DaySet::MON_THU);
         assert_eq!(check_version_up_to(&item_to_doc(&item, None), 2), Ok(()));
+    }
+
+    /// A yearly Dec 1–24 event, as the Advent of Cyber one.
+    fn advent(now: chrono::DateTime<Utc>) -> Item {
+        let mut item = Item::new(Kind::Event, "Advent of Cyber", now);
+        item.date = NaiveDate::from_ymd_opt(2026, 12, 1);
+        item.repeat = RepeatRule::Yearly;
+        item
+    }
+
+    #[test]
+    fn end_dates_and_stops_are_version_5_and_round_trip() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+        let mut event = advent(now);
+        // Without the new fields: v1, and the fields are absent (not null).
+        let doc = item_to_doc(&event, None);
+        assert_eq!(doc["v"], 1);
+        assert!(doc.get("end_date").is_none());
+        assert!(doc.get("reminders_stopped_for").is_none());
+
+        event.end_date = NaiveDate::from_ymd_opt(2026, 12, 24);
+        let doc = item_to_doc(&event, None);
+        assert_eq!(doc["v"], 5);
+        assert_eq!(doc["end_date"], "2026-12-24");
+        assert_eq!(item_from_doc(&doc).unwrap(), event);
+
+        event.reminders_stopped_for = NaiveDate::from_ymd_opt(2026, 12, 1);
+        let doc = item_to_doc(&event, None);
+        assert_eq!(doc["reminders_stopped_for"], "2026-12-01");
+        assert_eq!(item_from_doc(&doc).unwrap(), event);
+
+        // A repeating task with an "until" date is v5 too, even on top of a v3 repeat.
+        let mut task = Item::new(Kind::Task, "Advent of Cyber room", now);
+        task.date = NaiveDate::from_ymd_opt(2026, 12, 1);
+        task.repeat = RepeatRule::NthWeekday {
+            nth: crate::model::Ordinal::First,
+            weekday: chrono::Weekday::Mon,
+            month: None,
+        };
+        task.end_date = NaiveDate::from_ymd_opt(2027, 6, 30);
+        let doc = item_to_doc(&task, None);
+        assert_eq!(doc["v"], 5);
+        assert_eq!(item_from_doc(&doc).unwrap(), task);
+    }
+
+    #[test]
+    fn older_builds_skip_only_the_items_with_an_end_date() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+        let mut event = advent(now);
+        assert_eq!(check_version_up_to(&item_to_doc(&event, None), 3), Ok(()));
+        event.end_date = NaiveDate::from_ymd_opt(2026, 12, 24);
+        // A v3 build (today's phone) and the abandoned v4 test build both skip it as newer.
+        for older in [3, 4] {
+            assert_eq!(
+                check_version_up_to(&item_to_doc(&event, None), older),
+                Err(DocProblem::NewerVersion(5))
+            );
+        }
+    }
+
+    #[test]
+    fn a_stray_v4_document_is_read_with_its_old_fields_ignored() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+        let event = advent(now);
+        let mut doc = item_to_doc(&event, None);
+        doc["v"] = json!(4);
+        doc["remind_days_before"] = json!(23);
+        doc["reminders_stopped_for"] = json!("2026-12-24");
+        // Even a field named like a v5 one is not trusted in a v4 document.
+        doc["end_date"] = json!("2026-12-24");
+        assert_eq!(item_from_doc(&doc).unwrap(), event);
+    }
+
+    #[test]
+    fn a_malformed_end_date_is_reported_as_broken() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 22, 10, 0, 0).unwrap();
+        let mut event = advent(now);
+        event.end_date = NaiveDate::from_ymd_opt(2026, 12, 24);
+        for bad in [json!("Dec 24"), json!(24)] {
+            let mut doc = item_to_doc(&event, None);
+            doc["end_date"] = bad;
+            assert!(matches!(item_from_doc(&doc), Err(DocProblem::Invalid(_))));
+        }
     }
 
     #[test]

@@ -724,6 +724,31 @@ mod tests {
     }
 
     #[test]
+    fn an_end_date_and_a_stop_sync_as_a_version_5_document() {
+        let server = FakeCouch::new("zerohour");
+        let (mut laptop, mut phone) = (device(), device());
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", at(9));
+        event.date = Some(day(1));
+        event.end_date = Some(day(24));
+        event.repeat = RepeatRule::Yearly;
+        laptop.insert_item(&event).unwrap();
+        sync(&mut laptop, &server, at(9));
+        assert_eq!(server.doc(&item_doc_id(&event.id)).unwrap()["v"], 5);
+        sync(&mut phone, &server, at(10));
+        assert_eq!(phone.get_item(&event.id).unwrap().unwrap(), event);
+
+        // Stopping on the phone reaches the laptop.
+        let mut on_phone = phone.get_item(&event.id).unwrap().unwrap();
+        on_phone.reminders_stopped_for = Some(day(1));
+        phone.update_item(&mut on_phone, at(11)).unwrap();
+        sync(&mut phone, &server, at(11));
+        sync(&mut laptop, &server, at(12));
+        let on_laptop = laptop.get_item(&event.id).unwrap().unwrap();
+        assert_eq!(on_laptop.reminders_stopped_for, Some(day(1)));
+        assert_eq!(on_laptop.end_date, Some(day(24)));
+    }
+
+    #[test]
     fn foreign_newer_and_broken_documents_are_skipped() {
         let server = FakeCouch::new("zerohour");
         server.put(json!({ "_id": "_design/app", "views": {} }));
