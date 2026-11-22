@@ -798,3 +798,73 @@ first task to be High needs updating.
 - **Title:** Run only the task-order tests
   **Command:** `cargo test -p zerohour-core tasks_`
   **When:** after changing how the task list is sorted.
+
+## Events that run for days, and repeating tasks with an end (done 2026-11-22)
+
+Branch `feature/daily-reminder-range`, off master. It replaces the earlier "Remind N days" design
+(branches `feature/event-daily-reminders` and `feature/task-daily-reminders`, left as they are). An
+event can have an end date: it runs from its date through that day, with one reminder a day, and
+Space stops that for the year. A repeating task can have an "until" date. Core and the TUI are done;
+Android comes later.
+
+### What was built
+
+| Where | What it does |
+|---|---|
+| `core/src/db.rs` | Migration 5 kept exactly as the test build applied it (its `remind_days_before` column is unused, commented); migration 6 adds `end_date`. `stop_event_reminders(id, today, now)` marks the current range's first day; `resume_event_reminders`. A one-off series end in `complete_task`. |
+| `core/src/model.rs` | `Item::end_date`, `Item::reminders_stopped_for`. |
+| `core/src/sync/doc.rs` | `DOC_VERSION` 5: items with either field are `v: 5`. v4 is never written; a stray v4 document is read with its old fields ignored. |
+| `core/src/repeat.rs` | `EventRange`, `event_range` (the current range; month-stepped rules move the end by months, others by days), `event_target` counts to the start, then to the end; `within_series`. |
+| `core/src/view.rs` | `RunningDay`, running events sorted first, `event_label` / `running_label` ("19 days left", "last day!"), `tagline` ("day 5 of 24"), `reminder_mark`, and "↻ daily until Dec 24" in `task_title`. |
+| `core/src/reminders.rs` | `ReminderKind::Daily` ("Day 5 of 24 · 19 days left", "Last day"), `reminded_range`, `reminders_stopped`, `still_applies(item, today)`, `Reminder::last_day` and `Reminder::actions` (`ReminderActions`: None, Done, Stop, StopForYear, StopKeepRemove); the series end in the task loop. |
+| `core/src/form.rs` | `Field::EndDate` ("Ends on" / "Until"), `end_text`, `start_date`, `end_date`, the checks (`EndProblem`), `end_preview`, `FormInput::label` ("Starts"). |
+| `core/src/icons.rs` | `DailyReminder`, `RemindersStopped` (one cell even in ASCII). |
+| `tui/src/ui/calendar.rs` | `Calendar::with_earliest`, `allows`, crossed-out days, the "not before the start" note. |
+| `tui/src/ui/add.rs` | The row, typing, "(none)", Ctrl+D/F2 on it, `calendar_field`. |
+| `tui/src/ui/list.rs`, `banner.rs`, `app.rs`, `help.rs` | The running label and bell column, the banner, `Space` stop/resume with keep-or-remove. |
+
+**Tests:** 289 without sync and 354 with (master had 244 and 304). They cover the Dec 1–24 range and
+its roll-over, a range stored years ago, leap years (Feb 20–Mar 5, a Feb 29 start), a range across New
+Year, weekly and monthly ranges, the stop and next year's range, one-off and one-day ranges, the
+clock-change nights, the buttons, the 5→6 upgrade with a stray old value, v5 documents and older
+readers, a stray v4 document, the two-device stop through the fake CouchDB, the series end for tasks,
+every form check and preview, the picker's refusal, and the list, banner and Space.
+
+### Rules worth knowing
+
+- **Why migration 6, not a new migration 5:** a test build had already applied migration 5 to the real
+  database, so it can't change. Its unused column is harmless and documented.
+- **Why v5, not v4:** a test build may have pushed v4 documents of the old design; v5 can't be mistaken
+  for them.
+- **Ranges and the stop:** the stop names a range's first day, so it never needs clearing. Stopping
+  before a range starts skips the coming one. Saving without an end (or as a task) clears it.
+- **Repeating ranges can't overlap** (the form refuses a range that would still run when the event comes
+  round again), and a one-off range is at most a year.
+- **Relative end dates count from the start**: `12/24`, `+23`.
+- **Sync:** plain newest-wins. The desktop timer never syncs.
+- **A delete can't be undone** (Keep/Remove's "remove" is the normal delete).
+
+### Android (next, after the TUI is tested)
+
+Re-pin core to the merged commit (that runs migrations 5 and 6 on the phone, whatever it has). Then:
+`ReminderKind::Daily`, `Reminder::last_day` and `Reminder::actions` in the FFI's `PlannedReminder`,
+with the buttons taken from `actions` (Done; "Stop reminders"; "Stop for this year"; plus "Keep" /
+"Remove"); `still_applies(item_id)` replacing `isOpenTask` in `ReminderAlarmReceiver.show` and
+`ReminderNotifications.removeClosed` (otherwise every event reminder is dropped); `Field::EndDate`
+in `zerohour-ffi/src/form.rs` (exhaustive matches), `FormScreen.kt` with the date picker limited to
+the start, and `FormInput::label`; `RunningDay` / `event_label` / `tagline` / `reminder_mark` on the
+event rows; Stop/Resume on the edit screen. The scheduler needs no change.
+
+### Save to your personal notes
+
+- **Title:** A zerohour event that runs for days, with a daily reminder
+  **Command:** `e` on the event → *Ends on* `12/24` (or `F2` to pick) → `Enter`; `Space` on it stops them for the year
+  **When:** something that lasts a while every year, like Advent of Cyber (Dec 1–24).
+
+- **Title:** A repeating zerohour task that stops on a date
+  **Command:** `e` on the task → *Until* `12/24` → `Enter`
+  **When:** a daily (or weekly) task that only runs for a season.
+
+- **Title:** Run only the range and reminder tests
+  **Command:** `cargo test -p zerohour-core range` and `cargo test -p zerohour-core end_`
+  **When:** after changing ranges, the planner or the end-date row.

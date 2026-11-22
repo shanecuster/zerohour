@@ -262,6 +262,14 @@ pub fn next_instance_date(
     }
 }
 
+/// True if `date` is still part of a repeating task's series: on or before its end date
+/// ("daily until Dec 24"), or always when it has none. Completing a task makes no next
+/// instance past the end, and the planner reminds no later scheduled day past it.
+pub fn within_series(task: &Item, date: NaiveDate) -> bool {
+    // `is_none_or`: true for `None`, or for `Some(end)` where the closure says yes.
+    task.end_date.is_none_or(|end| date <= end)
+}
+
 /// The local date and time a task is due, if it has both a due date and a due time.
 /// (`?` on an `Option` returns `None` early if that part is missing.)
 pub fn due_datetime(item: &Item) -> Option<NaiveDateTime> {
@@ -296,10 +304,120 @@ pub fn days_until(date: NaiveDate, today: NaiveDate) -> i64 {
 ///
 /// Repeating events roll forward to their next occurrence on or after today automatically —
 /// nothing is stored or clicked. One-off events just show their stored date.
+///
+/// An event with an end date (see [`event_range`]) counts down to its first day until the
+/// range starts, then to its last day while it runs ("12 days left"), and a passed one-off
+/// one counts from its last day ("3d ago").
 pub fn event_target(item: &Item, today: NaiveDate) -> Option<NaiveDate> {
+    // `if let`: run the block only when there is a range, binding it to `range`.
+    if let Some(range) = event_range(item, today) {
+        return Some(if today < range.start {
+            range.start
+        } else {
+            range.end
+        });
+    }
     // `.map(|d| ...)` transforms the value inside an Option if there is one.
     // `|d| expr` is a closure: a small unnamed function taking `d`.
     item.date.map(|d| next_occurrence(item.repeat, d, today))
+}
+
+/// One occurrence of an event with an end date: its first and last day, both included.
+///
+/// `Copy` is fine here: it's just two dates, so passing it around by value costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventRange {
+    /// The first day (the event's date, or this occurrence of it).
+    pub start: NaiveDate,
+    /// The last day.
+    pub end: NaiveDate,
+}
+
+impl EventRange {
+    /// True if `day` is one of the range's days.
+    pub fn contains(self, day: NaiveDate) -> bool {
+        self.start <= day && day <= self.end
+    }
+
+    /// How many days the range has: Dec 1 to Dec 24 is 24.
+    pub fn len_days(self) -> i64 {
+        days_until(self.end, self.start) + 1
+    }
+
+    /// Which day of the range `day` is, counting from 1 (Dec 5 is day 5 of Dec 1–24).
+    pub fn day_number(self, day: NaiveDate) -> i64 {
+        days_until(day, self.start) + 1
+    }
+}
+
+/// The most occurrences [`event_range`] steps through to find the current range. It starts
+/// just before today, so two or three are normal; this only guards against a rule bug.
+const MAX_RANGE_STEPS: usize = 32;
+
+/// The range of an event with an end date that is current on `today`, or `None` for anything
+/// that isn't an event with both a date and an end date on or after it.
+///
+/// - **One-off:** always its stored range, even once it has passed (so it can show "3d ago").
+/// - **Repeating:** the first occurrence whose *last* day is today or later. So a running
+///   range stays current through its last day, and the day after it the next one is current.
+///   Each occurrence's start comes from the repeat rule, and its end moves along with it:
+///   - rules that step in months (monthly, yearly, every N months) move the end by the same
+///     number of months, so a yearly Dec 1–24 is Dec 1–24 every year, and Feb 20 to Mar 5
+///     stays Mar 5 in leap years too;
+///   - every other rule moves the end by the same number of days as the start (a Mon–Wed
+///     weekly range stays Mon–Wed).
+pub fn event_range(item: &Item, today: NaiveDate) -> Option<EventRange> {
+    if item.kind != Kind::Event {
+        return None;
+    }
+    // `?` on an Option: no date or no end date means no range.
+    let (start, end) = (item.date?, item.end_date?);
+    // Only stored data from a bug or a hand edit could have this; treat it as no range.
+    if end < start {
+        return None;
+    }
+    let stored = EventRange { start, end };
+    if !item.repeat.is_repeating() {
+        return Some(stored);
+    }
+    // Start looking one range-length before today (plus a few days, for a month-stepped end
+    // that a short month clamped to be a little shorter). An occurrence starting earlier than
+    // that must already be over.
+    let lookback = add_days(today, -(stored.len_days() + 3));
+    let mut occurrence = next_occurrence(item.repeat, start, lookback);
+    let mut range = stored;
+    for _ in 0..MAX_RANGE_STEPS {
+        range = EventRange {
+            start: occurrence,
+            end: moved_end(item.repeat, stored, occurrence),
+        };
+        if range.end >= today {
+            break;
+        }
+        let next = next_occurrence(item.repeat, start, add_days(occurrence, 1));
+        // A rule that doesn't move forward would loop forever; keep the last range instead.
+        if next <= occurrence {
+            break;
+        }
+        occurrence = next;
+    }
+    Some(range)
+}
+
+/// Where the stored range's end lands for an occurrence starting on `occurrence` (see
+/// [`event_range`]). `occurrence` is never before the stored start: occurrences are counted
+/// forward from it.
+fn moved_end(rule: RepeatRule, stored: EventRange, occurrence: NaiveDate) -> NaiveDate {
+    match step_of(rule) {
+        Some(Step::Months(_)) => {
+            // Whole months between the stored start and this occurrence, e.g. 12 per year.
+            let months = (occurrence.year() - stored.start.year()) * 12 + occurrence.month() as i32
+                - stored.start.month() as i32;
+            // `try_from` refuses a negative number; it can't be one (see above).
+            add_months(stored.end, u32::try_from(months).unwrap_or(0))
+        }
+        _ => add_days(stored.end, days_until(occurrence, stored.start)),
+    }
 }
 
 /// Should this event be shown on the main screen today?
@@ -432,6 +550,123 @@ mod tests {
         item.date = Some(date);
         item.repeat = repeat;
         item
+    }
+
+    // ---- event_range ---------------------------------------------------------------------
+
+    /// A yearly event from `start` through `end`.
+    fn ranged(start: NaiveDate, end: NaiveDate, repeat: RepeatRule) -> Item {
+        let mut item = event(start, repeat);
+        item.end_date = Some(end);
+        item
+    }
+
+    /// A range, briefly.
+    fn r(start: NaiveDate, end: NaiveDate) -> Option<EventRange> {
+        Some(EventRange { start, end })
+    }
+
+    #[test]
+    fn a_yearly_range_runs_through_its_last_day_then_moves_to_next_year() {
+        let advent = ranged(d(2026, 12, 1), d(2026, 12, 24), RepeatRule::Yearly);
+        let this_year = r(d(2026, 12, 1), d(2026, 12, 24));
+        assert_eq!(event_range(&advent, d(2026, 11, 22)), this_year);
+        assert_eq!(event_range(&advent, d(2026, 12, 1)), this_year);
+        assert_eq!(event_range(&advent, d(2026, 12, 24)), this_year);
+        assert_eq!(
+            event_range(&advent, d(2026, 12, 25)),
+            r(d(2027, 12, 1), d(2027, 12, 24))
+        );
+        // A date stored years ago still finds this year's range.
+        let old = ranged(d(2020, 12, 1), d(2020, 12, 24), RepeatRule::Yearly);
+        assert_eq!(event_range(&old, d(2026, 12, 10)), this_year);
+    }
+
+    #[test]
+    fn the_target_is_the_start_before_the_range_and_the_end_during_it() {
+        let advent = ranged(d(2026, 12, 1), d(2026, 12, 24), RepeatRule::Yearly);
+        assert_eq!(event_target(&advent, d(2026, 11, 22)), Some(d(2026, 12, 1)));
+        assert_eq!(event_target(&advent, d(2026, 12, 5)), Some(d(2026, 12, 24)));
+        assert_eq!(event_target(&advent, d(2026, 12, 25)), Some(d(2027, 12, 1)));
+        // A passed one-off range counts from its last day, and hides like any passed event.
+        let once = ranged(d(2026, 12, 1), d(2026, 12, 24), RepeatRule::None);
+        assert_eq!(event_target(&once, d(2026, 12, 27)), Some(d(2026, 12, 24)));
+        assert!(event_is_visible(&once, d(2026, 12, 24)));
+        assert!(!event_is_visible(&once, d(2026, 12, 25)));
+    }
+
+    #[test]
+    fn yearly_ranges_keep_their_calendar_dates_across_leap_years() {
+        // Feb 20 to Mar 5 in a leap year (2028) is Feb 20 to Mar 5 the next year too, not
+        // one day longer.
+        let late_feb = ranged(d(2028, 2, 20), d(2028, 3, 5), RepeatRule::Yearly);
+        assert_eq!(
+            event_range(&late_feb, d(2029, 1, 1)),
+            r(d(2029, 2, 20), d(2029, 3, 5))
+        );
+        // Starting on Feb 29: Feb 28 in other years, same end date.
+        let leap_day = ranged(d(2028, 2, 29), d(2028, 3, 2), RepeatRule::Yearly);
+        assert_eq!(
+            event_range(&leap_day, d(2029, 1, 1)),
+            r(d(2029, 2, 28), d(2029, 3, 2))
+        );
+    }
+
+    #[test]
+    fn a_range_across_new_year_stays_current_until_it_ends() {
+        let holidays = ranged(d(2026, 12, 20), d(2027, 1, 5), RepeatRule::Yearly);
+        assert_eq!(
+            event_range(&holidays, d(2027, 1, 3)),
+            r(d(2026, 12, 20), d(2027, 1, 5))
+        );
+        assert_eq!(
+            event_range(&holidays, d(2027, 1, 6)),
+            r(d(2027, 12, 20), d(2028, 1, 5))
+        );
+    }
+
+    #[test]
+    fn day_stepped_and_month_stepped_ranges_move_their_end_alike() {
+        // Mon Nov 23 to Wed Nov 25, weekly: the next one is Mon–Wed again.
+        let weekly = ranged(d(2026, 11, 23), d(2026, 11, 25), RepeatRule::Weekly);
+        assert_eq!(
+            event_range(&weekly, d(2026, 11, 26)),
+            r(d(2026, 11, 30), d(2026, 12, 2))
+        );
+        // Jan 30 to Feb 2, monthly: in February the start clamps to Feb 28, the end is Mar 2.
+        let monthly = ranged(d(2026, 1, 30), d(2026, 2, 2), RepeatRule::Monthly);
+        assert_eq!(
+            event_range(&monthly, d(2026, 2, 20)),
+            r(d(2026, 2, 28), d(2026, 3, 2))
+        );
+    }
+
+    #[test]
+    fn no_range_without_both_dates_in_order_or_for_a_task() {
+        let mut plain = event(d(2026, 12, 1), RepeatRule::Yearly);
+        assert_eq!(event_range(&plain, d(2026, 12, 5)), None);
+        plain.end_date = Some(d(2026, 11, 30));
+        assert_eq!(
+            event_range(&plain, d(2026, 12, 5)),
+            None,
+            "end before start"
+        );
+        let mut task = Item::new(Kind::Task, "Room", Utc::now());
+        task.date = Some(d(2026, 12, 1));
+        task.end_date = Some(d(2026, 12, 24));
+        assert_eq!(event_range(&task, d(2026, 12, 5)), None);
+    }
+
+    #[test]
+    fn range_counts() {
+        let range = EventRange {
+            start: d(2026, 12, 1),
+            end: d(2026, 12, 24),
+        };
+        assert_eq!(range.len_days(), 24);
+        assert_eq!(range.day_number(d(2026, 12, 5)), 5);
+        assert!(range.contains(d(2026, 12, 24)));
+        assert!(!range.contains(d(2026, 11, 30)));
     }
 
     // ---- next_occurrence ---------------------------------------------------------------

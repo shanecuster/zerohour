@@ -24,7 +24,9 @@ use chrono::{Datelike, Month, NaiveDate, NaiveTime, TimeDelta, Weekday};
 use crate::clock::{TimeFormat, format_time, parse_time_input};
 use crate::model::{DaySet, Item, Kind, Ordinal, Priority, RepeatRule, Unit};
 use crate::model::{month_label, weekday_label};
-use crate::repeat::{days_until, next_occurrence, parse_date_input, scheduled_on_or_after};
+use crate::repeat::{
+    EventRange, days_until, event_range, next_occurrence, parse_date_input, scheduled_on_or_after,
+};
 use crate::theme::Slot;
 
 /// The repeat options, in the order the form cycles through them.
@@ -131,6 +133,9 @@ pub enum Field {
     EveryN,
     EveryUnit,
     KeepAfterPass,
+    /// The last day: "Ends on" for an event (its range), "Until" for a repeating task (the
+    /// end of its series). Optional; empty means no end.
+    EndDate,
     Notes,
 }
 
@@ -152,6 +157,8 @@ impl Field {
             Field::EveryN => "Every",
             Field::EveryUnit => "Unit",
             Field::KeepAfterPass => "Keep after",
+            Field::EndDate if kind == Kind::Task => "Until",
+            Field::EndDate => "Ends on",
             Field::Notes => "Notes",
         }
     }
@@ -160,7 +167,12 @@ impl Field {
     pub fn is_text(self) -> bool {
         matches!(
             self,
-            Field::Title | Field::Date | Field::Time | Field::EveryN | Field::Notes
+            Field::Title
+                | Field::Date
+                | Field::Time
+                | Field::EveryN
+                | Field::EndDate
+                | Field::Notes
         )
     }
 
@@ -261,6 +273,9 @@ pub struct FormInput {
     pub month: Option<Month>,
     /// One-off events only: keep showing after the date passes.
     pub keep_after_pass: bool,
+    /// The end date as typed ("12/24", "+23"); empty = no end. Relative forms count from the
+    /// start date, not from today (see [`FormInput::end_date`]).
+    pub end_text: String,
     pub notes: String,
 }
 
@@ -284,6 +299,7 @@ impl Default for FormInput {
             weekday: Weekday::Mon,
             month: None,
             keep_after_pass: false,
+            end_text: String::new(),
             notes: String::new(),
         }
     }
@@ -307,6 +323,7 @@ impl FormInput {
                 .map(|t| format_time(t, time_format))
                 .unwrap_or_default(),
             keep_after_pass: item.keep_after_pass,
+            end_text: item.end_date.map(iso_date).unwrap_or_default(),
             notes: item.notes.clone().unwrap_or_default(),
             ..FormInput::default()
         };
@@ -367,8 +384,23 @@ impl FormInput {
         if self.kind == Kind::Event && self.repeat == RepeatChoice::None {
             fields.push(Field::KeepAfterPass);
         }
+        // The end date: always on an event (its range), only on a repeating task (a one-off
+        // task has no series to end).
+        if self.kind == Kind::Event || self.repeat != RepeatChoice::None {
+            fields.push(Field::EndDate);
+        }
         fields.push(Field::Notes);
         fields
+    }
+
+    /// The label for `field` in this form: like [`Field::label`], except that an event's date
+    /// reads "Starts" once it has an end date, so the two rows read as a range.
+    pub fn label(&self, field: Field) -> &'static str {
+        if field == Field::Date && self.kind == Kind::Event && !self.end_text.trim().is_empty() {
+            "Starts"
+        } else {
+            field.label(self.kind)
+        }
     }
 
     /// Picks a repeat choice. The presets fill in their days; "pick days" keeps whatever days
@@ -438,6 +470,7 @@ impl FormInput {
             | Field::Time
             | Field::Days
             | Field::EveryN
+            | Field::EndDate
             | Field::Notes => {}
         }
     }
@@ -462,6 +495,7 @@ impl FormInput {
             Field::Month => self.month.map_or("every month", month_label).to_string(),
             Field::Days => self.days.label(),
             Field::KeepAfterPass => if self.keep_after_pass { "yes" } else { "no" }.to_string(),
+            Field::EndDate => self.end_text.clone(),
         }
     }
 
@@ -476,6 +510,31 @@ impl FormInput {
     /// exactly what editing shows too.
     pub fn set_date(&mut self, date: NaiveDate) {
         self.date_text = iso_date(date);
+    }
+
+    /// Puts a picked date into the end-date field, in ISO form (see [`FormInput::set_date`]).
+    pub fn set_end_date(&mut self, date: NaiveDate) {
+        self.end_text = iso_date(date);
+    }
+
+    /// The start date as saving would store it, if it's readable yet: the typed date, moved
+    /// to the first scheduled day for weekday repeats (or that day from today, if empty).
+    /// The end date is checked against this, and the calendar picker starts here.
+    pub fn start_date(&self, today: NaiveDate) -> Option<NaiveDate> {
+        // `.ok()` turns an error into `None`: an unreadable date or rule is "not known yet".
+        let typed = parse_date_input(&self.date_text, today).ok()?;
+        let rule = self.repeat_rule().ok()?;
+        if lands_on_days(rule) {
+            Some(scheduled_on_or_after(rule, typed.unwrap_or(today)))
+        } else {
+            typed
+        }
+    }
+
+    /// The typed end date, read with `start` as "today": "12/24" is the first Dec 24 on or
+    /// after the start, "+23" is 23 days after it. `Ok(None)` when the field is empty.
+    pub fn end_date(&self, start: NaiveDate) -> Result<Option<NaiveDate>, String> {
+        parse_date_input(&self.end_text, start)
     }
 
     /// The repeat rule currently chosen, or an error message for a bad "every N" or an empty
@@ -545,6 +604,7 @@ impl FormInput {
         if due_time.is_some() && date.is_none() {
             return Err("A due time needs a due date.".to_string());
         }
+        let end_date = self.checked_end(date, repeat)?;
         let notes = self.notes.trim();
         Ok(FormData {
             editing: self.editing.clone(),
@@ -559,7 +619,38 @@ impl FormInput {
             keep_after_pass: self.kind == Kind::Event
                 && !repeat.is_repeating()
                 && self.keep_after_pass,
+            end_date,
         })
+    }
+
+    /// The end date to save, checked against the start (`date`) and the repeat rule, or the
+    /// message saying what's wrong with it (see [`EndProblem`]).
+    fn checked_end(
+        &self,
+        date: Option<NaiveDate>,
+        repeat: RepeatRule,
+    ) -> Result<Option<NaiveDate>, String> {
+        // A one-off task has no "Until" row; whatever the hidden field holds is ignored.
+        if self.kind == Kind::Task && !repeat.is_repeating() {
+            return Ok(None);
+        }
+        if self.end_text.trim().is_empty() {
+            return Ok(None);
+        }
+        let name = self.label(Field::EndDate);
+        let Some(start) = date else {
+            return Err(format!("\"{name}\" needs a due date."));
+        };
+        // `map_err` rewrites the parser's message so it names this field.
+        let end = self
+            .end_date(start)
+            .map_err(|e| format!("\"{name}\": {e}"))?
+            // Not empty (checked above), so the parser gave a date; `ok_or` is just a guard.
+            .ok_or_else(|| format!("\"{name}\" isn't a date."))?;
+        match end_problem(self.kind, repeat, start, end) {
+            None => Ok(Some(end)),
+            Some(problem) => Err(problem.message(self.kind)),
+        }
     }
 
     /// The line under a field, if it has one, plus its color slot: under the date, the
@@ -577,7 +668,70 @@ impl FormInput {
             Field::Date => Some(self.date_preview(today)),
             Field::Time => Some(self.time_preview(time_format)),
             Field::Month => self.nth_preview(today),
+            Field::EndDate => Some(self.end_preview(today)),
             _ => None,
+        }
+    }
+
+    /// The line under "Ends on" / "Until": the range (an event) or the last instance (a task),
+    /// how to type an end date, or what's wrong with it.
+    ///
+    /// - Event: "→ Tue Dec 01 to Thu Dec 24, every year · a reminder each day (24)", for the
+    ///   range that is current today (so a yearly event shows this year's or next year's).
+    /// - Task: "→ last one Thu Dec 24", the last scheduled day on or before the end.
+    pub fn end_preview(&self, today: NaiveDate) -> (String, Slot) {
+        if self.end_text.trim().is_empty() {
+            let hint = if self.kind == Kind::Event {
+                "empty = no end · e.g. 12/24 or +23, from the start"
+            } else {
+                "empty = repeats on and on · e.g. 12/24 or +23"
+            };
+            return (hint.to_string(), Slot::Muted);
+        }
+        let (Some(start), Ok(rule)) = (self.start_date(today), self.repeat_rule()) else {
+            let missing = if self.kind == Kind::Task {
+                "? needs a due date"
+            } else {
+                "? needs a start date"
+            };
+            return (missing.to_string(), Slot::Warn);
+        };
+        let Ok(Some(end)) = self.end_date(start) else {
+            return ("? not a date yet".to_string(), Slot::Warn);
+        };
+        if let Some(problem) = end_problem(self.kind, rule, start, end) {
+            return (problem.short(self.kind, today), Slot::Warn);
+        }
+        match self.kind {
+            Kind::Event => {
+                // The same range the Events box and the reminders will use today.
+                let mut probe = Item::new(Kind::Event, "", chrono::Utc::now());
+                probe.date = Some(start);
+                probe.end_date = Some(end);
+                probe.repeat = rule;
+                let range = event_range(&probe, today).unwrap_or(EventRange { start, end });
+                let repeats = match rule {
+                    RepeatRule::None => String::new(),
+                    RepeatRule::Yearly => ", every year".to_string(),
+                    other => format!(", {}", other.label()),
+                };
+                (
+                    format!(
+                        "→ {} to {}{repeats} · a reminder each day ({})",
+                        short_date(range.start, today),
+                        short_date(range.end, today),
+                        range.len_days()
+                    ),
+                    Slot::Ok,
+                )
+            }
+            Kind::Task => (
+                format!(
+                    "→ last one {}",
+                    short_date(last_on_or_before(rule, start, end), today)
+                ),
+                Slot::Ok,
+            ),
         }
     }
 
@@ -697,6 +851,108 @@ fn iso_date(date: NaiveDate) -> String {
     date.format("%Y-%m-%d").to_string()
 }
 
+/// What can be wrong with an end date that parsed fine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndProblem {
+    /// Before the start (the same day is fine: a one-day range, or a single last instance).
+    BeforeStart(NaiveDate),
+    /// A one-off event's range of more than a year (366 days): more daily reminders than
+    /// anyone means to set up.
+    TooLong,
+    /// A repeating event whose range would still run when it comes round again (the date
+    /// here): the ranges would overlap, and it would remind every day for ever.
+    Overlaps(NaiveDate),
+}
+
+impl EndProblem {
+    /// The full message shown when saving is refused.
+    fn message(self, kind: Kind) -> String {
+        match (self, kind) {
+            (EndProblem::BeforeStart(start), Kind::Task) => format!(
+                "\"Until\" can't be before the due date ({}).",
+                crate::view::long_date(start)
+            ),
+            (EndProblem::BeforeStart(start), Kind::Event) => format!(
+                "\"Ends on\" can't be before the start ({}).",
+                crate::view::long_date(start)
+            ),
+            (EndProblem::TooLong, _) => {
+                "\"Ends on\" can be at most a year after the start.".to_string()
+            }
+            (EndProblem::Overlaps(next), _) => format!(
+                "The range must end before the event comes round again ({}).",
+                crate::view::long_date(next)
+            ),
+        }
+    }
+
+    /// The short form for the line under the field.
+    fn short(self, kind: Kind, today: NaiveDate) -> String {
+        match (self, kind) {
+            (EndProblem::BeforeStart(start), Kind::Task) => {
+                format!("? before the due date ({})", short_date(start, today))
+            }
+            (EndProblem::BeforeStart(start), Kind::Event) => {
+                format!("? before the start ({})", short_date(start, today))
+            }
+            (EndProblem::TooLong, _) => "? at most a year after the start".to_string(),
+            (EndProblem::Overlaps(next), _) => format!(
+                "? must end before it comes round again ({})",
+                short_date(next, today)
+            ),
+        }
+    }
+}
+
+/// Checks an end date against the start and the repeat rule (see [`EndProblem`]). Tasks only
+/// need it on or after the due date: a series can end as far away as you like.
+fn end_problem(
+    kind: Kind,
+    rule: RepeatRule,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> Option<EndProblem> {
+    if end < start {
+        return Some(EndProblem::BeforeStart(start));
+    }
+    if kind == Kind::Task {
+        return None;
+    }
+    if !rule.is_repeating() {
+        // 365 days after the start is the 366th day of the range: a whole (leap) year.
+        return (days_until(end, start) > 365).then_some(EndProblem::TooLong);
+    }
+    // The next time the event starts after this one; the range must be over before it.
+    let next = next_occurrence(rule, start, start + TimeDelta::days(1));
+    (next > start && end >= next).then_some(EndProblem::Overlaps(next))
+}
+
+/// The last scheduled day of a repeating rule from `start` on or before `end` (`start` itself
+/// if no later one fits). Walks the occurrences, so it gives up (returning the last one found)
+/// after a few years of daily ones rather than looping for ever on a far-away end.
+fn last_on_or_before(rule: RepeatRule, start: NaiveDate, end: NaiveDate) -> NaiveDate {
+    let mut last = start;
+    for _ in 0..2000 {
+        let next = next_occurrence(rule, start, last + TimeDelta::days(1));
+        if next <= last || next > end {
+            break;
+        }
+        last = next;
+    }
+    last
+}
+
+/// A date for the line under a field: "Tue Dec 01" this year, "Wed Dec 01 2027" in another,
+/// with non-breaking spaces so a UI that wraps the line never splits a date.
+fn short_date(date: NaiveDate, today: NaiveDate) -> String {
+    let text = if date.year() == today.year() {
+        date.format("%a %b %d").to_string()
+    } else {
+        crate::view::long_date(date)
+    };
+    text.replace(' ', "\u{a0}")
+}
+
 /// The checked result of a form, ready to be written to the database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormData {
@@ -711,6 +967,8 @@ pub struct FormData {
     pub due_time: Option<NaiveTime>,
     pub repeat: RepeatRule,
     pub keep_after_pass: bool,
+    /// An event's last day, or a repeating task's "until"; checked against the start.
+    pub end_date: Option<NaiveDate>,
 }
 
 impl FormData {
@@ -723,6 +981,14 @@ impl FormData {
         item.due_time = self.due_time;
         item.repeat = self.repeat;
         item.keep_after_pass = self.keep_after_pass;
+        item.end_date = self.end_date;
+        // Without an end date there's nothing to stop, and a task never has a stop (Done is
+        // its stop): forget a marker, so the item goes back to an older sync format that every
+        // build can read (see `sync/doc.rs`). A changed range keeps it: it names one range's
+        // first day and simply stops matching a different one.
+        if self.end_date.is_none() || self.kind == Kind::Task {
+            item.reminders_stopped_for = None;
+        }
     }
 }
 
@@ -741,6 +1007,247 @@ mod tests {
             title: title.to_string(),
             ..FormInput::default()
         }
+    }
+
+    /// The Advent of Cyber event form: yearly from Dec 1 (stored 2026), with this end text.
+    fn advent_form(end: &str) -> FormInput {
+        FormInput {
+            kind: Kind::Event,
+            title: "Advent of Cyber".into(),
+            date_text: "2026-12-01".into(),
+            repeat: RepeatChoice::Yearly,
+            end_text: end.into(),
+            ..FormInput::default()
+        }
+    }
+
+    /// A daily task due Dec 1 (stored 2026), with this "Until" text.
+    fn room_form(until: &str) -> FormInput {
+        FormInput {
+            date_text: "2026-12-01".into(),
+            repeat: RepeatChoice::Daily,
+            end_text: until.into(),
+            ..task("Advent of Cyber room")
+        }
+    }
+
+    /// The preview under the end-date row.
+    fn end_line(input: &FormInput) -> (String, Slot) {
+        input
+            .preview(Field::EndDate, today(), TimeFormat::Hour12)
+            .unwrap()
+    }
+
+    /// `s` with its spaces turned into the non-breaking ones the previews use in dates.
+    fn nbsp(s: &str) -> String {
+        s.replace(' ', "\u{a0}")
+    }
+
+    #[test]
+    fn the_end_row_is_on_events_and_repeating_tasks_just_before_notes() {
+        let fields = advent_form("").fields();
+        assert_eq!(fields[fields.len() - 2..], [Field::EndDate, Field::Notes]);
+        assert_eq!(Field::EndDate.label(Kind::Event), "Ends on");
+        assert_eq!(Field::EndDate.label(Kind::Task), "Until");
+        assert!(Field::EndDate.is_text());
+        // A one-off event: after "Keep after".
+        let mut once = advent_form("");
+        once.repeat = RepeatChoice::None;
+        let fields = once.fields();
+        assert_eq!(
+            fields[fields.len() - 3..],
+            [Field::KeepAfterPass, Field::EndDate, Field::Notes]
+        );
+        // Tasks: only when they repeat.
+        assert!(!task("x").fields().contains(&Field::EndDate));
+        let fields = room_form("").fields();
+        assert_eq!(fields[fields.len() - 2..], [Field::EndDate, Field::Notes]);
+    }
+
+    #[test]
+    fn an_events_date_reads_starts_once_it_has_an_end() {
+        assert_eq!(advent_form("").label(Field::Date), "Date");
+        assert_eq!(advent_form("12/24").label(Field::Date), "Starts");
+        assert_eq!(room_form("12/24").label(Field::Date), "Due date");
+        assert_eq!(room_form("").label(Field::EndDate), "Until");
+    }
+
+    #[test]
+    fn the_end_date_counts_from_the_start_and_round_trips() {
+        let d = |m: u32, day: u32| NaiveDate::from_ymd_opt(2026, m, day);
+        for (typed, end) in [
+            ("12/24", d(12, 24)),
+            ("+23", d(12, 24)),
+            ("2026-12-24", d(12, 24)),
+        ] {
+            let data = advent_form(typed).validate(today()).unwrap();
+            assert_eq!(data.end_date, end, "{typed:?}");
+        }
+        assert_eq!(advent_form("").validate(today()).unwrap().end_date, None);
+        let mut item = Item::new(Kind::Event, "Advent of Cyber", Utc::now());
+        advent_form("+23")
+            .validate(today())
+            .unwrap()
+            .apply_to(&mut item);
+        assert_eq!(item.end_date, d(12, 24));
+        let input = FormInput::from_item(&item, TimeFormat::Hour12);
+        assert_eq!(input.field_value(Field::EndDate), "2026-12-24");
+        // Typed in the picker.
+        let mut picked = advent_form("");
+        picked.set_end_date(NaiveDate::from_ymd_opt(2026, 12, 24).unwrap());
+        assert_eq!(picked.end_text, "2026-12-24");
+    }
+
+    #[test]
+    fn end_dates_are_checked_against_the_start_and_the_repeat() {
+        let error = |input: FormInput| input.validate(today()).unwrap_err();
+        assert_eq!(
+            error(advent_form("2026-11-30")),
+            "\"Ends on\" can't be before the start (Tue Dec 01 2026)."
+        );
+        // The same day is fine: a one-day range.
+        assert!(advent_form("2026-12-01").validate(today()).is_ok());
+        // A yearly range of a year or more would meet next year's.
+        assert_eq!(
+            error(advent_form("2027-12-01")),
+            "The range must end before the event comes round again (Wed Dec 01 2027)."
+        );
+        assert!(advent_form("2027-11-30").validate(today()).is_ok());
+        // A weekly event: at most 6 days.
+        let mut weekly = advent_form("+7");
+        weekly.repeat = RepeatChoice::Weekly;
+        assert!(error(weekly.clone()).contains("comes round again (Tue Dec 08 2026)"));
+        weekly.end_text = "+6".into();
+        assert!(weekly.validate(today()).is_ok());
+        // A one-off event: at most a year.
+        let mut once = advent_form("+366");
+        once.repeat = RepeatChoice::None;
+        assert_eq!(
+            error(once.clone()),
+            "\"Ends on\" can be at most a year after the start."
+        );
+        once.end_text = "+365".into();
+        assert!(once.validate(today()).is_ok());
+        // Not a date.
+        assert!(error(advent_form("soon")).starts_with("\"Ends on\": "));
+    }
+
+    #[test]
+    fn until_needs_a_due_date_and_can_be_far_away_and_is_ignored_on_one_off_tasks() {
+        let error = |input: FormInput| input.validate(today()).unwrap_err();
+        let mut undated = room_form("12/24");
+        undated.date_text.clear();
+        assert_eq!(error(undated), "\"Until\" needs a due date.");
+        assert_eq!(
+            error(room_form("2026-11-30")),
+            "\"Until\" can't be before the due date (Tue Dec 01 2026)."
+        );
+        let far = room_form("2030-01-01").validate(today()).unwrap();
+        assert_eq!(far.end_date, NaiveDate::from_ymd_opt(2030, 1, 1));
+        // Repeat switched back to none: the hidden row is ignored.
+        let mut once = room_form("12/24");
+        once.set_repeat(RepeatChoice::None);
+        assert_eq!(once.validate(today()).unwrap().end_date, None);
+    }
+
+    #[test]
+    fn the_end_preview_shows_the_range_or_the_last_instance() {
+        assert_eq!(
+            end_line(&advent_form("12/24")),
+            (
+                format!(
+                    "→ {} to {}, every year · a reminder each day (24)",
+                    nbsp("Tue Dec 01"),
+                    nbsp("Thu Dec 24")
+                ),
+                Slot::Ok
+            )
+        );
+        // Stored years ago: the preview shows the range that is current today.
+        let mut old = advent_form("2020-12-24");
+        old.date_text = "2020-12-01".into();
+        assert!(
+            end_line(&old)
+                .0
+                .starts_with(&format!("→ {}", nbsp("Tue Dec 01")))
+        );
+        let mut once = advent_form("+2");
+        once.repeat = RepeatChoice::None;
+        assert_eq!(
+            end_line(&once).0,
+            format!(
+                "→ {} to {} · a reminder each day (3)",
+                nbsp("Tue Dec 01"),
+                nbsp("Thu Dec 03")
+            )
+        );
+        // A weekly task due Tue Dec 1 until Thu Dec 24: the last one is Tue Dec 22.
+        let mut weekly = room_form("12/24");
+        weekly.repeat = RepeatChoice::Weekly;
+        assert_eq!(
+            end_line(&weekly),
+            (format!("→ last one {}", nbsp("Tue Dec 22")), Slot::Ok)
+        );
+        assert_eq!(
+            end_line(&room_form("12/24")).0,
+            format!("→ last one {}", nbsp("Thu Dec 24"))
+        );
+    }
+
+    #[test]
+    fn the_end_preview_explains_empty_and_wrong_values() {
+        assert_eq!(end_line(&advent_form("")).1, Slot::Muted);
+        assert_eq!(end_line(&room_form("")).1, Slot::Muted);
+        assert_eq!(
+            end_line(&advent_form("abc")),
+            ("? not a date yet".to_string(), Slot::Warn)
+        );
+        assert_eq!(
+            end_line(&advent_form("2026-11-30")),
+            (
+                format!("? before the start ({})", nbsp("Tue Dec 01")),
+                Slot::Warn
+            )
+        );
+        assert_eq!(
+            end_line(&advent_form("2027-12-05")).0,
+            format!(
+                "? must end before it comes round again ({})",
+                nbsp("Wed Dec 01 2027")
+            )
+        );
+        let mut undated = room_form("12/24");
+        undated.date_text.clear();
+        assert_eq!(
+            end_line(&undated),
+            ("? needs a due date".to_string(), Slot::Warn)
+        );
+    }
+
+    #[test]
+    fn saving_without_an_end_or_as_a_task_forgets_a_stop() {
+        let mut item = Item::new(Kind::Event, "Advent of Cyber", Utc::now());
+        item.reminders_stopped_for = NaiveDate::from_ymd_opt(2026, 12, 1);
+        // A changed range keeps it (it names Dec 1 and simply won't match another start).
+        advent_form("12/20")
+            .validate(today())
+            .unwrap()
+            .apply_to(&mut item);
+        assert_eq!(
+            item.reminders_stopped_for,
+            NaiveDate::from_ymd_opt(2026, 12, 1)
+        );
+        advent_form("")
+            .validate(today())
+            .unwrap()
+            .apply_to(&mut item);
+        assert_eq!(item.reminders_stopped_for, None);
+        item.reminders_stopped_for = NaiveDate::from_ymd_opt(2026, 12, 1);
+        room_form("12/24")
+            .validate(today())
+            .unwrap()
+            .apply_to(&mut item);
+        assert_eq!(item.reminders_stopped_for, None);
     }
 
     #[test]
@@ -889,6 +1396,7 @@ mod tests {
                 Field::Ordinal,
                 Field::Weekday,
                 Field::Month,
+                Field::EndDate,
                 Field::Notes
             ]
         );

@@ -479,7 +479,7 @@ mod tests {
             panic!("expected remind");
         };
         run_remind(&args, remind).unwrap();
-        assert_eq!(Db::open(&file).unwrap().schema_version().unwrap(), 4);
+        assert_eq!(Db::open(&file).unwrap().schema_version().unwrap(), 6);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

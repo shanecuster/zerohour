@@ -538,6 +538,23 @@ pub struct Item {
     pub updated_at: DateTime<Utc>,
     /// Soft delete flag: deleted items stay in the database (hidden) so deletions can sync.
     pub deleted: bool,
+    /// The last day of a range, or `None` for no end.
+    ///
+    /// - **Event:** it runs from `date` through this day ("Dec 1 to Dec 24"), with a daily
+    ///   reminder on each day of it (see `reminders.rs`). A repeating event's range repeats
+    ///   with it; a yearly one keeps the same calendar dates every year (see
+    ///   `repeat::event_range`).
+    /// - **Task:** the last day a *repeating* task repeats ("daily until Dec 24"): completing
+    ///   it creates no instance after this day. Ignored on a one-off task.
+    pub end_date: Option<NaiveDate>,
+    /// Events with an end date only: the first day of the occurrence whose daily reminders
+    /// were stopped ("I'm done with it this year"), e.g. `2026-12-01`.
+    ///
+    /// It counts only while it equals the start of the event's current range. When a yearly
+    /// event moves on to next year, that start changes and the old marker simply stops
+    /// matching, so nothing has to clear it on the day of the roll-over (events roll over at
+    /// display time; no code runs then).
+    pub reminders_stopped_for: Option<NaiveDate>,
 }
 
 impl Item {
@@ -561,6 +578,8 @@ impl Item {
             created_at: now,
             updated_at: now,
             deleted: false,
+            end_date: None,
+            reminders_stopped_for: None,
         }
     }
 

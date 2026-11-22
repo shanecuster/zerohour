@@ -17,7 +17,10 @@ use super::{
 /// Main-screen keys: (keys, what they do).
 const KEYS: &[(&str, &str)] = &[
     ("a", "add a task or event"),
-    ("space / x", "complete the selected task"),
+    (
+        "space / x",
+        "complete a task · on an event: stop/resume its daily reminders",
+    ),
     ("e / Enter", "edit the selected item"),
     ("d", "delete the selected item"),
     ("j k / ↑ ↓", "move · g G jump to top/bottom"),

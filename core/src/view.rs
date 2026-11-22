@@ -19,7 +19,8 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use crate::clock::{TimeFormat, format_time, format_time_short, relative_text};
 use crate::icons::{Icon, IconMode};
 use crate::model::{Item, Kind, Priority};
-use crate::repeat::{days_until, event_is_visible, event_target, is_overdue};
+use crate::reminders::{reminded_range, reminders_stopped};
+use crate::repeat::{days_until, event_is_visible, event_range, event_target, is_overdue};
 use crate::theme::Slot;
 
 /// A piece of text plus how to show it: which theme color, and whether it's bold.
@@ -96,10 +97,39 @@ pub struct EventRow {
     pub target: Option<NaiveDate>,
     /// Days from today to `target`: 0 = today, negative = already passed.
     pub days: Option<i64>,
+    /// Set while today is inside the event's range (an event with an end date): which day
+    /// of it this is. Such events are listed first, and show "12 days left".
+    pub running: Option<RunningDay>,
+}
+
+/// Where today falls in a running event's range: "day 5 of 24, 19 days left".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunningDay {
+    /// Which day of the range today is, from 1.
+    pub day: i64,
+    /// How many days the range has.
+    pub of: i64,
+    /// Days after today until the last day: 0 on the last day.
+    pub days_left: i64,
+}
+
+impl RunningDay {
+    /// Today's place in `item`'s range, if it has one and today is inside it.
+    pub fn of_item(item: &Item, today: NaiveDate) -> Option<RunningDay> {
+        // `.filter(...)` keeps the value only if the test passes: here, a range containing
+        // today.
+        let range = event_range(item, today).filter(|range| range.contains(today))?;
+        Some(RunningDay {
+            day: range.day_number(today),
+            of: range.len_days(),
+            days_left: days_until(range.end, today),
+        })
+    }
 }
 
 /// The events to list, with their countdowns, sorted soonest first.
 ///
+/// Running events (today is inside their range) come first, the one ending soonest on top.
 /// Passed one-off events are left out unless they were marked "keep after pass", or
 /// `show_passed` is on (the TUI's `p` key), so you can still edit or delete them. Passed events
 /// go to the bottom, the most recently passed first; events without a date go last.
@@ -114,15 +144,18 @@ pub fn event_rows(items: &[Item], today: NaiveDate, show_passed: bool) -> Vec<Ev
                 item: i.clone(),
                 target,
                 days: target.map(|t| days_until(t, today)),
+                running: RunningDay::of_item(i, today),
             }
         })
         .collect();
     // `sort_by_key` sorts by a computed key; tuples compare element by element, so the first
-    // number picks the group (upcoming, passed, no date) and the second orders inside it.
-    events.sort_by_key(|e| match e.days {
-        Some(d) if d >= 0 => (0, d),
-        Some(d) => (1, -d),
-        None => (2, 0),
+    // number picks the group (running, upcoming, passed, no date) and the second orders
+    // inside it.
+    events.sort_by_key(|e| match (e.running, e.days) {
+        (Some(running), _) => (0, running.days_left),
+        (None, Some(d)) if d >= 0 => (1, d),
+        (None, Some(d)) => (2, -d),
+        (None, None) => (3, 0),
     });
     events
 }
@@ -140,6 +173,19 @@ pub fn next_upcoming(events: &[EventRow]) -> Option<(&str, i64)> {
         Some(days) if days >= 0 => Some((row.item.title.as_str(), days)),
         _ => None,
     })
+}
+
+/// The tagline under the banner for a sorted event list (see [`event_rows`]): a running event
+/// first ("Advent of Cyber: day 5 of 24"), else the soonest upcoming one (see
+/// [`tagline_text`]), else today's date.
+pub fn tagline(events: &[EventRow], today: NaiveDate) -> String {
+    // Running events are sorted first, so only the first row needs checking.
+    if let Some(row) = events.first()
+        && let Some(running) = row.running
+    {
+        return format!("{}: day {} of {}", row.item.title, running.day, running.of);
+    }
+    tagline_text(next_upcoming(events), today)
 }
 
 /// The tagline under the banner: "Christmas is today!", "1 day to Christmas", "77 days to
@@ -176,12 +222,21 @@ pub fn date_text(date: Option<NaiveDate>, today: NaiveDate) -> String {
     .unwrap_or_default()
 }
 
-/// A task's title as listed: repeating tasks get the repeat icon after the title.
+/// A task's title as listed: repeating tasks get the repeat icon after the title, and one
+/// with an end date also its rule and end: "Advent of Cyber room ↻ daily until Dec 24".
 pub fn task_title(task: &Item, mode: IconMode) -> String {
     let mut title = task.title.clone();
     if task.repeat.is_repeating() {
         title.push(' ');
         title.push_str(Icon::Repeat.get(mode));
+        // `if let`: only when there is an end date.
+        if let Some(end) = task.end_date {
+            title.push_str(&format!(
+                " {} until {}",
+                task.repeat.label(),
+                end.format("%b %d")
+            ));
+        }
     }
     title
 }
@@ -296,6 +351,52 @@ fn timed_due_label(
         _ => Slot::Muted,
     };
     Label::plain(text, slot)
+}
+
+/// The daily-reminder mark for an event row: which icon, in which color slot. `None` for an
+/// event without an end date, so lists that don't use the feature look exactly as before.
+///
+/// - [`Icon::RemindersStopped`], muted: stopped for the current range.
+/// - [`Icon::DailyReminder`] in the accent color: the range is running, so today has (or had)
+///   a reminder.
+/// - [`Icon::DailyReminder`], muted: the range hasn't started yet (or a one-off one passed).
+pub fn reminder_mark(item: &Item, today: NaiveDate) -> Option<(Icon, Slot)> {
+    if item.kind != Kind::Event || item.end_date.is_none() {
+        return None;
+    }
+    Some(if reminders_stopped(item, today) {
+        (Icon::RemindersStopped, Slot::Muted)
+    } else if reminded_range(item, today).is_some() {
+        (Icon::DailyReminder, Slot::Accent)
+    } else {
+        (Icon::DailyReminder, Slot::Muted)
+    })
+}
+
+/// The countdown column for one event row: [`running_label`] while its range runs, else
+/// [`countdown_label`].
+pub fn event_label(row: &EventRow, narrow: bool) -> Label {
+    match row.running {
+        Some(running) => running_label(running, narrow),
+        None => countdown_label(row.days, narrow),
+    }
+}
+
+/// The countdown column for a running event: "12 days left" ("12d" when narrow), and
+/// "last day!" ("last!") on its last day, in the `Ok` slot so it stands out from countdowns.
+pub fn running_label(running: RunningDay, narrow: bool) -> Label {
+    let text = match (running.days_left, narrow) {
+        (0, false) => "last day!".to_string(),
+        (0, true) => "last!".to_string(),
+        (1, false) => "1 day left".to_string(),
+        (n, false) => format!("{n} days left"),
+        (n, true) => format!("{n}d"),
+    };
+    Label {
+        text,
+        slot: Slot::Ok,
+        bold: running.days_left == 0,
+    }
 }
 
 /// The "78 days" text for an event's countdown, and how to show it.
@@ -469,6 +570,123 @@ mod tests {
         let all = event_rows(&items, today, true);
         assert!(all.iter().any(|r| r.item.title == "passed, hidden"));
         assert_eq!(all.len(), items.len());
+    }
+
+    /// A yearly Dec 1–24 event, and a plain Christmas countdown.
+    fn advent_and_christmas() -> Vec<Item> {
+        let day = |m: u32, d: u32| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let mut advent = Item::new(Kind::Event, "Advent of Cyber", chrono::Utc::now());
+        advent.date = Some(day(12, 1));
+        advent.end_date = Some(day(12, 24));
+        advent.repeat = RepeatRule::Yearly;
+        let mut christmas = Item::new(Kind::Event, "Christmas", chrono::Utc::now());
+        christmas.date = Some(day(12, 25));
+        christmas.repeat = RepeatRule::Yearly;
+        // Christmas first, so the sort has something to do.
+        vec![christmas, advent]
+    }
+
+    #[test]
+    fn a_running_event_is_listed_first_with_its_day_and_days_left() {
+        let items = advent_and_christmas();
+        let dec = |d: u32| NaiveDate::from_ymd_opt(2026, 12, d).unwrap();
+        let rows = event_rows(&items, dec(5), false);
+        assert_eq!(rows[0].item.title, "Advent of Cyber");
+        assert_eq!(
+            rows[0].running,
+            Some(RunningDay {
+                day: 5,
+                of: 24,
+                days_left: 19
+            })
+        );
+        // It counts down to its last day; the date column shows that day.
+        assert_eq!(rows[0].target, Some(dec(24)));
+        assert_eq!(event_label(&rows[0], false).text, "19 days left");
+        assert_eq!(event_label(&rows[0], true).text, "19d");
+        assert_eq!(event_label(&rows[0], false).slot, Slot::Ok);
+        assert_eq!(rows[1].running, None);
+        assert_eq!(event_label(&rows[1], false).text, "20 days");
+        assert_eq!(tagline(&rows, dec(5)), "Advent of Cyber: day 5 of 24");
+
+        // The last day.
+        let rows = event_rows(&items, dec(24), false);
+        let last = event_label(&rows[0], false);
+        assert_eq!((last.text.as_str(), last.bold), ("last day!", true));
+        assert_eq!(event_label(&rows[0], true).text, "last!");
+        assert_eq!(tagline(&rows, dec(24)), "Advent of Cyber: day 24 of 24");
+
+        // Before it starts: an ordinary countdown to Dec 1 (which is sooner than Christmas).
+        let rows = event_rows(
+            &items,
+            NaiveDate::from_ymd_opt(2026, 11, 22).unwrap(),
+            false,
+        );
+        assert_eq!(rows[0].item.title, "Advent of Cyber");
+        assert_eq!(rows[0].running, None);
+        assert_eq!(event_label(&rows[0], false).text, "9 days");
+
+        // The day after: it counts to next year's Dec 1 and goes below Christmas.
+        let rows = event_rows(&items, dec(25), false);
+        assert_eq!(rows[0].item.title, "Christmas");
+        assert_eq!(rows[1].target, NaiveDate::from_ymd_opt(2027, 12, 1));
+        assert_eq!(tagline(&rows, dec(25)), "Christmas is today!");
+    }
+
+    #[test]
+    fn a_task_with_an_until_date_names_it_in_its_title() {
+        let mut room = Item::new(Kind::Task, "Advent of Cyber room", chrono::Utc::now());
+        room.date = NaiveDate::from_ymd_opt(2026, 12, 1);
+        room.repeat = RepeatRule::Daily;
+        assert_eq!(
+            task_title(&room, IconMode::Unicode),
+            format!(
+                "Advent of Cyber room {}",
+                Icon::Repeat.get(IconMode::Unicode)
+            )
+        );
+        room.end_date = NaiveDate::from_ymd_opt(2026, 12, 24);
+        assert_eq!(
+            task_title(&room, IconMode::Unicode),
+            format!(
+                "Advent of Cyber room {} daily until Dec 24",
+                Icon::Repeat.get(IconMode::Unicode)
+            )
+        );
+        // A one-off task's end date (never set by the form) changes nothing.
+        room.repeat = RepeatRule::None;
+        assert_eq!(task_title(&room, IconMode::Unicode), "Advent of Cyber room");
+    }
+
+    #[test]
+    fn reminder_marks_follow_the_range_and_the_stop() {
+        let mut items = advent_and_christmas();
+        let day = |m: u32, d: u32| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let christmas = items[0].clone();
+        // No end date: no mark, so the list looks as it always did.
+        assert_eq!(reminder_mark(&christmas, day(12, 10)), None);
+        let advent = &mut items[1];
+        assert_eq!(
+            reminder_mark(advent, day(11, 22)),
+            Some((Icon::DailyReminder, Slot::Muted)),
+            "not started yet"
+        );
+        assert_eq!(
+            reminder_mark(advent, day(12, 10)),
+            Some((Icon::DailyReminder, Slot::Accent)),
+            "running"
+        );
+        advent.reminders_stopped_for = Some(day(12, 1));
+        assert_eq!(
+            reminder_mark(advent, day(12, 10)),
+            Some((Icon::RemindersStopped, Slot::Muted)),
+            "stopped"
+        );
+        // The day after: next year's range, not stopped, not started.
+        assert_eq!(
+            reminder_mark(advent, day(12, 25)),
+            Some((Icon::DailyReminder, Slot::Muted))
+        );
     }
 
     #[test]

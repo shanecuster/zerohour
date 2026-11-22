@@ -92,6 +92,10 @@ pub enum Icon {
     Offline,
     /// Reminders (the `n` settings popup).
     Reminder,
+    /// An event with an end date, which has daily reminders (bright while its range runs).
+    DailyReminder,
+    /// An event whose daily reminders were stopped for the current range.
+    RemindersStopped,
 }
 
 impl Icon {
@@ -119,6 +123,10 @@ impl Icon {
             Icon::SyncError => ("\u{f06a}", "✗", "!!"),  // nf-fa-exclamation_circle
             Icon::Offline => ("\u{f127}", "○", "--"),    // nf-fa-chain_broken
             Icon::Reminder => ("\u{f0f3}", "♪", "(!)"),  // nf-fa-bell
+            // The two event-row marks are one character even in ASCII, so the column they
+            // sit in stays one cell wide in every mode.
+            Icon::DailyReminder => ("\u{f0f3}", "♪", "*"), // nf-fa-bell
+            Icon::RemindersStopped => ("\u{f1f6}", "⊘", "x"), // nf-fa-bell_slash
         }
     }
 
@@ -148,7 +156,7 @@ pub fn priority_icon(priority: crate::model::Priority) -> Icon {
 mod tests {
     use super::*;
 
-    const ALL_ICONS: [Icon; 15] = [
+    const ALL_ICONS: [Icon; 17] = [
         Icon::Task,
         Icon::Done,
         Icon::Event,
@@ -164,6 +172,8 @@ mod tests {
         Icon::SyncError,
         Icon::Offline,
         Icon::Reminder,
+        Icon::DailyReminder,
+        Icon::RemindersStopped,
     ];
 
     #[test]
@@ -179,6 +189,18 @@ mod tests {
         for icon in ALL_ICONS {
             assert_eq!(icon.get(IconMode::Nerd).chars().count(), 1, "{icon:?}");
             assert_eq!(icon.get(IconMode::Unicode).chars().count(), 1, "{icon:?}");
+        }
+    }
+
+    #[test]
+    fn event_reminder_marks_are_one_ascii_cell_and_differ() {
+        assert_eq!(Icon::DailyReminder.get(IconMode::Ascii).len(), 1);
+        assert_eq!(Icon::RemindersStopped.get(IconMode::Ascii).len(), 1);
+        for mode in IconMode::ALL {
+            assert_ne!(
+                Icon::DailyReminder.get(mode),
+                Icon::RemindersStopped.get(mode)
+            );
         }
     }
 

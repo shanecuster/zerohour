@@ -27,7 +27,11 @@
 //!   reminder listing the tasks that are overdue at that moment ("2 overdue tasks"), if any.
 //!   Overdue means the due *day* is over: a task due at 8:00 today whose time has passed is
 //!   not in today's digest (its own 8:00 reminder already came), only in tomorrow's;
-//! - nothing that is completed or deleted, and no events.
+//! - an *event with an end date* (Advent of Cyber, Dec 1 to Dec 24): once a day at
+//!   `day_time` on every day of its range ("Day 5 of 24 · 19 days left" … "Last day"),
+//!   unless its reminders were stopped for that range (`Item::reminders_stopped_for`). A
+//!   repeating event's next range is reminded again by itself;
+//! - nothing that is completed or deleted, and no event without an end date.
 //!
 //! Only reminders in the future are returned. A device that was off at a reminder's time
 //! never gets it replayed later: the plan simply starts from "now".
@@ -36,13 +40,15 @@
 //! [`settings_keys`](crate::db::settings_keys). That table is per device and never synced, so
 //! each device decides for itself whether and when to remind.
 
-use chrono::{NaiveDateTime, NaiveTime, TimeDelta};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 
 use crate::calendar::add_days;
 use crate::clock::{TimeFormat, format_time};
 use crate::db::{Db, DbError, settings_keys};
 use crate::model::{Item, Kind};
-use crate::repeat::{is_overdue, next_occurrence};
+use crate::repeat::{
+    EventRange, days_until, event_range, is_overdue, next_occurrence, within_series,
+};
 use crate::view::open_tasks;
 
 /// The largest allowed lead time: one day, in minutes.
@@ -362,7 +368,7 @@ mod plan_tests {
     }
 
     #[test]
-    fn completed_deleted_and_events_are_never_reminded() {
+    fn completed_deleted_and_events_without_an_end_date_are_never_reminded() {
         let now = at(2026, 10, 22, 9, 0);
         let mut done = task("Done", Some(d(2026, 10, 22)), Some(t(14, 0)));
         done.completed_at = Some(Utc::now());
@@ -372,6 +378,225 @@ mod plan_tests {
         event.date = Some(d(2026, 10, 22));
         event.repeat = RepeatRule::None;
         assert!(plan48(&[done, gone, event], now, &on(15)).is_empty());
+    }
+
+    /// The Advent of Cyber event: yearly, Dec 1 to Dec 24 (stored as 2026).
+    fn advent() -> Item {
+        let mut item = Item::new(Kind::Event, "Advent of Cyber", Utc::now());
+        item.date = Some(d(2026, 12, 1));
+        item.end_date = Some(d(2026, 12, 24));
+        item.repeat = RepeatRule::Yearly;
+        item
+    }
+
+    /// The plan between two moments, in 12-hour times (for spans longer than 48 hours).
+    fn plan_between(items: &[Item], from: NaiveDateTime, until: NaiveDateTime) -> Vec<Reminder> {
+        plan(items, from, until, &on(0), TimeFormat::Hour12)
+    }
+
+    /// Just the dates of the planned reminders.
+    fn dates(plan: &[Reminder]) -> Vec<NaiveDate> {
+        plan.iter().map(|r| r.fire_at.date()).collect()
+    }
+
+    #[test]
+    fn a_dec_1_to_24_event_reminds_every_day_of_its_range() {
+        let plan = plan_between(&[advent()], at(2026, 11, 22, 12, 0), at(2027, 1, 31, 0, 0));
+        assert_eq!(plan.len(), 24);
+        assert!(plan.iter().all(|r| r.kind == ReminderKind::Daily));
+        // Every day at the Day time (09:00 by default), Dec 1 to Dec 24 with no gaps.
+        let expected: Vec<NaiveDateTime> = (1..=24).map(|day| at(2026, 12, day, 9, 0)).collect();
+        let fire_times: Vec<NaiveDateTime> = plan.iter().map(|r| r.fire_at).collect();
+        assert_eq!(fire_times, expected);
+        assert_eq!(plan[0].body, "Day 1 of 24 · 23 days left");
+        assert_eq!(plan[4].body, "Day 5 of 24 · 19 days left");
+        assert_eq!(plan[22].body, "Day 23 of 24 · 1 day left");
+        assert_eq!(plan[23].body, "Last day");
+        // Only the last day is the last day, and only it offers Keep/Remove.
+        let last: Vec<bool> = plan.iter().map(|r| r.last_day).collect();
+        assert_eq!(last.iter().filter(|&&l| l).count(), 1);
+        assert!(plan[23].last_day);
+        assert_eq!(plan[23].actions, ReminderActions::StopKeepRemove);
+        assert!(
+            plan[..23]
+                .iter()
+                .all(|r| r.actions == ReminderActions::StopForYear)
+        );
+    }
+
+    #[test]
+    fn the_range_follows_the_day_time_setting_and_skips_todays_passed_time() {
+        let settings = ReminderSettings {
+            day_time: t(7, 30),
+            ..on(0)
+        };
+        let plan = plan(
+            &[advent()],
+            at(2026, 12, 23, 8, 0),
+            at(2026, 12, 26, 0, 0),
+            &settings,
+            TimeFormat::Hour12,
+        );
+        // Dec 23 at 7:30 has passed at 8:00: only Dec 24 is left.
+        assert_eq!(
+            times(&plan),
+            [(ReminderKind::Daily, at(2026, 12, 24, 7, 30))]
+        );
+    }
+
+    #[test]
+    fn stopping_silences_this_year_and_next_years_range_is_reminded_again() {
+        let mut event = advent();
+        event.reminders_stopped_for = Some(d(2026, 12, 1));
+        let this_year = plan_between(
+            &[event.clone()],
+            at(2026, 12, 5, 12, 0),
+            at(2026, 12, 31, 0, 0),
+        );
+        assert!(this_year.is_empty());
+        let next_year = plan_between(&[event], at(2027, 11, 1, 0, 0), at(2027, 12, 31, 0, 0));
+        assert_eq!(next_year.len(), 24);
+        assert_eq!(next_year[0].fire_at, at(2027, 12, 1, 9, 0));
+    }
+
+    #[test]
+    fn a_one_off_range_reminds_once_and_offers_stop_only() {
+        let mut once = advent();
+        once.repeat = RepeatRule::None;
+        once.date = Some(d(2026, 12, 1));
+        once.end_date = Some(d(2026, 12, 3));
+        let plan = plan_between(&[once], at(2026, 11, 22, 12, 0), at(2028, 1, 1, 0, 0));
+        assert_eq!(
+            dates(&plan),
+            [d(2026, 12, 1), d(2026, 12, 2), d(2026, 12, 3)]
+        );
+        assert!(plan.iter().all(|r| r.actions == ReminderActions::Stop));
+        assert!(plan[2].last_day);
+        // A one-day range: its only day is its last.
+        let mut one_day = advent();
+        one_day.end_date = Some(d(2026, 12, 1));
+        let plan = plan_between(&[one_day], at(2026, 11, 22, 12, 0), at(2026, 12, 31, 0, 0));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].body, "Last day");
+    }
+
+    #[test]
+    fn deleted_events_and_switched_off_reminders_have_no_daily_reminders() {
+        let mut gone = advent();
+        gone.deleted = true;
+        assert!(plan48(&[gone], at(2026, 12, 10, 12, 0), &on(0)).is_empty());
+        let off = ReminderSettings::default();
+        assert!(plan48(&[advent()], at(2026, 12, 10, 12, 0), &off).is_empty());
+    }
+
+    #[test]
+    fn daily_reminders_keep_their_floating_time_on_clock_change_nights() {
+        // 02:30 doesn't exist on Mar 8 2026 (US spring forward) and happens twice on Nov 1.
+        // The planner returns the wall-clock time; the apps decide what it means.
+        let settings = ReminderSettings {
+            day_time: t(2, 30),
+            ..on(0)
+        };
+        for day in [d(2026, 3, 8), d(2026, 11, 1)] {
+            let mut event = advent();
+            event.repeat = RepeatRule::None;
+            event.date = Some(day);
+            event.end_date = Some(day);
+            let plan = plan(
+                &[event],
+                day.pred_opt().unwrap().and_time(t(12, 0)),
+                day.succ_opt().unwrap().and_time(t(0, 0)),
+                &settings,
+                TimeFormat::Hour12,
+            );
+            assert_eq!(
+                times(&plan),
+                [(ReminderKind::Daily, day.and_time(t(2, 30)))]
+            );
+        }
+    }
+
+    #[test]
+    fn daily_and_task_reminders_share_one_sorted_plan_with_their_buttons() {
+        let items = [
+            advent(),
+            task("Call the bank", Some(d(2026, 12, 24)), Some(t(14, 0))),
+        ];
+        let plan = plan_between(&items, at(2026, 12, 23, 12, 0), at(2026, 12, 25, 0, 0));
+        let summary: Vec<(ReminderKind, NaiveDateTime, ReminderActions)> = plan
+            .iter()
+            .map(|r| (r.kind, r.fire_at, r.actions))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    ReminderKind::Daily,
+                    at(2026, 12, 24, 9, 0),
+                    ReminderActions::StopKeepRemove
+                ),
+                (
+                    ReminderKind::Due,
+                    at(2026, 12, 24, 14, 0),
+                    ReminderActions::Done
+                ),
+            ]
+        );
+        assert_eq!(
+            plan[0].key(),
+            format!("{}|Daily|2026-12-24T09:00", items[0].id)
+        );
+    }
+
+    #[test]
+    fn the_digest_offers_no_buttons() {
+        let items = [task("Late", Some(d(2026, 12, 1)), None)];
+        let settings = ReminderSettings {
+            overdue_digest: true,
+            ..on(0)
+        };
+        let plan = plan(
+            &items,
+            at(2026, 12, 5, 0, 0),
+            at(2026, 12, 5, 12, 0),
+            &settings,
+            TimeFormat::Hour12,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].actions, ReminderActions::None);
+    }
+
+    #[test]
+    fn still_applies_follows_tasks_ranges_and_stops() {
+        let today = d(2026, 12, 10);
+        let mut event = advent();
+        assert!(still_applies(&event, today));
+        assert!(!still_applies(&event, d(2026, 11, 30)), "before the range");
+        assert!(!still_applies(&event, d(2026, 12, 25)), "after it");
+        event.reminders_stopped_for = Some(d(2026, 12, 1));
+        assert!(!still_applies(&event, today), "stopped");
+        assert!(still_applies(&event, d(2027, 12, 1)), "next year's range");
+        event.end_date = None;
+        assert!(!still_applies(&event, today), "no end date");
+
+        let mut open = task("Call", Some(today), None);
+        assert!(still_applies(&open, today));
+        open.completed_at = Some(Utc::now());
+        assert!(!still_applies(&open, today));
+    }
+
+    #[test]
+    fn reminders_stopped_only_names_the_current_range() {
+        let mut event = advent();
+        assert!(!reminders_stopped(&event, d(2026, 12, 10)));
+        event.reminders_stopped_for = Some(d(2026, 12, 1));
+        assert!(
+            reminders_stopped(&event, d(2026, 11, 22)),
+            "the coming range"
+        );
+        assert!(reminders_stopped(&event, d(2026, 12, 24)));
+        // From Dec 25 the current range is 2027's: last year's stop is stale.
+        assert!(!reminders_stopped(&event, d(2026, 12, 25)));
     }
 
     #[test]
@@ -398,6 +623,33 @@ mod plan_tests {
         let mut item = task("Fill Out Your Timesheet", Some(date), Some(t(14, 0)));
         item.repeat = RepeatRule::Weekdays(DaySet::MON_THU);
         item
+    }
+
+    #[test]
+    fn a_repeating_task_is_reminded_only_up_to_its_until_date() {
+        // Daily at 7 PM until Thu Dec 24, open instance Dec 23: Dec 23 and Dec 24 only.
+        let mut room = task(
+            "Advent of Cyber room",
+            Some(d(2026, 12, 23)),
+            Some(t(19, 0)),
+        );
+        room.repeat = RepeatRule::Daily;
+        room.end_date = Some(d(2026, 12, 24));
+        let plan = plan_between(
+            std::slice::from_ref(&room),
+            at(2026, 12, 23, 12, 0),
+            at(2026, 12, 28, 0, 0),
+        );
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Due, at(2026, 12, 23, 19, 0)),
+                (ReminderKind::Due, at(2026, 12, 24, 19, 0)),
+            ]
+        );
+        // Left open past the end: no more reminders (the overdue digest can still list it).
+        room.date = Some(d(2026, 12, 22));
+        assert!(plan_between(&[room], at(2026, 12, 25, 0, 0), at(2026, 12, 28, 0, 0)).is_empty());
     }
 
     #[test]
@@ -642,22 +894,48 @@ pub enum ReminderKind {
     DayOf,
     /// The once-a-day list of overdue tasks (not about one task).
     Digest,
+    /// At `day_time` on each day of an event's range (an event with an end date).
+    Daily,
+}
+
+/// Which buttons a reminder's notification offers.
+///
+/// Worked out here (see [`Reminder::actions`]) so the Android app never has to look at the
+/// item to decide, and can't disagree with the plan. The desktop shows no buttons
+/// (`notify-send` has none), so it ignores this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReminderActions {
+    /// No buttons: the overdue digest, which is about several tasks.
+    None,
+    /// "Done": every task reminder.
+    Done,
+    /// "Stop reminders": a one-off event's daily reminder.
+    Stop,
+    /// "Stop for this year": a repeating event's daily reminder before its last day.
+    StopForYear,
+    /// "Stop for this year", "Keep" and "Remove": a repeating event's daily reminder on the
+    /// last day of its range, when the apps ask whether to keep the event for next time.
+    StopKeepRemove,
 }
 
 /// One planned reminder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reminder {
-    /// The task it is about, or `None` for the digest (which is about several). The apps
-    /// offer "Done" only when there is one task to complete.
+    /// The task or event it is about, or `None` for the digest (which is about several).
     pub item_id: Option<String>,
     /// Why it fires.
     pub kind: ReminderKind,
     /// When, as local wall-clock time (see the module docs).
     pub fire_at: NaiveDateTime,
-    /// The notification's title: the task's title.
+    /// The notification's title: the task's (or event's) title.
     pub title: String,
     /// The notification's text, e.g. "Due 2:00 PM".
     pub body: String,
+    /// True only for an event's daily reminder on the last day of its range. Worked out here,
+    /// not stored, so the apps can never disagree about which day is last.
+    pub last_day: bool,
+    /// The buttons its notification offers (see [`ReminderActions`]).
+    pub actions: ReminderActions,
 }
 
 impl Reminder {
@@ -679,7 +957,8 @@ impl Reminder {
 /// Plans every reminder that fires after `now` and no later than `until` (both local wall-clock
 /// times), sorted by time.
 ///
-/// - `items`: all items (completed, deleted and events are skipped here).
+/// - `items`: all items (completed and deleted ones are skipped here, and so are events
+///   without an end date).
 /// - `settings`: the reminder settings; with the master switch off, the plan is empty.
 /// - `time_format`: 12- or 24-hour, for the texts ("Due 2:00 PM" / "Due 14:00").
 ///
@@ -717,6 +996,8 @@ pub fn plan(
                     fire_at,
                     title: item.title.clone(),
                     body: "Due today".to_string(),
+                    last_day: false,
+                    actions: ReminderActions::Done,
                 });
             }
             continue;
@@ -734,6 +1015,12 @@ pub fn plan(
             date
         };
         for _ in 0..MAX_OCCURRENCES_PER_TASK {
+            // A later scheduled day past the series' end ("daily until Dec 24") is never
+            // due. The open instance's own day always counts: it exists, even if the end
+            // date was moved before it.
+            if day != date && !within_series(item, day) {
+                break;
+            }
             let due = day.and_time(time);
             // Past the window, even for its earlier reminder: no later day can be inside.
             if due - lead > until {
@@ -746,6 +1033,8 @@ pub fn plan(
                     fire_at: due,
                     title: item.title.clone(),
                     body: due_text(time, time_format),
+                    last_day: false,
+                    actions: ReminderActions::Done,
                 });
             }
             // The earlier reminder, if a lead time is set. It can fall on the previous day
@@ -757,6 +1046,8 @@ pub fn plan(
                     fire_at: due - lead,
                     title: item.title.clone(),
                     body: lead_text(settings.lead_minutes, time, time_format),
+                    last_day: false,
+                    actions: ReminderActions::Done,
                 });
             }
             if !item.repeat.is_repeating() {
@@ -769,6 +1060,13 @@ pub fn plan(
             }
             day = next;
         }
+    }
+
+    // Daily event reminders: their own loop, one day at a time (see `daily_reminders`).
+    for item in items {
+        // `in_window` only borrows `now` and `until` (shared borrows can be copied), so the
+        // closure itself is `Copy`: each call gets its own copy and it stays usable below.
+        reminders.extend(daily_reminders(item, now, until, settings, in_window));
     }
 
     if settings.overdue_digest {
@@ -814,6 +1112,8 @@ fn digests(
                     fire_at,
                     title: digest_title(overdue.len()),
                     body: digest_body(&overdue),
+                    last_day: false,
+                    actions: ReminderActions::None,
                 });
             }
         }
@@ -841,7 +1141,112 @@ fn digest_body(titles: &[&str]) -> String {
     body
 }
 
-/// True for a task that is still open and not deleted: the only things that are reminded.
+/// The range of `event` that `day` is a reminded day of: inside the range, and reminders
+/// not stopped for it. `None` for anything else (a task, a deleted event, an event without an
+/// end date, a day outside the range, or a stopped range).
+///
+/// A stop marker counts only for the range whose first day it names, so last year's stop
+/// never silences this year's range.
+pub fn reminded_range(event: &Item, day: NaiveDate) -> Option<EventRange> {
+    if event.deleted {
+        return None;
+    }
+    // `event_range` is `None` for a task or an event without an end date. `.filter(...)`
+    // keeps the range only if the test passes.
+    let range = event_range(event, day).filter(|range| range.contains(day))?;
+    if event.reminders_stopped_for == Some(range.start) {
+        return None;
+    }
+    Some(range)
+}
+
+/// One event's daily reminders in the plan window: at `day_time` on each day that
+/// [`reminded_range`] says is reminded. A 48-hour plan looks at three days.
+fn daily_reminders(
+    event: &Item,
+    now: NaiveDateTime,
+    until: NaiveDateTime,
+    settings: &ReminderSettings,
+    in_window: impl Fn(NaiveDateTime) -> bool,
+) -> Vec<Reminder> {
+    let mut out = Vec::new();
+    // Skip the day loop entirely for everything that can never have a daily reminder.
+    if event.kind != Kind::Event || event.end_date.is_none() {
+        return out;
+    }
+    let mut day = now.date();
+    while day <= until.date() {
+        let fire_at = day.and_time(settings.day_time);
+        // A *let chain*: `cond && let Some(x) = value` runs the block only if the condition
+        // holds AND the value is `Some`, binding `x` for the block. Here: is this moment in the
+        // plan window, and is this day a reminded day (and of which range)?
+        if in_window(fire_at)
+            && let Some(range) = reminded_range(event, day)
+        {
+            let last_day = day == range.end;
+            // `match` on a pair: the first pattern that fits wins.
+            let actions = match (event.repeat.is_repeating(), last_day) {
+                (false, _) => ReminderActions::Stop,
+                (true, false) => ReminderActions::StopForYear,
+                (true, true) => ReminderActions::StopKeepRemove,
+            };
+            out.push(Reminder {
+                item_id: Some(event.id.clone()),
+                kind: ReminderKind::Daily,
+                fire_at,
+                title: event.title.clone(),
+                body: daily_text(range, day),
+                last_day,
+                actions,
+            });
+        }
+        day = add_days(day, 1);
+    }
+    out
+}
+
+/// "Day 5 of 24 · 19 days left", "Day 23 of 24 · 1 day left", "Last day".
+fn daily_text(range: EventRange, day: NaiveDate) -> String {
+    let left = days_until(range.end, day);
+    match left {
+        0 => "Last day".to_string(),
+        1 => format!(
+            "Day {} of {} · 1 day left",
+            range.day_number(day),
+            range.len_days()
+        ),
+        n => format!(
+            "Day {} of {} · {n} days left",
+            range.day_number(day),
+            range.len_days()
+        ),
+    }
+}
+
+/// True if `event`'s daily reminders are stopped for its current range (the running one, or
+/// the next one if none is running): what the apps show as "stopped", and use to offer
+/// "Resume" instead of "Stop". A marker naming an earlier range (last year's) doesn't count.
+pub fn reminders_stopped(event: &Item, today: NaiveDate) -> bool {
+    // `is_some_and`: true only for `Some(range)` where the closure says yes.
+    event_range(event, today).is_some_and(|range| event.reminders_stopped_for == Some(range.start))
+}
+
+/// Should an alarm set earlier for this item still be shown on `today` (local date)?
+///
+/// Apps that schedule alarms ahead (Android) ask this when one goes off, as a second guard
+/// after cancelling alarms that are no longer planned: a sync may have completed the task,
+/// deleted the event, changed its range or stopped its reminders after the alarm was set.
+///
+/// - A task: still open and not deleted.
+/// - An event: today is a reminded day of its range (see [`reminded_range`]).
+pub fn still_applies(item: &Item, today: NaiveDate) -> bool {
+    match item.kind {
+        Kind::Task => is_open_task(item),
+        Kind::Event => reminded_range(item, today).is_some(),
+    }
+}
+
+/// True for a task that is still open and not deleted: the only tasks that are reminded.
 fn is_open_task(item: &Item) -> bool {
     item.kind == Kind::Task && !item.deleted && !item.is_completed()
 }

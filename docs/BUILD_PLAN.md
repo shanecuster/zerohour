@@ -48,7 +48,7 @@ Desktop TUI comes first. Android and sync come after the TUI works well.
 | Android | Native Kotlin + Jetpack Compose UI, calling the shared Rust core via UniFFI. Styled to look like a TUI (monospace Nerd Font, box-drawing borders, same themes). Phase 3. |
 | Repeats | Yearly, monthly, weekly/daily, custom interval (every N days/weeks/months) |
 | Repeating tasks | Completing one creates a **new instance** with the next due date; old instance stays as history |
-| Repeating events | Auto-roll to next occurrence at display time; nothing needs to be stored or clicked |
+| Repeating events | Auto-roll to next occurrence at display time; nothing needs to be stored or clicked. **Approved deviation (2026-11-22):** an event with an end date may store a "daily reminders stopped" marker set by a click (see section 4). It names one range's first day, so the roll-over still needs nothing stored or clicked. |
 | Add flow | The add dialog first asks **Task or Event** with a one-line explanation of each |
 | Layout | Two sections: Tasks on top, Events underneath; each with its own color and marker |
 | Tags | NOT in v1 (leave room for a future migration). Priorities and notes ARE in v1. |
@@ -106,6 +106,9 @@ Every row is built for future sync from day one:
 - `completed_at`: optional timestamp (tasks)
 - `created_at`, `updated_at`: timestamps (UTC). `updated_at` changes on EVERY edit.
 - `deleted`: bool (soft delete, so deletions can sync later)
+- `end_date`: optional date (schema 6). Events: the last day of a range that starts on `date`, with a daily reminder on each day of it; a repeating event's range repeats with it (yearly ones keep their calendar dates). Repeating tasks: the last day the series repeats ("until"). Ignored on one-off tasks.
+- `reminders_stopped_for`: optional date (events with an end date, schema 5): the first day of the range whose daily reminders the user stopped. Counts only while it equals the start of the current range, so it never needs clearing at roll-over. This is the approved deviation in section 2.
+- (Schema 5 also added `remind_days_before`, from a test build of an earlier design. It is unused and stays NULL.)
 
 `RepeatRule`:
 

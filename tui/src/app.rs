@@ -18,12 +18,14 @@ use ratatui::crossterm::event::{
 };
 use ratatui::widgets::TableState;
 use zerohour_core::calendar::WeekStart;
+use zerohour_core::calendar::add_days;
 use zerohour_core::clock::TimeFormat;
 use zerohour_core::db::{Db, settings_keys};
 use zerohour_core::form::FormData;
 use zerohour_core::icons::IconMode;
 use zerohour_core::model::{Item, Kind};
-use zerohour_core::reminders::ReminderSettings;
+use zerohour_core::reminders::{ReminderSettings, reminders_stopped};
+use zerohour_core::repeat::event_range;
 use zerohour_core::stats::{self, Stats};
 use zerohour_core::theme::{THEMES, Theme, theme_by_name, theme_index};
 use zerohour_core::view::{self, EventRow};
@@ -656,14 +658,16 @@ impl App {
     }
 
     /// Completes the selected task. A repeating task gets a new instance with the next due
-    /// date, which is then selected so you can see it appear.
+    /// date, which is then selected so you can see it appear. On an event, stops or resumes
+    /// its daily reminders instead (see [`App::toggle_event_reminders`]).
     fn complete_selected(&mut self) -> Result<()> {
         let Some(item) = self.selected_item() else {
             return Ok(());
         };
         if item.kind == Kind::Event {
-            self.set_status("Events count down on their own; there's nothing to complete.");
-            return Ok(());
+            // `clone()` because `item` borrows `self`, and the toggle needs `self` mutably.
+            let event = item.clone();
+            return self.toggle_event_reminders(&event);
         }
         let (id, title) = (item.id.clone(), item.title.clone());
         let next = self.db.complete_task(&id, local_now(), Utc::now())?;
@@ -683,6 +687,50 @@ impl App {
             }
             None => self.set_status(format!("Done: \"{title}\"")),
         }
+        Ok(())
+    }
+
+    /// `Space` on an event: stops its daily reminders for the current range (the running
+    /// one, or the next one: "skip this year"), or resumes them if they were stopped. An
+    /// event without an end date has no daily reminders, so the status line says how to set
+    /// them up.
+    ///
+    /// On the last day of a repeating event's range the status line also offers "keep or
+    /// remove": keeping needs nothing (next year's range comes by itself), and `d` removes it.
+    fn toggle_event_reminders(&mut self, event: &Item) -> Result<()> {
+        let today = self.today;
+        // `let ... else`: only an event with a range goes on; otherwise explain and stop.
+        let Some(range) = event_range(event, today) else {
+            self.set_status(
+                "Events count down on their own. For daily reminders, give it an end date (e).",
+            );
+            return Ok(());
+        };
+        let title = &event.title;
+        if reminders_stopped(event, today) {
+            self.db.resume_event_reminders(&event.id, Utc::now())?;
+            self.set_status(format!("Daily reminders back on for \"{title}\""));
+        } else {
+            self.db.stop_event_reminders(&event.id, today, Utc::now())?;
+            // What "until" means depends on the repeat: a one-off event has no next time.
+            let until = if event.repeat.is_repeating() {
+                // The range after this one: the one current the day after this one ends.
+                let next = event_range(event, add_days(range.end, 1))
+                    .map(|next| next.start.format("%b %d %Y").to_string());
+                format!("until next time ({})", next.unwrap_or_default())
+            } else {
+                "(it doesn't repeat)".to_string()
+            };
+            let mut text = format!("Stopped daily reminders for \"{title}\" {until}. Space: undo");
+            if today == range.end && event.repeat.is_repeating() {
+                // The last day of the range: the "keep or remove?" moment.
+                text.push_str(" · keep it, or d to remove it");
+            }
+            self.set_status(text);
+        }
+        let id = event.id.clone();
+        self.refresh()?;
+        self.select_id(&id);
         Ok(())
     }
 
@@ -935,6 +983,84 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// An app on `today` with the yearly Dec 1–24 Advent of Cyber event selected (without its
+    /// end date if `ranged` is false).
+    fn app_with_advent(ranged: bool, today: NaiveDate) -> (App, String) {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting(settings_keys::ICON_MODE, "unicode").unwrap();
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", Utc::now());
+        event.date = NaiveDate::from_ymd_opt(2026, 12, 1);
+        event.end_date = NaiveDate::from_ymd_opt(2026, 12, 24).filter(|_| ranged);
+        event.repeat = zerohour_core::model::RepeatRule::Yearly;
+        db.insert_item(&event).unwrap();
+        let mut app = App::new(db, false, None).unwrap();
+        app.today = today;
+        app.refresh().unwrap();
+        app.select_id(&event.id);
+        (app, event.id)
+    }
+
+    /// The status line's text (empty if there is none).
+    fn status(app: &App) -> String {
+        app.status
+            .as_ref()
+            .map(|s| s.text.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn space_on_an_event_stops_then_resumes_its_daily_reminders() {
+        let dec10 = NaiveDate::from_ymd_opt(2026, 12, 10).unwrap();
+        let (mut app, id) = app_with_advent(true, dec10);
+        app.handle_key(press(KeyCode::Char(' ')));
+        let stopped = app.db.get_item(&id).unwrap().unwrap();
+        assert_eq!(
+            stopped.reminders_stopped_for,
+            NaiveDate::from_ymd_opt(2026, 12, 1)
+        );
+        assert_eq!(
+            status(&app),
+            "Stopped daily reminders for \"Advent of Cyber\" until next time (Dec 01 2027). \
+             Space: undo"
+        );
+        // Still selected, so a second Space undoes it.
+        app.handle_key(press(KeyCode::Char('x')));
+        assert_eq!(
+            app.db.get_item(&id).unwrap().unwrap().reminders_stopped_for,
+            None
+        );
+        assert_eq!(
+            status(&app),
+            "Daily reminders back on for \"Advent of Cyber\""
+        );
+    }
+
+    #[test]
+    fn on_the_last_day_space_also_offers_keep_or_remove() {
+        let dec24 = NaiveDate::from_ymd_opt(2026, 12, 24).unwrap();
+        let (mut app, id) = app_with_advent(true, dec24);
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert!(status(&app).ends_with("· keep it, or d to remove it"));
+        // `d` is the existing delete, with its confirmation.
+        app.handle_key(press(KeyCode::Char('d')));
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete { .. }));
+        app.handle_key(press(KeyCode::Char('y')));
+        assert!(app.db.get_item(&id).unwrap().unwrap().deleted);
+    }
+
+    #[test]
+    fn space_on_an_event_without_an_end_date_explains_how() {
+        let dec10 = NaiveDate::from_ymd_opt(2026, 12, 10).unwrap();
+        let (mut app, id) = app_with_advent(false, dec10);
+        app.handle_key(press(KeyCode::Char(' ')));
+        assert_eq!(
+            status(&app),
+            "Events count down on their own. For daily reminders, give it an end date (e)."
+        );
+        let item = app.db.get_item(&id).unwrap().unwrap();
+        assert_eq!(item.reminders_stopped_for, None, "nothing written");
     }
 
     /// `n` opens the Reminders popup, and each change is in the database straight away,

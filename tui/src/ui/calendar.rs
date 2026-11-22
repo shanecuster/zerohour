@@ -1,5 +1,8 @@
-//! The month-grid date picker that opens over the add/edit dialog's date field
-//! (Ctrl+D or F2).
+//! The month-grid date picker that opens over the add/edit dialog's date fields (Ctrl+D or
+//! F2 on the date, and on "Ends on" / "Until").
+//!
+//! For an end date the picker has an *earliest* day (the start): days before it are crossed
+//! out, and picking one is refused with a note in the hint line.
 //!
 //! ```text
 //! ╭ October 2026 ───────────────╮
@@ -47,6 +50,11 @@ pub struct Calendar {
     pub current: Option<NaiveDate>,
     /// Which day the grid's weeks start on.
     pub week_start: WeekStart,
+    /// The first day that may be picked, if any (an end date can't be before the start).
+    pub earliest: Option<NaiveDate>,
+    /// True right after Enter on a day before `earliest`: the hint line then says why
+    /// nothing happened. Any other key clears it.
+    pub refused: bool,
 }
 
 /// What a key press in the picker means for the form.
@@ -69,11 +77,33 @@ impl Calendar {
             cursor: current.unwrap_or(today),
             current,
             week_start,
+            earliest: None,
+            refused: false,
         }
+    }
+
+    /// Only days on or after `earliest` may be picked (see [`Calendar::allows`]). With no date
+    /// in the field yet, the picker opens on `earliest` instead of today: an end date is
+    /// usually near the start. `self` is taken by value and returned, so calls can be chained
+    /// right after [`Calendar::new`].
+    pub fn with_earliest(mut self, earliest: Option<NaiveDate>) -> Calendar {
+        self.earliest = earliest;
+        if let (None, Some(first)) = (self.current, earliest) {
+            self.cursor = first;
+        }
+        self
+    }
+
+    /// True if `date` may be picked: on or after the earliest day, if there is one.
+    pub fn allows(&self, date: NaiveDate) -> bool {
+        // `is_none_or`: true when there's no earliest day, or the closure says yes.
+        self.earliest.is_none_or(|first| date >= first)
     }
 
     /// Handles one key. `today` is needed for the `t` (jump to today) key.
     pub fn handle_key(&mut self, key: KeyEvent, today: NaiveDate) -> CalendarOutcome {
+        // Any key after a refused pick clears the note (Enter may set it again below).
+        self.refused = false;
         match key.code {
             // Days and weeks. Moving off the shown month simply shows the new month.
             KeyCode::Left | KeyCode::Char('h') => self.cursor = add_days(self.cursor, -1),
@@ -88,6 +118,8 @@ impl Calendar {
                 self.week_start = self.week_start.toggled();
                 return CalendarOutcome::WeekStartChanged(self.week_start);
             }
+            // A day before the earliest one can't be picked: stay open and say why.
+            KeyCode::Enter if !self.allows(self.cursor) => self.refused = true,
             KeyCode::Enter => return CalendarOutcome::Pick(self.cursor),
             KeyCode::Esc | KeyCode::Char('q') => return CalendarOutcome::Cancel,
             _ => {}
@@ -160,13 +192,22 @@ pub fn draw(frame: &mut Frame, calendar: &Calendar, theme: &Theme, today: NaiveD
         "←→↑↓/hjkl day · PgUp/Dn month",
         muted,
     )));
-    lines.push(Line::from(Span::styled(
-        format!(
-            "t today · w week: {} · ⏎ pick",
-            calendar.week_start.day_labels()[0]
+    // The second hint line, or (right after a refused pick) why nothing was picked. It fits
+    // the 29-column hint width: "not before the start (Dec 01)".
+    let second_hint = match (calendar.refused, calendar.earliest) {
+        (true, Some(first)) => Span::styled(
+            format!("not before the start ({})", first.format("%b %d")),
+            Style::new().fg(color(theme.danger)),
         ),
-        muted,
-    )));
+        _ => Span::styled(
+            format!(
+                "t today · w week: {} · ⏎ pick",
+                calendar.week_start.day_labels()[0]
+            ),
+            muted,
+        ),
+    };
+    lines.push(Line::from(second_hint));
 
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -185,6 +226,12 @@ fn day_style(date: NaiveDate, calendar: &Calendar, theme: &Theme, today: NaiveDa
     } else {
         Style::new().fg(color(theme.fg))
     };
+    // A day that can't be picked (before the start): crossed out, so it reads as "no".
+    if !calendar.allows(date) {
+        style = Style::new()
+            .fg(color(theme.muted))
+            .add_modifier(Modifier::CROSSED_OUT);
+    }
     // The date already in the field.
     if Some(date) == calendar.current {
         style = style.fg(color(theme.ok)).add_modifier(Modifier::BOLD);
@@ -268,6 +315,67 @@ mod tests {
             CalendarOutcome::WeekStartChanged(WeekStart::Monday)
         );
         assert_eq!(cal.week_start, WeekStart::Monday);
+    }
+
+    #[test]
+    fn days_before_the_earliest_are_refused_and_crossed_out() {
+        let today = d(2026, 10, 9);
+        // An empty end date opens on the start, not on today.
+        let mut cal =
+            Calendar::new(None, today, WeekStart::Sunday).with_earliest(Some(d(2026, 12, 1)));
+        assert_eq!(cal.cursor, d(2026, 12, 1));
+        press(&mut cal, KeyCode::Left);
+        assert_eq!(press(&mut cal, KeyCode::Enter), CalendarOutcome::Continue);
+        assert!(cal.refused, "Nov 30 is before the start");
+        press(&mut cal, KeyCode::Right);
+        assert!(!cal.refused, "any key clears the note");
+        assert_eq!(
+            press(&mut cal, KeyCode::Enter),
+            CalendarOutcome::Pick(d(2026, 12, 1)),
+            "the start itself is fine"
+        );
+        // A date already in the field still opens on that date.
+        let filled = Calendar::new(Some(d(2026, 12, 24)), today, WeekStart::Sunday)
+            .with_earliest(Some(d(2026, 12, 1)));
+        assert_eq!(filled.cursor, d(2026, 12, 24));
+
+        // Drawn: Nov 30 crossed out, Dec 2 not; after a refusal, the note.
+        let theme = &zerohour_core::theme::THEMES[0];
+        let mut cal = filled;
+        cal.cursor = d(2026, 11, 30);
+        assert!(
+            day_style(d(2026, 11, 30), &cal, theme, today)
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        assert!(
+            !day_style(d(2026, 12, 2), &cal, theme, today)
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT)
+        );
+        press(&mut cal, KeyCode::Enter);
+        let screen = draw_to_text(&cal, today);
+        assert!(screen.contains("not before the start (Dec 01)"), "{screen}");
+    }
+
+    /// The picker drawn on an 80×24 screen, as text.
+    fn draw_to_text(cal: &Calendar, today: NaiveDate) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let theme = &zerohour_core::theme::THEMES[0];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, cal, theme, today);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
     }
 
     #[test]

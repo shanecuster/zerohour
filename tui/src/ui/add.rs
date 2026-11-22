@@ -14,8 +14,9 @@
 //!
 //! Editing skips step 1 (an item's kind can't change) and starts with the fields pre-filled.
 //!
-//! The date field also has a month-grid picker (Ctrl+D or F2, see `calendar.rs`); typing a
-//! date still works.
+//! The date field and the "Ends on" / "Until" field also have a month-grid picker (Ctrl+D or
+//! F2, see `calendar.rs`); typing a date still works. For the end date the picker won't pick
+//! a day before the start.
 //!
 //! The form's values, which fields appear, the repeat choices, stepping through a choice,
 //! validation and the previews live in core (`zerohour_core::form`), so the Android app's
@@ -83,6 +84,8 @@ pub struct Form {
     pub error: Option<String>,
     /// The date picker, while it's open over the form.
     pub calendar: Option<Calendar>,
+    /// Which date row the open picker fills: [`Field::Date`] or [`Field::EndDate`].
+    pub calendar_field: Field,
     /// Display settings the form needs (week start, 12/24-hour times).
     pub prefs: FormPrefs,
 }
@@ -108,6 +111,7 @@ impl Form {
             focus: 0,
             error: None,
             calendar: None,
+            calendar_field: Field::Date,
             prefs,
         }
     }
@@ -126,10 +130,23 @@ impl Form {
         let Some(calendar) = &self.calendar else {
             return;
         };
-        if let Some(date) = grid.date_at(calendar, column, row) {
-            self.input.set_date(date);
-            self.calendar = None;
+        // A click on a day before the earliest one (crossed out) does nothing.
+        if let Some(date) = grid.date_at(calendar, column, row)
+            && calendar.allows(date)
+        {
+            self.put_picked_date(date);
         }
+    }
+
+    /// Puts a date picked in the calendar into the row that opened it, and closes it.
+    fn put_picked_date(&mut self, date: NaiveDate) {
+        // Core writes it in ISO form: unambiguous, and what editing shows too.
+        if self.calendar_field == Field::EndDate {
+            self.input.set_end_date(date);
+        } else {
+            self.input.set_date(date);
+        }
+        self.calendar = None;
     }
 
     /// The scroll wheel over the open date picker: one month back (`-1`) or forward (`1`).
@@ -160,11 +177,7 @@ impl Form {
             match calendar.handle_key(key, today) {
                 CalendarOutcome::Continue => {}
                 CalendarOutcome::Cancel => self.calendar = None,
-                CalendarOutcome::Pick(date) => {
-                    // Core writes it in ISO form: unambiguous, and what editing shows too.
-                    self.input.set_date(date);
-                    self.calendar = None;
-                }
+                CalendarOutcome::Pick(date) => self.put_picked_date(date),
                 CalendarOutcome::WeekStartChanged(start) => {
                     self.prefs.week_start = start;
                     return FormOutcome::WeekStartChanged(start);
@@ -244,6 +257,20 @@ impl Form {
                     .ok()
                     .flatten();
                 self.calendar = Some(Calendar::new(current, today, self.prefs.week_start));
+                self.calendar_field = Field::Date;
+            }
+            // The same keys on "Ends on" / "Until": the same picker, which won't pick a day
+            // before the start, and opens on the start when the field is empty. (The row is
+            // hidden on a one-off task, so it can't be focused and the keys do nothing.)
+            KeyCode::Char('d') | KeyCode::F(2)
+                if field == Field::EndDate && (ctrl || key.code == KeyCode::F(2)) =>
+            {
+                let start = self.input.start_date(today);
+                // `and_then`: only with a start can the typed end be read (it counts from it).
+                let current = start.and_then(|s| self.input.end_date(s).ok().flatten());
+                self.calendar =
+                    Some(Calendar::new(current, today, self.prefs.week_start).with_earliest(start));
+                self.calendar_field = Field::EndDate;
             }
             // Ctrl+U clears the focused text field (same as in a shell).
             KeyCode::Char('u') if ctrl => {
@@ -280,6 +307,7 @@ impl Form {
             Field::Date => Some(&mut self.input.date_text),
             Field::Time => Some(&mut self.input.time_text),
             Field::EveryN => Some(&mut self.input.every_n),
+            Field::EndDate => Some(&mut self.input.end_text),
             Field::Notes => Some(&mut self.input.notes),
             _ => None,
         }
@@ -431,7 +459,9 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
         lines.push(Line::from(vec![
             Span::styled(if is_focused { "› " } else { "  " }, label_style),
             Span::styled(
-                format!("{:<LABEL_WIDTH$} ", field.label(form.input.kind)),
+                // `input.label` (not `field.label`): an event's date reads "Starts" once it
+                // has an end date.
+                format!("{:<LABEL_WIDTH$} ", form.input.label(*field)),
                 label_style,
             ),
             Span::styled(value, Style::new().fg(color(theme.fg))),
@@ -461,7 +491,9 @@ fn draw_fields(frame: &mut Frame, form: &Form, theme: &Theme, today: NaiveDate) 
     }
     // The hint names the keys that do something on the focused field.
     let hint = match focused {
-        Field::Date => "Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel",
+        Field::Date | Field::EndDate => {
+            "Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel"
+        }
         Field::Days => "↑↓ move · ←→ day · Space on/off · Enter save · Esc cancel",
         _ => "Tab/↑↓ move · ←→ change · Enter save · Esc cancel",
     };
@@ -525,12 +557,14 @@ fn field_value(form: &Form, field: Field, focused: bool, width: usize) -> String
                 Field::Date => &form.input.date_text,
                 Field::Time => &form.input.time_text,
                 Field::EveryN => &form.input.every_n,
+                Field::EndDate => &form.input.end_text,
                 _ => &form.input.notes,
             };
             debug_assert!(field.is_text());
             if focused {
                 format!("{}▏", tail_fit(text, width.saturating_sub(1)))
-            } else if text.is_empty() && matches!(field, Field::Date | Field::Time) {
+            } else if text.is_empty() && matches!(field, Field::Date | Field::Time | Field::EndDate)
+            {
                 "(none)".to_string()
             } else {
                 tail_fit(text, width)
@@ -984,6 +1018,125 @@ mod tests {
             "{rows:#?}"
         );
         assert!(rows.iter().any(|row| row == "Thu Nov 25 2027"), "{rows:#?}");
+    }
+
+    /// An Advent of Cyber event form (yearly from Dec 1 2026), focused on "Ends on".
+    fn advent_form() -> Form {
+        let mut form = task_form();
+        form.input.kind = Kind::Event;
+        form.input.title = "Advent of Cyber".into();
+        form.input.date_text = "2026-12-01".into();
+        form.input.repeat = RepeatChoice::Yearly;
+        focus_on(&mut form, Field::EndDate);
+        form
+    }
+
+    #[test]
+    fn ends_on_takes_typing_and_saves_the_end_date() {
+        let mut form = advent_form();
+        type_text(&mut form, "12/24");
+        assert_eq!(form.input.end_text, "12/24");
+        match form.handle_key(key(KeyCode::Enter), today()) {
+            FormOutcome::Save(data) => {
+                assert_eq!(data.end_date, NaiveDate::from_ymd_opt(2026, 12, 24));
+            }
+            _ => panic!("expected the form to save"),
+        }
+        // Before the start: the form stays open with core's message. (A full date: a short
+        // "11/30" counts from the start, so it would mean next year's Nov 30.)
+        form.input.end_text = "2026-11-30".into();
+        assert!(matches!(
+            form.handle_key(key(KeyCode::Enter), today()),
+            FormOutcome::Continue
+        ));
+        assert_eq!(
+            form.error.as_deref(),
+            Some("\"Ends on\" can't be before the start (Tue Dec 01 2026).")
+        );
+    }
+
+    #[test]
+    fn ctrl_d_and_f2_on_ends_on_open_the_picker_at_the_start_and_refuse_earlier_days() {
+        for opener in [
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            key(KeyCode::F(2)),
+        ] {
+            let mut form = advent_form();
+            form.handle_key(opener, today());
+            let calendar = form.calendar.as_ref().expect("picker open");
+            let dec = |d: u32| NaiveDate::from_ymd_opt(2026, 12, d).unwrap();
+            assert_eq!(calendar.cursor, dec(1), "empty: opens at the start");
+            assert_eq!(calendar.earliest, Some(dec(1)));
+            // Nov 30 is refused: the picker stays open and the field stays empty.
+            form.handle_key(key(KeyCode::Left), today());
+            form.handle_key(key(KeyCode::Enter), today());
+            assert!(form.calendar.is_some());
+            assert!(form.input.end_text.is_empty());
+            // Dec 24 (Nov 30 + 3 weeks + 3 days) is picked into "Ends on", not the date.
+            for _ in 0..3 {
+                form.handle_key(key(KeyCode::Down), today());
+            }
+            for _ in 0..3 {
+                form.handle_key(key(KeyCode::Right), today());
+            }
+            form.handle_key(key(KeyCode::Enter), today());
+            assert!(form.calendar.is_none());
+            assert_eq!(form.input.end_text, "2026-12-24");
+            assert_eq!(form.input.date_text, "2026-12-01");
+            // Reopened, it starts on the end date already there.
+            form.handle_key(key(KeyCode::F(2)), today());
+            assert_eq!(form.calendar.as_ref().unwrap().cursor, dec(24));
+        }
+    }
+
+    #[test]
+    fn the_picker_keys_do_nothing_on_a_one_off_task_which_has_no_until_row() {
+        let mut form = task_form();
+        form.input.date_text = "2026-12-01".into();
+        assert!(!form.fields().contains(&Field::EndDate));
+        // Focus can only be on rows that exist; F2 on any other row but the date is ignored.
+        focus_on(&mut form, Field::Notes);
+        form.handle_key(key(KeyCode::F(2)), today());
+        assert!(form.calendar.is_none());
+        // A repeating task has the row, and the picker works there too.
+        form.input.repeat = RepeatChoice::Daily;
+        focus_on(&mut form, Field::EndDate);
+        form.handle_key(key(KeyCode::F(2)), today());
+        assert!(form.calendar.is_some());
+        assert_eq!(form.calendar_field, Field::EndDate);
+    }
+
+    #[test]
+    fn the_end_rows_and_their_previews_are_never_cut_off() {
+        let mut form = advent_form();
+        form.focus = 0;
+        assert_dialog_shows(
+            &form,
+            &[
+                "Ends on",
+                "(none)",
+                "empty = no end · e.g. 12/24 or +23, from the start",
+            ],
+        );
+        form.input.end_text = "12/24".into();
+        assert_dialog_shows(
+            &form,
+            &[
+                "Starts",
+                "→ Tue Dec 01 to Thu Dec 24, every year · a reminder each day (24)",
+            ],
+        );
+        let mut task = task_form();
+        task.input.date_text = "2026-12-01".into();
+        task.input.repeat = RepeatChoice::Daily;
+        task.input.end_text = "12/24".into();
+        assert_dialog_shows(&task, &["Until", "→ last one Thu Dec 24"]);
+        // The hint on the row names the picker.
+        focus_on(&mut task, Field::EndDate);
+        assert_dialog_shows(
+            &task,
+            &["Tab/↑↓ move · Ctrl+D/F2 calendar · Enter save · Esc cancel"],
+        );
     }
 
     #[test]

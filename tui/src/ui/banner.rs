@@ -76,7 +76,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) {
 
     // The tagline: the next event's countdown, or today's date if there's none. Core picks
     // the event (visible, upcoming ones only) and writes the words.
-    let text = view::tagline_text(view::next_upcoming(&app.events), app.today);
+    // A running event ("Advent of Cyber: day 5 of 24"), else the soonest upcoming one.
+    let text = view::tagline(&app.events, app.today);
     lines.push(Line::from(Span::styled(
         truncate(&text, usize::from(area.width)),
         Style::new().fg(color(theme.muted)),

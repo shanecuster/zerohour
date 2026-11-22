@@ -28,7 +28,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::{
     Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
 };
-use crate::repeat::{is_overdue, next_instance_date};
+use crate::repeat::{event_range, is_overdue, next_instance_date, within_series};
 
 /// Everything that can go wrong in the storage layer.
 ///
@@ -56,7 +56,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
 /// Version 1 is the initial schema; version 2 adds the sync bookkeeping table; version 3 adds
-/// the optional due time; version 4 adds the desktop reminder log.
+/// the optional due time; version 4 adds the desktop reminder log; version 5 (from an
+/// earlier test build) adds the stop marker and an unused column; version 6 adds end dates.
 /// NEVER edit an entry once released; add a new one instead.
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -133,12 +134,42 @@ const MIGRATIONS: &[(i64, &str)] = &[
     );
     ",
     ),
+    // Migration 5 came from a test build of an earlier design ("remind N days before"), and
+    // real databases already have it applied, so it stays exactly as it was (a migration is
+    // never edited once a database has run it). Of its two columns:
+    // - `reminders_stopped_for` is used (see `Item::reminders_stopped_for`);
+    // - `remind_days_before` is NOT used: no build reads or writes it any more, and it stays
+    //   NULL. SQLite columns can't simply be dropped without rebuilding the table, and an
+    //   unused nullable column costs nothing, so it is left alone.
+    (
+        5,
+        "
+    -- Daily reminders before an event (see Item::remind_days_before), and the occurrence
+    -- they were stopped for (Item::reminders_stopped_for, 'YYYY-MM-DD'). NULL = off / not
+    -- stopped. Purely additive: existing rows get NULL, and older builds that don't know
+    -- the columns never read them (their INSERT and UPDATE statements name their columns,
+    -- so they leave these alone).
+    ALTER TABLE items ADD COLUMN remind_days_before INTEGER;
+    ALTER TABLE items ADD COLUMN reminders_stopped_for TEXT;
+    ",
+    ),
+    (
+        6,
+        "
+    -- The last day of an item's range, 'YYYY-MM-DD' (see Item::end_date): an event that runs
+    -- from its date through this day (with a daily reminder on each day), or the last day a
+    -- repeating task repeats. NULL = no end. Purely additive: existing rows get NULL, and
+    -- older builds never read it (their statements name their columns).
+    ALTER TABLE items ADD COLUMN end_date TEXT;
+    ",
+    ),
 ];
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
 pub(crate) const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
-                            completed_at, created_at, updated_at, deleted, due_time";
+                            completed_at, created_at, updated_at, deleted, due_time, \
+                            end_date, reminders_stopped_for";
 
 /// Well-known keys for the settings table, so typos become compile errors instead of bugs.
 pub mod settings_keys {
@@ -285,7 +316,8 @@ impl Db {
             "UPDATE items SET kind = ?2, title = ?3, notes = ?4, priority = ?5, date = ?6,
                               repeat = ?7, keep_after_pass = ?8, completed_at = ?9,
                               created_at = ?10, updated_at = ?11, deleted = ?12,
-                              due_time = ?13
+                              due_time = ?13, end_date = ?14,
+                              reminders_stopped_for = ?15
              WHERE id = ?1",
             params![
                 item.id,
@@ -301,6 +333,8 @@ impl Db {
                 ts_to_db(item.updated_at),
                 item.deleted,
                 item.due_time.map(time_to_db),
+                item.end_date.map(date_to_db),
+                item.reminders_stopped_for.map(date_to_db),
             ],
         )?;
         if changed == 0 {
@@ -323,6 +357,54 @@ impl Db {
             return Err(DbError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Stops an event's daily reminders for its current range on `today` (local date): the
+    /// running one, or the next one if none is running ("skip this year"). Returns that
+    /// range's first day, which is what the marker stores.
+    ///
+    /// Only the marker changes (plus `updated_at`, so the stop syncs). Nothing has to undo it
+    /// later: once the range is over, the marker names a past range and no longer matches,
+    /// so next year's range is reminded again on its own (see `reminders::reminded_range`).
+    ///
+    /// Fails with `NotFound` for a missing or deleted id, and with `BadData` for a task or an
+    /// event without an end date, which have nothing to stop.
+    pub fn stop_event_reminders(
+        &self,
+        id: &str,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<NaiveDate> {
+        let mut item = self.live_event(id)?;
+        // `ok_or_else` turns `None` (no range) into an error, built only if needed.
+        let range = event_range(&item, today)
+            .ok_or_else(|| DbError::BadData(format!("event {id} has no end date")))?;
+        item.reminders_stopped_for = Some(range.start);
+        self.update_item(&mut item, now)?;
+        Ok(range.start)
+    }
+
+    /// Undoes [`Db::stop_event_reminders`]: the event's daily reminders come back (if its
+    /// range is running). Clears the marker whatever range it named.
+    pub fn resume_event_reminders(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        let mut item = self.live_event(id)?;
+        item.reminders_stopped_for = None;
+        self.update_item(&mut item, now)
+    }
+
+    /// Loads an event that isn't deleted, for the stop/resume functions above.
+    fn live_event(&self, id: &str) -> Result<Item> {
+        // `filter` turns `Some(deleted item)` into `None`, so both cases give `NotFound`.
+        let item = self
+            .get_item(id)?
+            .filter(|item| !item.deleted)
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
+        if item.kind != Kind::Event {
+            return Err(DbError::BadData(format!(
+                "{id} is a task; only events have daily reminders"
+            )));
+        }
+        Ok(item)
     }
 
     /// The stored `updated_at` of an item, or `None` if there's no such id.
@@ -393,8 +475,11 @@ impl Db {
 
         // Build the next instance (if repeating) before we start writing.
         // The next instance keeps the due time (`..task.clone()` below copies it).
-        let next =
-            next_instance_date(task.repeat, task.date, task.due_time, local_now).map(|date| {
+        // A series with an end date ("daily until Dec 24") stops there: `.filter` drops a
+        // next date past the end, so no instance is made.
+        let next = next_instance_date(task.repeat, task.date, task.due_time, local_now)
+            .filter(|&date| within_series(&task, date))
+            .map(|date| {
                 // `..task.clone()` = "every other field copied from the old task".
                 Item {
                     id: derived_id(DerivedId::NextInstance, &task.id),
@@ -593,7 +678,7 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
     conn.execute(
         &format!(
             "{verb} INTO items ({ITEM_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
         ),
         params![
             item.id,
@@ -609,6 +694,8 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
             ts_to_db(item.updated_at),
             item.deleted,
             item.due_time.map(time_to_db),
+            item.end_date.map(date_to_db),
+            item.reminders_stopped_for.map(date_to_db),
         ],
     )?;
     Ok(())
@@ -663,6 +750,8 @@ pub(crate) struct RawItem {
     updated_at: String,
     deleted: bool,
     due_time: Option<String>,
+    end_date: Option<String>,
+    reminders_stopped_for: Option<String>,
 }
 
 impl RawItem {
@@ -685,6 +774,8 @@ impl RawItem {
             updated_at: row.get(10)?,
             deleted: row.get(11)?,
             due_time: row.get(12)?,
+            end_date: row.get(13)?,
+            reminders_stopped_for: row.get(14)?,
         })
     }
 
@@ -706,6 +797,14 @@ impl RawItem {
             notes: self.notes,
             keep_after_pass: self.keep_after_pass,
             deleted: self.deleted,
+            // `Option<&str>` → `Option<Result<NaiveDate>>` → `Result<Option<NaiveDate>>`:
+            // `transpose` swaps the two wrappers so `?` can catch a malformed date.
+            end_date: self.end_date.as_deref().map(date_from_db).transpose()?,
+            reminders_stopped_for: self
+                .reminders_stopped_for
+                .as_deref()
+                .map(date_from_db)
+                .transpose()?,
         })
     }
 }
@@ -772,10 +871,10 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -821,7 +920,7 @@ mod tests {
 
         // Re-run initialization the way `Db::open` does on the next start.
         let db = Db::init(old.conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
         assert_eq!(
@@ -863,7 +962,7 @@ mod tests {
         .unwrap();
 
         let db = Db::init(conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         let christmas = db.get_item("e1").unwrap().unwrap();
         assert_eq!(christmas.title, "Christmas");
         assert_eq!(christmas.date, Some(d(2026, 12, 25)));
@@ -891,7 +990,18 @@ mod tests {
         let mut task = Item::new(Kind::Task, "Fill Out Your Timesheet", now());
         task.date = Some(d(2026, 10, 26));
         task.due_time = NaiveTime::from_hms_opt(14, 0, 0);
-        old.insert_item(&task).unwrap();
+        // Written with the schema-3 column list, as a schema-3 build would have (today's
+        // `insert_item` names columns that don't exist yet in this database).
+        old.conn
+            .execute(
+                "INSERT INTO items (id, kind, title, notes, priority, date, repeat,
+                                    keep_after_pass, completed_at, created_at, updated_at,
+                                    deleted, due_time)
+                 VALUES (?1, 'task', ?2, NULL, 'medium', '2026-10-26', 'none', 0, NULL,
+                         ?3, ?3, 0, '14:00')",
+                params![task.id, task.title, ts_to_db(now())],
+            )
+            .unwrap();
         let completion = Completion {
             id: new_id(),
             item_id: task.id.clone(),
@@ -913,10 +1023,10 @@ mod tests {
     }
 
     #[test]
-    fn version_3_database_upgrades_to_4_adding_only_the_reminder_log() {
+    fn version_3_database_upgrades_adding_only_the_reminder_log_and_columns() {
         let (conn, task, completion) = version_3_database();
         let db = Db::init(conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         // Every existing row is untouched.
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
@@ -944,6 +1054,183 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 6);
+    }
+
+    /// A database exactly as the earlier test build left it: migrations 1 to 5 applied, so
+    /// it has the unused `remind_days_before` column (here even with a stray value in it).
+    fn version_5_database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, ts_to_db(now())],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO items (id, kind, title, notes, priority, date, repeat, keep_after_pass,
+                                completed_at, created_at, updated_at, deleted, due_time,
+                                remind_days_before, reminders_stopped_for)
+             VALUES ('e1', 'event', 'Advent of Cyber', 'one room a day', 'medium',
+                     '2026-12-01', 'yearly', 0, NULL, '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z', 0, NULL, 23, NULL)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn version_5_database_upgrades_to_6_with_no_end_dates() {
+        let db = Db::init(version_5_database()).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 6);
+        let event = db.get_item("e1").unwrap().unwrap();
+        // Every old field is untouched...
+        assert_eq!(event.title, "Advent of Cyber");
+        assert_eq!(event.notes.as_deref(), Some("one room a day"));
+        assert_eq!(event.date, Some(d(2026, 12, 1)));
+        assert_eq!(event.repeat, RepeatRule::Yearly);
+        assert_eq!(ts_to_db(event.updated_at), "2026-10-01T00:00:00.000Z");
+        // ...the new one starts empty, and the old window (23) is simply not read.
+        assert_eq!(event.end_date, None);
+        assert_eq!(event.reminders_stopped_for, None);
+    }
+
+    #[test]
+    fn writing_an_item_leaves_the_unused_column_alone() {
+        let db = Db::init(version_5_database()).unwrap();
+        let mut event = db.get_item("e1").unwrap().unwrap();
+        event.end_date = Some(d(2026, 12, 24));
+        db.update_item(&mut event, now()).unwrap();
+        let old_window: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT remind_days_before FROM items WHERE id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Untouched (no statement names the column), and harmless.
+        assert_eq!(old_window, Some(23));
+    }
+
+    #[test]
+    fn end_date_and_stop_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", now());
+        event.date = Some(d(2026, 12, 1));
+        event.repeat = RepeatRule::Yearly;
+        event.end_date = Some(d(2026, 12, 24));
+        event.reminders_stopped_for = Some(d(2026, 12, 1));
+        db.insert_item(&event).unwrap();
+        assert_eq!(db.get_item(&event.id).unwrap().unwrap(), event);
+
+        // An edit can change and clear them.
+        event.end_date = None;
+        event.reminders_stopped_for = None;
+        db.update_item(&mut event, now() + chrono::TimeDelta::minutes(1))
+            .unwrap();
+        assert_eq!(db.get_item(&event.id).unwrap().unwrap(), event);
+    }
+
+    #[test]
+    fn stopping_marks_the_current_range_and_resuming_clears_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", now());
+        // Stored with last year's dates: a yearly range moves to this year's.
+        event.date = Some(d(2025, 12, 1));
+        event.end_date = Some(d(2025, 12, 24));
+        event.repeat = RepeatRule::Yearly;
+        db.insert_item(&event).unwrap();
+
+        let later = now() + chrono::TimeDelta::hours(1);
+        let stopped = db
+            .stop_event_reminders(&event.id, d(2026, 12, 5), later)
+            .unwrap();
+        assert_eq!(stopped, d(2026, 12, 1));
+        let saved = db.get_item(&event.id).unwrap().unwrap();
+        assert_eq!(saved.reminders_stopped_for, Some(d(2026, 12, 1)));
+        assert_eq!(saved.updated_at, later, "bumped, so the stop syncs");
+        // Everything else is untouched.
+        assert_eq!((saved.date, saved.end_date), (event.date, event.end_date));
+
+        // Before the range starts, a stop names the coming range ("skip this year").
+        let skipped = db
+            .stop_event_reminders(&event.id, d(2027, 11, 20), later)
+            .unwrap();
+        assert_eq!(skipped, d(2027, 12, 1));
+
+        db.resume_event_reminders(&event.id, later + chrono::TimeDelta::hours(1))
+            .unwrap();
+        assert_eq!(
+            db.get_item(&event.id)
+                .unwrap()
+                .unwrap()
+                .reminders_stopped_for,
+            None
+        );
+    }
+
+    #[test]
+    fn only_live_events_with_an_end_date_can_be_stopped() {
+        let db = Db::open_in_memory().unwrap();
+        let today = d(2026, 12, 10);
+        let task = Item::new(Kind::Task, "A task", now());
+        db.insert_item(&task).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&task.id, today, now()),
+            Err(DbError::BadData(_))
+        ));
+        let mut no_end = Item::new(Kind::Event, "No end date", now());
+        no_end.date = Some(d(2026, 12, 24));
+        db.insert_item(&no_end).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&no_end.id, today, now()),
+            Err(DbError::BadData(_))
+        ));
+        let mut gone = Item::new(Kind::Event, "Gone", now());
+        gone.date = Some(d(2026, 12, 1));
+        gone.end_date = Some(d(2026, 12, 24));
+        db.insert_item(&gone).unwrap();
+        db.delete_item(&gone.id, now()).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&gone.id, today, now()),
+            Err(DbError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.resume_event_reminders("no-such-id", now()),
+            Err(DbError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_repeating_task_makes_no_instance_past_its_until_date() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut room = Item::new(Kind::Task, "Advent of Cyber room", now());
+        room.date = Some(d(2026, 12, 23));
+        room.repeat = RepeatRule::Daily;
+        room.end_date = Some(d(2026, 12, 24));
+        db.insert_item(&room).unwrap();
+
+        // Done on Dec 23: the Dec 24 instance comes, and keeps the end date.
+        let at = |day: u32| d(2026, 12, day).and_hms_opt(20, 0, 0).unwrap();
+        let next = db.complete_task(&room.id, at(23), now()).unwrap().unwrap();
+        assert_eq!(next.date, Some(d(2026, 12, 24)));
+        assert_eq!(next.end_date, Some(d(2026, 12, 24)));
+        // Done on Dec 24: the series is over.
+        assert_eq!(db.complete_task(&next.id, at(24), now()).unwrap(), None);
+
+        // An instance done late, after the end date, makes none either.
+        let mut late = room.clone();
+        late.id = new_id();
+        late.date = Some(d(2026, 12, 20));
+        db.insert_item(&late).unwrap();
+        assert_eq!(db.complete_task(&late.id, at(26), now()).unwrap(), None);
     }
 
     /// 2026-10-26 at `h:m`, local wall-clock time.
