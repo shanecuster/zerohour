@@ -6,6 +6,22 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Events that run for days, with a daily reminder**: an optional *Ends on* date for events. Advent of
+  Cyber, Dec 1 to Dec 24 every year, reminds once a day at the day time on every day of the range
+  ("Day 5 of 24 · 19 days left" … "Last day"), on the desktop (`zerohour remind`) and, with the same
+  rules from core, on Android. Yearly ranges keep their calendar dates. While it runs the event is
+  listed first ("19 days left", "last day!") and the banner shows "day 5 of 24"; a bell / crossed-out
+  bell marks such events. `Space` on one stops its reminders for the current range (and undoes that);
+  on the last day of a repeating range the status line offers "keep it, or d to remove it". The
+  calendar picker (Ctrl+D / F2) works on the new row and won't pick a day before the start.
+- **Repeating tasks with an end**: an optional *Until* date on repeating tasks ("↻ daily until
+  Dec 24"); no instance and no reminder after it.
+- Database schema versions 5 and 6 add `end_date` and `reminders_stopped_for`, both nullable; existing
+  data is unchanged. Version 5 comes from a test build of an earlier design, and its
+  `remind_days_before` column is unused. Items with an end date sync as document `v: 5`, so older builds
+  skip just those items with the "need a newer zerohour" note (`v: 4` is skipped on purpose; a stray v4
+  document is read with its extra fields ignored).
+
 - **Nth-weekday repeats**: "the 4th Thursday of November" (Thanksgiving), "the last Monday of May",
   or "the 1st Friday of every month", for tasks and events. Choose *nth weekday* in the add/edit
   dialog, then the ordinal (1st to 4th, or last), weekday and month (or every month); the next two

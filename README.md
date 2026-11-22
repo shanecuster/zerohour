@@ -15,9 +15,10 @@ Add Christmas once and it counts down every year: after the date passes, it roll
 
 - **Tasks and events in one view.** Tasks on top, events underneath, each with its own color and icon.
 - **Countdowns that repeat.** Yearly, monthly, weekly, daily, every N days/weeks/months, on chosen weekdays (weekdays, Mon–Thu, or any days you pick), or on the Nth weekday of a month (Thanksgiving is the 4th Thursday of November; also "the 1st Friday of every month").
-- **Repeating tasks.** Completing one creates the next instance with the next due date.
+- **Repeating tasks.** Completing one creates the next instance with the next due date. Give one an end ("daily until Dec 24") and the series stops there.
+- **Events that run for days, with a daily reminder.** Give an event an end date (Advent of Cyber, Dec 1 to Dec 24, every year) and it reminds you once a day through the range. `Space` stops that for the year; next year's range comes back on its own.
 - **Due times.** Give a task a time ("2pm") and it shows "today 2:00 PM · in 3h", then "today 2:00 PM" once that time comes. It's only overdue when the day is over. 12- or 24-hour clock.
-- **Calendar picker** for dates (Ctrl+D or F2), with the keyboard or a mouse click. Typing dates still works.
+- **Calendar picker** for dates and end dates (Ctrl+D or F2), with the keyboard or a mouse click. Typing dates still works.
 - **Priorities and notes** on every item.
 - **Statistics.** Completions per week, streaks, overdue count, and more, with a bar chart.
 - **Themes.** Everforest, Dracula, Gruvbox, Catppuccin, Nord, Solarized, Tokyo Night, with a live-preview picker.
@@ -94,7 +95,7 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | Key | Action |
 |---|---|
 | `a` | Add a task or event |
-| `Space` / `x` | Complete a task |
+| `Space` / `x` | Complete a task; on an event with an end date, stop (or resume) its daily reminders |
 | `e` / `Enter` | Edit the selected item |
 | `d` | Delete the selected item |
 | `j` / `k` or arrows | Move up and down |
@@ -119,7 +120,7 @@ In the add/edit dialog:
 | `Tab` / `↑` `↓` | Move between fields |
 | `←` `→` | Change a choice (priority, repeat, and the nth weekday's rows); move between days in the day checkboxes |
 | `Space` | Toggle a checkbox or a day |
-| `Ctrl+D` / `F2` | Open the calendar on the date field |
+| `Ctrl+D` / `F2` | Open the calendar on the date field, or on "Ends on" / "Until" |
 | `Enter` | Save |
 | `Esc` | Close (or close just the calendar) |
 
@@ -152,7 +153,8 @@ Options:
 Your data is stored in `~/.local/share/zerohour/zerohour.db`.
 
 **Upgrading:** new versions update the database automatically and keep your data
-(schema version 4 adds a small table for desktop reminders).
+(schema version 4 adds a small table for desktop reminders; 5 and 6 add end dates and the "stopped for this year" mark).
+Version 5 came from a test build of an earlier design; one of its columns (`remind_days_before`) is unused and stays empty.
 Going back is limited: once you've used a weekday or nth-weekday repeat, an older version of zerohour can't open that database
 (it reports "bad data" instead of guessing). Keep a copy of the file before upgrading if you might go back.
 
@@ -164,8 +166,9 @@ the app, so it's fine while zerohour is open in a terminal.
 
 **What gets a reminder** (the same rules as the Android app): a task with a due time, at that time,
 plus an earlier reminder if you set one; a repeating task on each of its days while it's still open;
-a task due on a day without a time, at the day time (9:00 AM unless changed); and, if switched on, a
-daily list of overdue tasks.
+a task due on a day without a time, at the day time (9:00 AM unless changed); an event with an end
+date, once a day at the day time on every day of its range (see below); and, if switched on, a daily
+list of overdue tasks.
 
 ### Setting it up
 
@@ -201,6 +204,40 @@ To stop: `systemctl --user disable --now zerohour-remind.timer`.
   than 15 minutes old.
 - Notifications stay until you dismiss them (or whatever your notification daemon does with them).
   There's no "Done" button yet; complete the task in the app.
+
+### Events that run for days
+
+For something that lasts a while (TryHackMe's Advent of Cyber, Dec 1 to Dec 24 every year), give the
+event an **Ends on** date in the add/edit dialog: its date becomes the first day ("Starts") and you get
+one reminder a day, at the day time, on every day of the range: "Day 5 of 24 · 19 days left" …
+"Last day". The line under the field shows the range ("→ Tue Dec 01 to Thu Dec 24, every year · a
+reminder each day (24)"). Empty means no end, and the event counts down as before.
+
+- **Typing it:** `12/24` means the first Dec 24 on or after the start, and `+23` means 23 days after the
+  start. `Ctrl+D` / `F2` opens the calendar, which won't pick a day before the start (those are crossed out).
+- **The rules:** the end can't be before the start; a one-off event's range is at most a year; a repeating
+  event's range has to end before it comes round again.
+- **While it runs**, the event is listed first with "19 days left" (and "last day!"), the date column
+  shows the last day, and the banner says "Advent of Cyber: day 5 of 24". Events with an end date have
+  a bell (bright while the range runs) or a crossed-out bell (stopped).
+- **Every year:** a yearly range keeps its calendar dates: Dec 1 to Dec 24 every year. The day after it
+  ends, the event counts down to next year's Dec 1.
+- **Stop for this year:** select the event and press `Space` (or `x`). Reminders stop until the next
+  range; `Space` again undoes it. Before the range starts, it skips the coming one.
+- **Keep or remove, on the last day:** for a repeating event, stopping on the last day also says "keep it,
+  or d to remove it". Keeping needs nothing. `d` deletes the event (with the usual y/n question).
+  **A delete can't be undone** in the app, and once synced it's deleted on every device.
+- The time of day is each device's own **day time** setting (`n`). Desktop notifications have no buttons;
+  use the app. The desktop timer doesn't sync, so a stop made on another device reaches it once
+  zerohour has been opened (or `r` pressed) there.
+
+### Repeating tasks with an end ("until")
+
+A repeating task gets an **Until** row (one-off tasks don't have it). "Daily until Dec 24" makes no
+instance after Dec 24: completing the last one ends the series, and no reminder is planned past it.
+The line under the field names the last one ("→ last one Thu Dec 24"), and the list shows
+"↻ daily until Dec 24" after the title. An instance left open past the end is overdue as usual. A yearly
+restart for tasks isn't there yet; an event with an end date covers the yearly part.
 
 ### If notifications never appear
 
@@ -270,8 +307,10 @@ itself is encrypted (Tailscale, WireGuard, a VPN).
 - A completed task stays completed, even if another device edited it later.
 - Completing the same repeating task on two offline devices creates one next instance, not two.
 
-Items with a due time or a weekday repeat are stored on the server in a newer format (`v: 2`), and items with an
-nth-weekday repeat in the format after that (`v: 3`).
+Items with a due time or a weekday repeat are stored on the server in a newer format (`v: 2`), items with an
+nth-weekday repeat in the format after that (`v: 3`), and items with an end date (or a stop) in `v: 5`
+(`v: 4` was only used by a test build).
+Until a device has been updated, it skips those items entirely: update the phone before relying on end dates there.
 A device running an older zerohour skips just those items and shows "N synced item(s) need a newer zerohour"; everything else keeps syncing.
 After updating that device, an item it skipped arrives the next time it's edited, or right away after *Reset sync state*.
 Update every device to use these features everywhere.
