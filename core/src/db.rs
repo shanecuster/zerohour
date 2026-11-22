@@ -28,7 +28,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::{
     Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
 };
-use crate::repeat::{is_overdue, next_instance_date};
+use crate::repeat::{event_range, is_overdue, next_instance_date};
 
 /// Everything that can go wrong in the storage layer.
 ///
@@ -56,7 +56,8 @@ pub type Result<T> = std::result::Result<T, DbError>;
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
 /// Version 1 is the initial schema; version 2 adds the sync bookkeeping table; version 3 adds
-/// the optional due time; version 4 adds the desktop reminder log.
+/// the optional due time; version 4 adds the desktop reminder log; version 5 (from an
+/// earlier test build) adds the stop marker and an unused column; version 6 adds end dates.
 /// NEVER edit an entry once released; add a new one instead.
 const MIGRATIONS: &[(i64, &str)] = &[
     (
@@ -356,6 +357,54 @@ impl Db {
             return Err(DbError::NotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    /// Stops an event's daily reminders for its current range on `today` (local date): the
+    /// running one, or the next one if none is running ("skip this year"). Returns that
+    /// range's first day, which is what the marker stores.
+    ///
+    /// Only the marker changes (plus `updated_at`, so the stop syncs). Nothing has to undo it
+    /// later: once the range is over, the marker names a past range and no longer matches,
+    /// so next year's range is reminded again on its own (see `reminders::reminded_range`).
+    ///
+    /// Fails with `NotFound` for a missing or deleted id, and with `BadData` for a task or an
+    /// event without an end date, which have nothing to stop.
+    pub fn stop_event_reminders(
+        &self,
+        id: &str,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<NaiveDate> {
+        let mut item = self.live_event(id)?;
+        // `ok_or_else` turns `None` (no range) into an error, built only if needed.
+        let range = event_range(&item, today)
+            .ok_or_else(|| DbError::BadData(format!("event {id} has no end date")))?;
+        item.reminders_stopped_for = Some(range.start);
+        self.update_item(&mut item, now)?;
+        Ok(range.start)
+    }
+
+    /// Undoes [`Db::stop_event_reminders`]: the event's daily reminders come back (if its
+    /// range is running). Clears the marker whatever range it named.
+    pub fn resume_event_reminders(&self, id: &str, now: DateTime<Utc>) -> Result<()> {
+        let mut item = self.live_event(id)?;
+        item.reminders_stopped_for = None;
+        self.update_item(&mut item, now)
+    }
+
+    /// Loads an event that isn't deleted, for the stop/resume functions above.
+    fn live_event(&self, id: &str) -> Result<Item> {
+        // `filter` turns `Some(deleted item)` into `None`, so both cases give `NotFound`.
+        let item = self
+            .get_item(id)?
+            .filter(|item| !item.deleted)
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
+        if item.kind != Kind::Event {
+            return Err(DbError::BadData(format!(
+                "{id} is a task; only events have daily reminders"
+            )));
+        }
+        Ok(item)
     }
 
     /// The stored `updated_at` of an item, or `None` if there's no such id.
@@ -1084,6 +1133,76 @@ mod tests {
         db.update_item(&mut event, now() + chrono::TimeDelta::minutes(1))
             .unwrap();
         assert_eq!(db.get_item(&event.id).unwrap().unwrap(), event);
+    }
+
+    #[test]
+    fn stopping_marks_the_current_range_and_resuming_clears_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", now());
+        // Stored with last year's dates: a yearly range moves to this year's.
+        event.date = Some(d(2025, 12, 1));
+        event.end_date = Some(d(2025, 12, 24));
+        event.repeat = RepeatRule::Yearly;
+        db.insert_item(&event).unwrap();
+
+        let later = now() + chrono::TimeDelta::hours(1);
+        let stopped = db
+            .stop_event_reminders(&event.id, d(2026, 12, 5), later)
+            .unwrap();
+        assert_eq!(stopped, d(2026, 12, 1));
+        let saved = db.get_item(&event.id).unwrap().unwrap();
+        assert_eq!(saved.reminders_stopped_for, Some(d(2026, 12, 1)));
+        assert_eq!(saved.updated_at, later, "bumped, so the stop syncs");
+        // Everything else is untouched.
+        assert_eq!((saved.date, saved.end_date), (event.date, event.end_date));
+
+        // Before the range starts, a stop names the coming range ("skip this year").
+        let skipped = db
+            .stop_event_reminders(&event.id, d(2027, 11, 20), later)
+            .unwrap();
+        assert_eq!(skipped, d(2027, 12, 1));
+
+        db.resume_event_reminders(&event.id, later + chrono::TimeDelta::hours(1))
+            .unwrap();
+        assert_eq!(
+            db.get_item(&event.id)
+                .unwrap()
+                .unwrap()
+                .reminders_stopped_for,
+            None
+        );
+    }
+
+    #[test]
+    fn only_live_events_with_an_end_date_can_be_stopped() {
+        let db = Db::open_in_memory().unwrap();
+        let today = d(2026, 12, 10);
+        let task = Item::new(Kind::Task, "A task", now());
+        db.insert_item(&task).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&task.id, today, now()),
+            Err(DbError::BadData(_))
+        ));
+        let mut no_end = Item::new(Kind::Event, "No end date", now());
+        no_end.date = Some(d(2026, 12, 24));
+        db.insert_item(&no_end).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&no_end.id, today, now()),
+            Err(DbError::BadData(_))
+        ));
+        let mut gone = Item::new(Kind::Event, "Gone", now());
+        gone.date = Some(d(2026, 12, 1));
+        gone.end_date = Some(d(2026, 12, 24));
+        db.insert_item(&gone).unwrap();
+        db.delete_item(&gone.id, now()).unwrap();
+        assert!(matches!(
+            db.stop_event_reminders(&gone.id, today, now()),
+            Err(DbError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.resume_event_reminders("no-such-id", now()),
+            Err(DbError::NotFound(_))
+        ));
     }
 
     /// 2026-10-26 at `h:m`, local wall-clock time.

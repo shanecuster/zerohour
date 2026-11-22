@@ -19,6 +19,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use crate::clock::{TimeFormat, format_time, format_time_short, relative_text};
 use crate::icons::{Icon, IconMode};
 use crate::model::{Item, Kind, Priority};
+use crate::reminders::{reminded_range, reminders_stopped};
 use crate::repeat::{days_until, event_is_visible, event_range, event_target, is_overdue};
 use crate::theme::Slot;
 
@@ -343,6 +344,26 @@ fn timed_due_label(
     Label::plain(text, slot)
 }
 
+/// The daily-reminder mark for an event row: which icon, in which color slot. `None` for an
+/// event without an end date, so lists that don't use the feature look exactly as before.
+///
+/// - [`Icon::RemindersStopped`], muted: stopped for the current range.
+/// - [`Icon::DailyReminder`] in the accent color: the range is running, so today has (or had)
+///   a reminder.
+/// - [`Icon::DailyReminder`], muted: the range hasn't started yet (or a one-off one passed).
+pub fn reminder_mark(item: &Item, today: NaiveDate) -> Option<(Icon, Slot)> {
+    if item.kind != Kind::Event || item.end_date.is_none() {
+        return None;
+    }
+    Some(if reminders_stopped(item, today) {
+        (Icon::RemindersStopped, Slot::Muted)
+    } else if reminded_range(item, today).is_some() {
+        (Icon::DailyReminder, Slot::Accent)
+    } else {
+        (Icon::DailyReminder, Slot::Muted)
+    })
+}
+
 /// The countdown column for one event row: [`running_label`] while its range runs, else
 /// [`countdown_label`].
 pub fn event_label(row: &EventRow, narrow: bool) -> Label {
@@ -601,6 +622,37 @@ mod tests {
         assert_eq!(rows[0].item.title, "Christmas");
         assert_eq!(rows[1].target, NaiveDate::from_ymd_opt(2027, 12, 1));
         assert_eq!(tagline(&rows, dec(25)), "Christmas is today!");
+    }
+
+    #[test]
+    fn reminder_marks_follow_the_range_and_the_stop() {
+        let mut items = advent_and_christmas();
+        let day = |m: u32, d: u32| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        let christmas = items[0].clone();
+        // No end date: no mark, so the list looks as it always did.
+        assert_eq!(reminder_mark(&christmas, day(12, 10)), None);
+        let advent = &mut items[1];
+        assert_eq!(
+            reminder_mark(advent, day(11, 22)),
+            Some((Icon::DailyReminder, Slot::Muted)),
+            "not started yet"
+        );
+        assert_eq!(
+            reminder_mark(advent, day(12, 10)),
+            Some((Icon::DailyReminder, Slot::Accent)),
+            "running"
+        );
+        advent.reminders_stopped_for = Some(day(12, 1));
+        assert_eq!(
+            reminder_mark(advent, day(12, 10)),
+            Some((Icon::RemindersStopped, Slot::Muted)),
+            "stopped"
+        );
+        // The day after: next year's range, not stopped, not started.
+        assert_eq!(
+            reminder_mark(advent, day(12, 25)),
+            Some((Icon::DailyReminder, Slot::Muted))
+        );
     }
 
     #[test]
