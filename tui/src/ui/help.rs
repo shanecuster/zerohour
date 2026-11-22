@@ -23,6 +23,7 @@ const KEYS: &[(&str, &str)] = &[
     ),
     ("e / Enter", "edit the selected item"),
     ("d", "delete the selected item"),
+    ("u", "undo the last done or delete (until the next key)"),
     ("j k / ↑ ↓", "move · g G jump to top/bottom"),
     ("p", "show/hide one-off events that have passed"),
     ("v", "layout: split 50/50 ↔ events fit their content"),

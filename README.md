@@ -98,6 +98,7 @@ Press `?` inside the app for the full list of keybindings. The basics:
 | `Space` / `x` | Complete a task; on an event with an end date, stop (or resume) its daily reminders |
 | `e` / `Enter` | Edit the selected item |
 | `d` | Delete the selected item |
+| `u` | Undo the last Done or delete, while the status line still offers it (see below) |
 | `j` / `k` or arrows | Move up and down |
 | `g` / `G` | Jump to top / bottom |
 | `p` | Show or hide passed events |
@@ -226,7 +227,7 @@ reminder each day (24)"). Empty means no end, and the event counts down as befor
   range; `Space` again undoes it. Before the range starts, it skips the coming one.
 - **Keep or remove, on the last day:** for a repeating event, stopping on the last day also says "keep it,
   or d to remove it". Keeping needs nothing. `d` deletes the event (with the usual y/n question).
-  **A delete can't be undone** in the app, and once synced it's deleted on every device.
+  `u` right after takes the delete back, until it has synced; once synced it's deleted on every device.
 - The time of day is each device's own **day time** setting (`n`). Desktop notifications have no buttons;
   use the app. The desktop timer doesn't sync, so a stop made on another device reaches it once
   zerohour has been opened (or `r` pressed) there.

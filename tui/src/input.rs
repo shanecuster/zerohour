@@ -27,6 +27,8 @@ pub enum Action {
     Complete,
     /// Delete the selected item (asks first).
     Delete,
+    /// Undo the last Done or delete, while the status line still offers it.
+    Undo,
     /// Switch between the main screen and the stats screen.
     ToggleStats,
     /// Open the theme picker.
@@ -73,6 +75,7 @@ pub fn main_action(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('e') | KeyCode::Enter => Action::Edit,
         KeyCode::Char(' ') | KeyCode::Char('x') => Action::Complete,
         KeyCode::Char('d') | KeyCode::Delete => Action::Delete,
+        KeyCode::Char('u') => Action::Undo,
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('s') => Action::ToggleStats,
         KeyCode::Char('t') => Action::Theme,
         KeyCode::Char('i') => Action::CycleIcons,
@@ -125,6 +128,7 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(main_action(ctrl_c), Some(Action::Quit));
         assert_eq!(main_action(press(KeyCode::Char('z'))), None);
+        assert_eq!(main_action(press(KeyCode::Char('u'))), Some(Action::Undo));
         assert_eq!(
             main_action(press(KeyCode::Char('n'))),
             Some(Action::Reminders)

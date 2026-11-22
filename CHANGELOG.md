@@ -6,6 +6,13 @@ All notable changes to zerohour. The format follows [Keep a Changelog](https://k
 
 ### Added
 
+- **Undo for Done and delete**: after completing a task or deleting an item, the status line ends in
+  "· u undo", and `u` takes it back: "Reopened" or "Restored". Undoing a Done also removes the
+  completion from the stats and the next instance a repeating task got. The offer lasts until the next
+  key, and only while the change hasn't synced: once the server has it, sync's rules (a delete and a
+  completion always stick) would bring it back, so `u` says "Already synced: can't undo" and changes
+  nothing. No database or sync change; core's `Db::undo_delete` and `Db::undo_complete` are shared
+  with the Android app.
 - **Events that run for days, with a daily reminder**: an optional *Ends on* date for events. Advent of
   Cyber, Dec 1 to Dec 24 every year, reminds once a day at the day time on every day of the range
   ("Day 5 of 24 · 19 days left" … "Last day"), on the desktop (`zerohour remind`) and, with the same
