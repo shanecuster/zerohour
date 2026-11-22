@@ -46,7 +46,9 @@ use crate::calendar::add_days;
 use crate::clock::{TimeFormat, format_time};
 use crate::db::{Db, DbError, settings_keys};
 use crate::model::{Item, Kind};
-use crate::repeat::{EventRange, days_until, event_range, is_overdue, next_occurrence};
+use crate::repeat::{
+    EventRange, days_until, event_range, is_overdue, next_occurrence, within_series,
+};
 use crate::view::open_tasks;
 
 /// The largest allowed lead time: one day, in minutes.
@@ -624,6 +626,33 @@ mod plan_tests {
     }
 
     #[test]
+    fn a_repeating_task_is_reminded_only_up_to_its_until_date() {
+        // Daily at 7 PM until Thu Dec 24, open instance Dec 23: Dec 23 and Dec 24 only.
+        let mut room = task(
+            "Advent of Cyber room",
+            Some(d(2026, 12, 23)),
+            Some(t(19, 0)),
+        );
+        room.repeat = RepeatRule::Daily;
+        room.end_date = Some(d(2026, 12, 24));
+        let plan = plan_between(
+            std::slice::from_ref(&room),
+            at(2026, 12, 23, 12, 0),
+            at(2026, 12, 28, 0, 0),
+        );
+        assert_eq!(
+            times(&plan),
+            [
+                (ReminderKind::Due, at(2026, 12, 23, 19, 0)),
+                (ReminderKind::Due, at(2026, 12, 24, 19, 0)),
+            ]
+        );
+        // Left open past the end: no more reminders (the overdue digest can still list it).
+        room.date = Some(d(2026, 12, 22));
+        assert!(plan_between(&[room], at(2026, 12, 25, 0, 0), at(2026, 12, 28, 0, 0)).is_empty());
+    }
+
+    #[test]
     fn mon_thu_completed_on_thursday_next_reminds_monday_at_two() {
         // Completing Thursday's instance creates Monday's (core's complete path), so the
         // stored open instance is due Mon 2026-10-26 at 2 PM. Planned on Friday morning, a
@@ -986,6 +1015,12 @@ pub fn plan(
             date
         };
         for _ in 0..MAX_OCCURRENCES_PER_TASK {
+            // A later scheduled day past the series' end ("daily until Dec 24") is never
+            // due. The open instance's own day always counts: it exists, even if the end
+            // date was moved before it.
+            if day != date && !within_series(item, day) {
+                break;
+            }
             let due = day.and_time(time);
             // Past the window, even for its earlier reminder: no later day can be inside.
             if due - lead > until {

@@ -28,7 +28,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::{
     Completion, DerivedId, Item, Kind, Priority, RepeatRule, derived_id, next_updated_at,
 };
-use crate::repeat::{event_range, is_overdue, next_instance_date};
+use crate::repeat::{event_range, is_overdue, next_instance_date, within_series};
 
 /// Everything that can go wrong in the storage layer.
 ///
@@ -475,8 +475,11 @@ impl Db {
 
         // Build the next instance (if repeating) before we start writing.
         // The next instance keeps the due time (`..task.clone()` below copies it).
-        let next =
-            next_instance_date(task.repeat, task.date, task.due_time, local_now).map(|date| {
+        // A series with an end date ("daily until Dec 24") stops there: `.filter` drops a
+        // next date past the end, so no instance is made.
+        let next = next_instance_date(task.repeat, task.date, task.due_time, local_now)
+            .filter(|&date| within_series(&task, date))
+            .map(|date| {
                 // `..task.clone()` = "every other field copied from the old task".
                 Item {
                     id: derived_id(DerivedId::NextInstance, &task.id),
@@ -1203,6 +1206,31 @@ mod tests {
             db.resume_event_reminders("no-such-id", now()),
             Err(DbError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn a_repeating_task_makes_no_instance_past_its_until_date() {
+        let mut db = Db::open_in_memory().unwrap();
+        let mut room = Item::new(Kind::Task, "Advent of Cyber room", now());
+        room.date = Some(d(2026, 12, 23));
+        room.repeat = RepeatRule::Daily;
+        room.end_date = Some(d(2026, 12, 24));
+        db.insert_item(&room).unwrap();
+
+        // Done on Dec 23: the Dec 24 instance comes, and keeps the end date.
+        let at = |day: u32| d(2026, 12, day).and_hms_opt(20, 0, 0).unwrap();
+        let next = db.complete_task(&room.id, at(23), now()).unwrap().unwrap();
+        assert_eq!(next.date, Some(d(2026, 12, 24)));
+        assert_eq!(next.end_date, Some(d(2026, 12, 24)));
+        // Done on Dec 24: the series is over.
+        assert_eq!(db.complete_task(&next.id, at(24), now()).unwrap(), None);
+
+        // An instance done late, after the end date, makes none either.
+        let mut late = room.clone();
+        late.id = new_id();
+        late.date = Some(d(2026, 12, 20));
+        db.insert_item(&late).unwrap();
+        assert_eq!(db.complete_task(&late.id, at(26), now()).unwrap(), None);
     }
 
     /// 2026-10-26 at `h:m`, local wall-clock time.

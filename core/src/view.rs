@@ -222,12 +222,21 @@ pub fn date_text(date: Option<NaiveDate>, today: NaiveDate) -> String {
     .unwrap_or_default()
 }
 
-/// A task's title as listed: repeating tasks get the repeat icon after the title.
+/// A task's title as listed: repeating tasks get the repeat icon after the title, and one
+/// with an end date also its rule and end: "Advent of Cyber room ↻ daily until Dec 24".
 pub fn task_title(task: &Item, mode: IconMode) -> String {
     let mut title = task.title.clone();
     if task.repeat.is_repeating() {
         title.push(' ');
         title.push_str(Icon::Repeat.get(mode));
+        // `if let`: only when there is an end date.
+        if let Some(end) = task.end_date {
+            title.push_str(&format!(
+                " {} until {}",
+                task.repeat.label(),
+                end.format("%b %d")
+            ));
+        }
     }
     title
 }
@@ -622,6 +631,31 @@ mod tests {
         assert_eq!(rows[0].item.title, "Christmas");
         assert_eq!(rows[1].target, NaiveDate::from_ymd_opt(2027, 12, 1));
         assert_eq!(tagline(&rows, dec(25)), "Christmas is today!");
+    }
+
+    #[test]
+    fn a_task_with_an_until_date_names_it_in_its_title() {
+        let mut room = Item::new(Kind::Task, "Advent of Cyber room", chrono::Utc::now());
+        room.date = NaiveDate::from_ymd_opt(2026, 12, 1);
+        room.repeat = RepeatRule::Daily;
+        assert_eq!(
+            task_title(&room, IconMode::Unicode),
+            format!(
+                "Advent of Cyber room {}",
+                Icon::Repeat.get(IconMode::Unicode)
+            )
+        );
+        room.end_date = NaiveDate::from_ymd_opt(2026, 12, 24);
+        assert_eq!(
+            task_title(&room, IconMode::Unicode),
+            format!(
+                "Advent of Cyber room {} daily until Dec 24",
+                Icon::Repeat.get(IconMode::Unicode)
+            )
+        );
+        // A one-off task's end date (never set by the form) changes nothing.
+        room.repeat = RepeatRule::None;
+        assert_eq!(task_title(&room, IconMode::Unicode), "Advent of Cyber room");
     }
 
     #[test]

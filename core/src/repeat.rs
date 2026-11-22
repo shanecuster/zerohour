@@ -262,6 +262,14 @@ pub fn next_instance_date(
     }
 }
 
+/// True if `date` is still part of a repeating task's series: on or before its end date
+/// ("daily until Dec 24"), or always when it has none. Completing a task makes no next
+/// instance past the end, and the planner reminds no later scheduled day past it.
+pub fn within_series(task: &Item, date: NaiveDate) -> bool {
+    // `is_none_or`: true for `None`, or for `Some(end)` where the closure says yes.
+    task.end_date.is_none_or(|end| date <= end)
+}
+
 /// The local date and time a task is due, if it has both a due date and a due time.
 /// (`?` on an `Option` returns `None` early if that part is missing.)
 pub fn due_datetime(item: &Item) -> Option<NaiveDateTime> {
