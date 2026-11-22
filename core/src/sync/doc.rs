@@ -197,6 +197,10 @@ pub fn item_from_doc(doc: &Value) -> Result<Item, DocProblem> {
         created_at: timestamp(&text(doc, "created_at")?)?,
         updated_at: timestamp(&text(doc, "updated_at")?)?,
         deleted: flag(doc, "deleted")?,
+        // Not part of the document format yet (the next format version adds them): an item
+        // from the server arrives without an end date or a stop.
+        end_date: None,
+        reminders_stopped_for: None,
     })
 }
 

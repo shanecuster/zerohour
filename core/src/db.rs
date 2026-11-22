@@ -133,12 +133,42 @@ const MIGRATIONS: &[(i64, &str)] = &[
     );
     ",
     ),
+    // Migration 5 came from a test build of an earlier design ("remind N days before"), and
+    // real databases already have it applied, so it stays exactly as it was (a migration is
+    // never edited once a database has run it). Of its two columns:
+    // - `reminders_stopped_for` is used (see `Item::reminders_stopped_for`);
+    // - `remind_days_before` is NOT used: no build reads or writes it any more, and it stays
+    //   NULL. SQLite columns can't simply be dropped without rebuilding the table, and an
+    //   unused nullable column costs nothing, so it is left alone.
+    (
+        5,
+        "
+    -- Daily reminders before an event (see Item::remind_days_before), and the occurrence
+    -- they were stopped for (Item::reminders_stopped_for, 'YYYY-MM-DD'). NULL = off / not
+    -- stopped. Purely additive: existing rows get NULL, and older builds that don't know
+    -- the columns never read them (their INSERT and UPDATE statements name their columns,
+    -- so they leave these alone).
+    ALTER TABLE items ADD COLUMN remind_days_before INTEGER;
+    ALTER TABLE items ADD COLUMN reminders_stopped_for TEXT;
+    ",
+    ),
+    (
+        6,
+        "
+    -- The last day of an item's range, 'YYYY-MM-DD' (see Item::end_date): an event that runs
+    -- from its date through this day (with a daily reminder on each day), or the last day a
+    -- repeating task repeats. NULL = no end. Purely additive: existing rows get NULL, and
+    -- older builds never read it (their statements name their columns).
+    ALTER TABLE items ADD COLUMN end_date TEXT;
+    ",
+    ),
 ];
 
 /// The column list for `items`, in the order [`item_from_row`] expects.
 /// Keeping it in one constant means SELECTs can't get out of sync with the row reader.
 pub(crate) const ITEM_COLUMNS: &str = "id, kind, title, notes, priority, date, repeat, keep_after_pass, \
-                            completed_at, created_at, updated_at, deleted, due_time";
+                            completed_at, created_at, updated_at, deleted, due_time, \
+                            end_date, reminders_stopped_for";
 
 /// Well-known keys for the settings table, so typos become compile errors instead of bugs.
 pub mod settings_keys {
@@ -285,7 +315,8 @@ impl Db {
             "UPDATE items SET kind = ?2, title = ?3, notes = ?4, priority = ?5, date = ?6,
                               repeat = ?7, keep_after_pass = ?8, completed_at = ?9,
                               created_at = ?10, updated_at = ?11, deleted = ?12,
-                              due_time = ?13
+                              due_time = ?13, end_date = ?14,
+                              reminders_stopped_for = ?15
              WHERE id = ?1",
             params![
                 item.id,
@@ -301,6 +332,8 @@ impl Db {
                 ts_to_db(item.updated_at),
                 item.deleted,
                 item.due_time.map(time_to_db),
+                item.end_date.map(date_to_db),
+                item.reminders_stopped_for.map(date_to_db),
             ],
         )?;
         if changed == 0 {
@@ -593,7 +626,7 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
     conn.execute(
         &format!(
             "{verb} INTO items ({ITEM_COLUMNS})
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
         ),
         params![
             item.id,
@@ -609,6 +642,8 @@ fn write_item_on(conn: &Connection, item: &Item, verb: &str) -> Result<()> {
             ts_to_db(item.updated_at),
             item.deleted,
             item.due_time.map(time_to_db),
+            item.end_date.map(date_to_db),
+            item.reminders_stopped_for.map(date_to_db),
         ],
     )?;
     Ok(())
@@ -663,6 +698,8 @@ pub(crate) struct RawItem {
     updated_at: String,
     deleted: bool,
     due_time: Option<String>,
+    end_date: Option<String>,
+    reminders_stopped_for: Option<String>,
 }
 
 impl RawItem {
@@ -685,6 +722,8 @@ impl RawItem {
             updated_at: row.get(10)?,
             deleted: row.get(11)?,
             due_time: row.get(12)?,
+            end_date: row.get(13)?,
+            reminders_stopped_for: row.get(14)?,
         })
     }
 
@@ -706,6 +745,14 @@ impl RawItem {
             notes: self.notes,
             keep_after_pass: self.keep_after_pass,
             deleted: self.deleted,
+            // `Option<&str>` → `Option<Result<NaiveDate>>` → `Result<Option<NaiveDate>>`:
+            // `transpose` swaps the two wrappers so `?` can catch a malformed date.
+            end_date: self.end_date.as_deref().map(date_from_db).transpose()?,
+            reminders_stopped_for: self
+                .reminders_stopped_for
+                .as_deref()
+                .map(date_from_db)
+                .transpose()?,
         })
     }
 }
@@ -772,10 +819,10 @@ mod tests {
     #[test]
     fn migrations_run_once_and_set_version() {
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         // Running again must be a no-op (no "table already exists" error).
         db.migrate().unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -821,7 +868,7 @@ mod tests {
 
         // Re-run initialization the way `Db::open` does on the next start.
         let db = Db::init(old.conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
         assert_eq!(
@@ -863,7 +910,7 @@ mod tests {
         .unwrap();
 
         let db = Db::init(conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         let christmas = db.get_item("e1").unwrap().unwrap();
         assert_eq!(christmas.title, "Christmas");
         assert_eq!(christmas.date, Some(d(2026, 12, 25)));
@@ -891,7 +938,18 @@ mod tests {
         let mut task = Item::new(Kind::Task, "Fill Out Your Timesheet", now());
         task.date = Some(d(2026, 10, 26));
         task.due_time = NaiveTime::from_hms_opt(14, 0, 0);
-        old.insert_item(&task).unwrap();
+        // Written with the schema-3 column list, as a schema-3 build would have (today's
+        // `insert_item` names columns that don't exist yet in this database).
+        old.conn
+            .execute(
+                "INSERT INTO items (id, kind, title, notes, priority, date, repeat,
+                                    keep_after_pass, completed_at, created_at, updated_at,
+                                    deleted, due_time)
+                 VALUES (?1, 'task', ?2, NULL, 'medium', '2026-10-26', 'none', 0, NULL,
+                         ?3, ?3, 0, '14:00')",
+                params![task.id, task.title, ts_to_db(now())],
+            )
+            .unwrap();
         let completion = Completion {
             id: new_id(),
             item_id: task.id.clone(),
@@ -913,10 +971,10 @@ mod tests {
     }
 
     #[test]
-    fn version_3_database_upgrades_to_4_adding_only_the_reminder_log() {
+    fn version_3_database_upgrades_adding_only_the_reminder_log_and_columns() {
         let (conn, task, completion) = version_3_database();
         let db = Db::init(conn).unwrap();
-        assert_eq!(db.schema_version().unwrap(), 4);
+        assert_eq!(db.schema_version().unwrap(), 6);
         // Every existing row is untouched.
         assert_eq!(db.list_items().unwrap(), vec![task]);
         assert_eq!(db.list_completions().unwrap(), vec![completion]);
@@ -944,6 +1002,88 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 6);
+    }
+
+    /// A database exactly as the earlier test build left it: migrations 1 to 5 applied, so
+    /// it has the unused `remind_days_before` column (here even with a stray value in it).
+    fn version_5_database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, ts_to_db(now())],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO items (id, kind, title, notes, priority, date, repeat, keep_after_pass,
+                                completed_at, created_at, updated_at, deleted, due_time,
+                                remind_days_before, reminders_stopped_for)
+             VALUES ('e1', 'event', 'Advent of Cyber', 'one room a day', 'medium',
+                     '2026-12-01', 'yearly', 0, NULL, '2026-10-01T00:00:00.000Z',
+                     '2026-10-01T00:00:00.000Z', 0, NULL, 23, NULL)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn version_5_database_upgrades_to_6_with_no_end_dates() {
+        let db = Db::init(version_5_database()).unwrap();
+        assert_eq!(db.schema_version().unwrap(), 6);
+        let event = db.get_item("e1").unwrap().unwrap();
+        // Every old field is untouched...
+        assert_eq!(event.title, "Advent of Cyber");
+        assert_eq!(event.notes.as_deref(), Some("one room a day"));
+        assert_eq!(event.date, Some(d(2026, 12, 1)));
+        assert_eq!(event.repeat, RepeatRule::Yearly);
+        assert_eq!(ts_to_db(event.updated_at), "2026-10-01T00:00:00.000Z");
+        // ...the new one starts empty, and the old window (23) is simply not read.
+        assert_eq!(event.end_date, None);
+        assert_eq!(event.reminders_stopped_for, None);
+    }
+
+    #[test]
+    fn writing_an_item_leaves_the_unused_column_alone() {
+        let db = Db::init(version_5_database()).unwrap();
+        let mut event = db.get_item("e1").unwrap().unwrap();
+        event.end_date = Some(d(2026, 12, 24));
+        db.update_item(&mut event, now()).unwrap();
+        let old_window: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT remind_days_before FROM items WHERE id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        // Untouched (no statement names the column), and harmless.
+        assert_eq!(old_window, Some(23));
+    }
+
+    #[test]
+    fn end_date_and_stop_round_trip() {
+        let db = Db::open_in_memory().unwrap();
+        let mut event = Item::new(Kind::Event, "Advent of Cyber", now());
+        event.date = Some(d(2026, 12, 1));
+        event.repeat = RepeatRule::Yearly;
+        event.end_date = Some(d(2026, 12, 24));
+        event.reminders_stopped_for = Some(d(2026, 12, 1));
+        db.insert_item(&event).unwrap();
+        assert_eq!(db.get_item(&event.id).unwrap().unwrap(), event);
+
+        // An edit can change and clear them.
+        event.end_date = None;
+        event.reminders_stopped_for = None;
+        db.update_item(&mut event, now() + chrono::TimeDelta::minutes(1))
+            .unwrap();
+        assert_eq!(db.get_item(&event.id).unwrap().unwrap(), event);
     }
 
     /// 2026-10-26 at `h:m`, local wall-clock time.
