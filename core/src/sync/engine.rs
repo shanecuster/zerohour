@@ -842,4 +842,59 @@ mod tests {
         let report = sync(&mut device(), &server, at(10));
         assert_eq!(report.clock_skew_secs, Some(300));
     }
+
+    // ---- undo before and after a sync (`Db::undo_delete`, `Db::undo_complete`) --------
+
+    #[test]
+    fn a_delete_undone_before_syncing_never_reaches_the_other_device() {
+        let server = FakeCouch::new("zerohour");
+        let (mut laptop, mut phone) = (device(), device());
+        let item = task("call mum", at(9));
+        phone.insert_item(&item).unwrap();
+        sync(&mut phone, &server, at(9));
+        sync(&mut laptop, &server, at(9));
+
+        // Deleted by accident on the phone, undone before any sync.
+        phone.delete_item(&item.id, at(10)).unwrap();
+        assert_eq!(
+            phone.undo_delete(&item.id, at(10)).unwrap(),
+            db::UndoOutcome::Undone
+        );
+        sync(&mut phone, &server, at(11));
+        sync(&mut laptop, &server, at(11));
+
+        for db in [&phone, &laptop] {
+            assert!(!db.get_item(&item.id).unwrap().unwrap().deleted);
+        }
+        let on_server = item_from_doc(&server.doc(&item_doc_id(&item.id)).unwrap()).unwrap();
+        assert!(!on_server.deleted, "the server never saw the delete stick");
+    }
+
+    #[test]
+    fn a_synced_delete_or_done_can_no_longer_be_undone() {
+        let server = FakeCouch::new("zerohour");
+        let mut phone = device();
+        let gone = task("old idea", at(9));
+        let mut weekly = task("water plants", at(9));
+        weekly.date = Some(day(8));
+        weekly.repeat = RepeatRule::Weekly;
+        phone.insert_item(&gone).unwrap();
+        phone.insert_item(&weekly).unwrap();
+        phone.delete_item(&gone.id, at(10)).unwrap();
+        phone
+            .complete_task(&weekly.id, day(8).and_hms_opt(12, 0, 0).unwrap(), at(10))
+            .unwrap();
+        sync(&mut phone, &server, at(11));
+
+        assert_eq!(
+            phone.undo_delete(&gone.id, at(11)).unwrap(),
+            db::UndoOutcome::AlreadySynced
+        );
+        assert_eq!(
+            phone.undo_complete(&weekly.id, at(11)).unwrap(),
+            db::UndoOutcome::AlreadySynced
+        );
+        // Nothing was changed, so the next sync has nothing to push.
+        assert_eq!(sync(&mut phone, &server, at(12)).pushed, 0);
+    }
 }

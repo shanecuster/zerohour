@@ -53,6 +53,20 @@ pub enum DbError {
 /// Short alias so function signatures read `Result<Item>` instead of `Result<Item, DbError>`.
 pub type Result<T> = std::result::Result<T, DbError>;
 
+/// What [`Db::undo_delete`] or [`Db::undo_complete`] did. Undo is only possible while the
+/// change is still on this device; the two refusals leave everything exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndoOutcome {
+    /// The change was taken back.
+    Undone,
+    /// The change already reached the server (or came from another device), so it can't be
+    /// taken back: sync would bring it back at the next sync (see `sync::merge`).
+    AlreadySynced,
+    /// The item is no longer in the state the undo expects (not deleted, not completed, or
+    /// the repeating task's next instance was changed since), so there is nothing safe to undo.
+    ChangedSince,
+}
+
 /// Every schema change ever made, in order. Each entry is (version number, SQL to run).
 ///
 /// Version 1 is the initial schema; version 2 adds the sync bookkeeping table; version 3 adds
@@ -516,6 +530,104 @@ impl Db {
         Ok(next)
     }
 
+    // ---- undo (of a Done or a delete, before it has synced) ----------------------------
+
+    /// Undoes a delete made on this device, as long as the deleted version hasn't left it.
+    ///
+    /// Why only then: sync makes deletes *sticky* (`sync::merge`). Once the server or another
+    /// device has the deleted version, clearing the flag here would be deleted again by the
+    /// next sync. While the delete is still only local, the server still has the item as it
+    /// was, so the restored item simply goes out as an ordinary, newer edit. No new field and
+    /// no change to the sync format, so older builds are unaffected.
+    ///
+    /// Returns [`UndoOutcome::AlreadySynced`] once the deleted version was pushed (or pulled:
+    /// another device deleted it), [`UndoOutcome::ChangedSince`] if the item isn't deleted, and
+    /// an error for an unknown id. Only an `Undone` changes anything.
+    pub fn undo_delete(&self, id: &str, now: DateTime<Utc>) -> Result<UndoOutcome> {
+        let item = self
+            .get_item(id)?
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
+        if !item.deleted {
+            return Ok(UndoOutcome::ChangedSince);
+        }
+        if item_version_synced(&self.conn, &item)? {
+            return Ok(UndoOutcome::AlreadySynced);
+        }
+        // `next_updated_at` keeps the restored version newer than the deleted one, even if
+        // this device's clock went backwards in between.
+        self.conn.execute(
+            "UPDATE items SET deleted = 0, updated_at = ?2 WHERE id = ?1",
+            params![id, ts_to_db(next_updated_at(item.updated_at, now))],
+        )?;
+        Ok(UndoOutcome::Undone)
+    }
+
+    /// Undoes [`Db::complete_task`] on this device, as long as nothing it wrote has left it:
+    /// reopens the task, removes its completion log entry (so stats are exactly as before),
+    /// and removes the next instance a repeating task got.
+    ///
+    /// Why only before a sync: completion is sticky in `sync::merge`, and completion entries
+    /// are add-only on the server, so a completion another device has seen can't be taken
+    /// back. Before that, the completion entry and the next instance exist only in this
+    /// database, so deleting their rows outright is safe: no other copy can bring them back.
+    ///
+    /// Refused ([`UndoOutcome::AlreadySynced`]) if the completed task, its completion entry or
+    /// its next instance is known to sync (pushed, or pulled from another device that completed
+    /// the same task: they share derived ids). Refused ([`UndoOutcome::ChangedSince`]) if the
+    /// task isn't completed or the next instance was edited, completed or deleted since. All
+    /// writes happen in one transaction, so an undo is never half done.
+    pub fn undo_complete(&mut self, id: &str, now: DateTime<Utc>) -> Result<UndoOutcome> {
+        let task = self
+            .get_item(id)?
+            .filter(|item| item.kind == Kind::Task)
+            .ok_or_else(|| DbError::NotFound(id.to_string()))?;
+        if task.deleted || !task.is_completed() {
+            return Ok(UndoOutcome::ChangedSince);
+        }
+        // The rows `complete_task` wrote have ids derived from the task's id.
+        let completion_id = derived_id(DerivedId::Completion, &task.id);
+        let next_id = derived_id(DerivedId::NextInstance, &task.id);
+        let next = self.get_item(&next_id)?;
+
+        // Anything sync already knows about can't be taken back.
+        let next_known = match &next {
+            Some(_) => doc_known(&self.conn, &format!("item:{next_id}"))?,
+            None => false,
+        };
+        if item_version_synced(&self.conn, &task)?
+            || doc_known(&self.conn, &format!("completion:{completion_id}"))?
+            || next_known
+        {
+            return Ok(UndoOutcome::AlreadySynced);
+        }
+        // No log entry under the derived id: completed some other way (an old build's random
+        // id), so we can't tell which entry to remove.
+        if !row_exists_on(&self.conn, "completions", &completion_id)? {
+            return Ok(UndoOutcome::ChangedSince);
+        }
+        // The next instance must be exactly as `complete_task` made it: any edit bumps
+        // `updated_at` past `created_at`, and removing it would throw that edit away.
+        if let Some(next) = &next {
+            let untouched =
+                !next.deleted && next.completed_at.is_none() && next.updated_at == next.created_at;
+            if !untouched {
+                return Ok(UndoOutcome::ChangedSince);
+            }
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE items SET completed_at = NULL, updated_at = ?2 WHERE id = ?1",
+            params![task.id, ts_to_db(next_updated_at(task.updated_at, now))],
+        )?;
+        tx.execute("DELETE FROM completions WHERE id = ?1", [&completion_id])?;
+        if next.is_some() {
+            tx.execute("DELETE FROM items WHERE id = ?1", [&next_id])?;
+        }
+        tx.commit()?;
+        Ok(UndoOutcome::Undone)
+    }
+
     /// Adds a completion log entry directly. Used by the demo data seeder and tests;
     /// normal completions go through [`Db::complete_task`].
     pub fn insert_completion(&self, completion: &Completion) -> Result<()> {
@@ -712,6 +824,40 @@ pub(crate) fn row_exists_on(conn: &Connection, table: &str, id: &str) -> Result<
         )
         .optional()?;
     Ok(found.is_some())
+}
+
+/// True if sync's bookkeeping knows this document (`item:<id>` or `completion:<id>`): this
+/// device pushed it, or pulled it from the server.
+///
+/// The `sync_docs` table exists in every database (migration 2), with or without the `sync`
+/// feature, so this also works in local-only builds: there it is simply empty, unless the
+/// file was synced by a build with sync.
+fn doc_known(conn: &Connection, doc_id: &str) -> Result<bool> {
+    let found = conn
+        .query_row(
+            "SELECT 1 FROM sync_docs WHERE doc_id = ?1",
+            [doc_id],
+            |_| Ok(()),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
+/// True if the version of `item` stored now is the one sync last pushed or pulled, i.e. the
+/// server already has exactly this version. (Sync records that version's `updated_at` in
+/// `sync_docs.synced_updated_at`; a later local change makes the two differ.)
+fn item_version_synced(conn: &Connection, item: &Item) -> Result<bool> {
+    // Two layers of `Option`: the outer one is "is there a row", the inner one "is the
+    // column NULL" (it is for a version that was never pushed).
+    let synced: Option<Option<String>> = conn
+        .query_row(
+            "SELECT synced_updated_at FROM sync_docs WHERE doc_id = ?1",
+            [format!("item:{}", item.id)],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // `matches!` with a guard (`if ...`): a row whose time is this version's time.
+    Ok(matches!(synced, Some(Some(text)) if text == ts_to_db(item.updated_at)))
 }
 
 /// Inserts a completion row using the given connection or transaction.
@@ -1561,5 +1707,250 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(db.list_items().unwrap()[0].title, "persist me");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- undo ------------------------------------------------------------------------
+
+    /// Marks the item's *current* version as known to sync, as a push or pull would.
+    fn mark_item_synced(db: &Db, id: &str) {
+        let updated = db.get_item(id).unwrap().unwrap().updated_at;
+        db.conn
+            .execute(
+                "INSERT OR REPLACE INTO sync_docs (doc_id, rev, synced_updated_at)
+                 VALUES (?1, '1-x', ?2)",
+                params![format!("item:{id}"), ts_to_db(updated)],
+            )
+            .unwrap();
+    }
+
+    /// A weekly task due Oct 8, stored, for the Done-undo tests.
+    fn weekly_task(db: &Db) -> Item {
+        let mut task = Item::new(Kind::Task, "water plants", now());
+        task.date = Some(d(2026, 10, 8));
+        task.repeat = RepeatRule::Weekly;
+        db.insert_item(&task).unwrap();
+        task
+    }
+
+    #[test]
+    fn undo_delete_brings_the_item_back_as_a_newer_edit() {
+        let db = Db::open_in_memory().unwrap();
+        let item = Item::new(Kind::Task, "call mum", now());
+        db.insert_item(&item).unwrap();
+        let later = now() + chrono::TimeDelta::minutes(1);
+        db.delete_item(&item.id, later).unwrap();
+        let deleted_at = db.get_item(&item.id).unwrap().unwrap().updated_at;
+
+        let undo_at = later + chrono::TimeDelta::seconds(3);
+        assert_eq!(
+            db.undo_delete(&item.id, undo_at).unwrap(),
+            UndoOutcome::Undone
+        );
+        let back = db.get_item(&item.id).unwrap().unwrap();
+        assert!(!back.deleted);
+        assert!(back.updated_at > deleted_at, "newer than the delete");
+        assert_eq!(back.title, "call mum");
+        assert_eq!(db.list_items().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undo_delete_works_when_only_the_version_before_the_delete_was_synced() {
+        let db = Db::open_in_memory().unwrap();
+        let item = Item::new(Kind::Task, "call mum", now());
+        db.insert_item(&item).unwrap();
+        mark_item_synced(&db, &item.id); // the server has the live version
+        db.delete_item(&item.id, now() + chrono::TimeDelta::minutes(1))
+            .unwrap();
+        let undo_at = now() + chrono::TimeDelta::minutes(2);
+        assert_eq!(
+            db.undo_delete(&item.id, undo_at).unwrap(),
+            UndoOutcome::Undone
+        );
+    }
+
+    #[test]
+    fn undo_delete_is_refused_once_the_delete_is_synced() {
+        let db = Db::open_in_memory().unwrap();
+        let item = Item::new(Kind::Task, "call mum", now());
+        db.insert_item(&item).unwrap();
+        db.delete_item(&item.id, now() + chrono::TimeDelta::minutes(1))
+            .unwrap();
+        mark_item_synced(&db, &item.id); // the deleted version reached the server
+        let before = db.get_item(&item.id).unwrap().unwrap();
+
+        let undo_at = now() + chrono::TimeDelta::minutes(2);
+        assert_eq!(
+            db.undo_delete(&item.id, undo_at).unwrap(),
+            UndoOutcome::AlreadySynced
+        );
+        assert_eq!(db.get_item(&item.id).unwrap().unwrap(), before, "untouched");
+    }
+
+    #[test]
+    fn undo_delete_of_a_live_or_unknown_item() {
+        let db = Db::open_in_memory().unwrap();
+        let item = Item::new(Kind::Event, "launch", now());
+        db.insert_item(&item).unwrap();
+        assert_eq!(
+            db.undo_delete(&item.id, now()).unwrap(),
+            UndoOutcome::ChangedSince
+        );
+        assert!(matches!(
+            db.undo_delete("no-such-id", now()),
+            Err(DbError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn undo_complete_of_a_repeating_task_restores_items_log_and_stats() {
+        let mut db = Db::open_in_memory().unwrap();
+        let task = weekly_task(&db);
+        let local = noon(d(2026, 10, 8));
+        let stats_before = crate::stats::compute(
+            &db.list_completions().unwrap(),
+            &db.list_items().unwrap(),
+            local,
+            &Utc,
+        );
+
+        let done_at = now() + chrono::TimeDelta::minutes(1);
+        let next = db.complete_task(&task.id, local, done_at).unwrap().unwrap();
+        assert_eq!(db.list_completions().unwrap().len(), 1);
+
+        let undo_at = done_at + chrono::TimeDelta::seconds(3);
+        assert_eq!(
+            db.undo_complete(&task.id, undo_at).unwrap(),
+            UndoOutcome::Undone
+        );
+
+        // The task is open again (only its timestamp moved on), the next instance and the
+        // log entry are gone, and the stats are exactly as before.
+        let reopened = db.get_item(&task.id).unwrap().unwrap();
+        assert_eq!(reopened.completed_at, None);
+        assert!(reopened.updated_at > done_at);
+        assert_eq!(
+            Item {
+                updated_at: task.updated_at,
+                ..reopened
+            },
+            task
+        );
+        assert_eq!(db.get_item(&next.id).unwrap(), None);
+        assert!(db.list_completions().unwrap().is_empty());
+        let stats_after = crate::stats::compute(
+            &db.list_completions().unwrap(),
+            &db.list_items().unwrap(),
+            local,
+            &Utc,
+        );
+        assert_eq!(stats_after, stats_before);
+
+        // And it can be completed again normally, with the same derived ids.
+        let again = db.complete_task(&task.id, local, undo_at).unwrap().unwrap();
+        assert_eq!(again.id, next.id);
+    }
+
+    #[test]
+    fn undo_complete_of_a_one_off_task_and_of_the_last_in_a_series() {
+        let mut db = Db::open_in_memory().unwrap();
+        let one_off = Item::new(Kind::Task, "post the letter", now());
+        db.insert_item(&one_off).unwrap();
+        // "daily until Oct 8", done on Oct 8: no next instance.
+        let mut last = Item::new(Kind::Task, "advent quiz", now());
+        last.date = Some(d(2026, 10, 8));
+        last.repeat = RepeatRule::Daily;
+        last.end_date = Some(d(2026, 10, 8));
+        db.insert_item(&last).unwrap();
+
+        for id in [&one_off.id, &last.id] {
+            let next = db.complete_task(id, noon(d(2026, 10, 8)), now()).unwrap();
+            assert_eq!(next, None);
+            assert_eq!(db.undo_complete(id, now()).unwrap(), UndoOutcome::Undone);
+            assert_eq!(db.get_item(id).unwrap().unwrap().completed_at, None);
+        }
+        assert!(db.list_completions().unwrap().is_empty());
+        assert_eq!(db.list_items().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn undo_complete_is_refused_when_the_next_instance_was_changed() {
+        let mut db = Db::open_in_memory().unwrap();
+        let task = weekly_task(&db);
+        let mut next = db
+            .complete_task(&task.id, noon(d(2026, 10, 8)), now())
+            .unwrap()
+            .unwrap();
+        next.title = "water the big plants".into();
+        db.update_item(&mut next, now() + chrono::TimeDelta::minutes(1))
+            .unwrap();
+
+        let undo_at = now() + chrono::TimeDelta::minutes(2);
+        assert_eq!(
+            db.undo_complete(&task.id, undo_at).unwrap(),
+            UndoOutcome::ChangedSince
+        );
+        assert!(db.get_item(&task.id).unwrap().unwrap().is_completed());
+        assert_eq!(
+            db.get_item(&next.id).unwrap().unwrap().title,
+            "water the big plants"
+        );
+        assert_eq!(db.list_completions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn undo_complete_is_refused_once_anything_it_wrote_is_known_to_sync() {
+        // Each case marks a different row as synced; each must refuse and change nothing.
+        for case in ["task", "completion", "next"] {
+            let mut db = Db::open_in_memory().unwrap();
+            let task = weekly_task(&db);
+            let next = db
+                .complete_task(&task.id, noon(d(2026, 10, 8)), now())
+                .unwrap()
+                .unwrap();
+            match case {
+                "task" => mark_item_synced(&db, &task.id),
+                "next" => mark_item_synced(&db, &next.id),
+                _ => {
+                    let doc = format!("completion:{}", derived_id(DerivedId::Completion, &task.id));
+                    db.conn
+                        .execute(
+                            "INSERT INTO sync_docs (doc_id, rev) VALUES (?1, '1-x')",
+                            [doc],
+                        )
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                db.undo_complete(&task.id, now()).unwrap(),
+                UndoOutcome::AlreadySynced,
+                "{case}"
+            );
+            assert!(
+                db.get_item(&task.id).unwrap().unwrap().is_completed(),
+                "{case}"
+            );
+            assert!(db.get_item(&next.id).unwrap().is_some(), "{case}");
+            assert_eq!(db.list_completions().unwrap().len(), 1, "{case}");
+        }
+    }
+
+    #[test]
+    fn undo_complete_of_an_open_task_an_event_or_an_unknown_id() {
+        let mut db = Db::open_in_memory().unwrap();
+        let task = weekly_task(&db);
+        assert_eq!(
+            db.undo_complete(&task.id, now()).unwrap(),
+            UndoOutcome::ChangedSince
+        );
+        let event = Item::new(Kind::Event, "launch", now());
+        db.insert_item(&event).unwrap();
+        assert!(matches!(
+            db.undo_complete(&event.id, now()),
+            Err(DbError::NotFound(_))
+        ));
+        assert!(matches!(
+            db.undo_complete("no-such-id", now()),
+            Err(DbError::NotFound(_))
+        ));
     }
 }
